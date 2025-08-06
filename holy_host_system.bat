@@ -1,10 +1,15 @@
 @echo off
 cd /d "%~dp0"
-chcp 65001 > nul
+chcp 65001 >nul
 title Прокидываю хосты
+
+setlocal EnableDelayedExpansion
 
 set "BIN=%~dp0bin\"
 set "LISTS=%~dp0lists\"
+set "HOSTS_FILE=C:\Windows\System32\drivers\etc\hosts"
+set "HOSTS_LIST=%LISTS%hosts-list.txt"
+set "TEMP_FILE=%TEMP%\hosts.tmp"
 
 NET SESSION >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -12,53 +17,59 @@ if %ERRORLEVEL% NEQ 0 (
     powershell -Command "Start-Process -FilePath '%~dpnx0' -Verb RunAs"
     exit /b
 )
+
 powershell -Command "Write-Host 'Обновляю записи в файле hosts...' -ForegroundColor Yellow"
-set "HOSTS_FILE=C:\Windows\System32\drivers\etc\hosts"
-set "HOSTS_LIST=%LISTS%hosts-list.txt"
 
-powershell -Command "Copy-Item '%HOSTS_FILE%' '%HOSTS_FILE%.bak' -Force" >nul 2>&1
+powershell -Command "Copy-Item -Path '%HOSTS_FILE%' -Destination '%HOSTS_FILE%.bak' -Force" >nul 2>&1
 
-set "TEMP_FILE=%TEMP%\hosts.tmp"
+type nul > "%TEMP_FILE%"
 
-for /f "tokens=*" %%a in ('type "%HOSTS_LIST%"') do (
-    set "entry=%%a"
-    set "domain="
-    set "new_ip="
-
-    for /f "tokens=1,2" %%i in ("%%a") do (
-        set "new_ip=%%i"
-        set "domain=%%j"
+set "processed_domains="
+for /f "usebackq delims=" %%L in ("%HOSTS_FILE%") do (
+    set "line=%%L"
+    set "keep_line=1"
+    set "current_domain="
+    
+    echo "!line!" | findstr /i "^#.*" >nul && set "keep_line=1" && goto :process_line
+    echo "!line!" | findstr /i "^[[:space:]]*$" >nul && set "keep_line=1" && goto :process_line
+    
+    for /f "tokens=1,*" %%a in ("!line!") do (
+        for %%d in (%%b) do set "current_domain=%%d"
     )
-
-    find /i "%domain%" "%HOSTS_FILE%" >nul 2>&1
-    if !errorlevel! equ 0 (
-        for /f "tokens=1,2" %%x in ('findstr /i "%domain%" "%HOSTS_FILE%"') do (
-            set "old_ip=%%x"
+    
+    if defined current_domain (
+        findstr /i /c:"!current_domain!" "%HOSTS_LIST%" >nul && set "keep_line=0"
+        for %%d in (!processed_domains!) do (
+            if /i "%%d"=="!current_domain!" set "keep_line=0"
         )
-        if not "!old_ip!"=="!new_ip!" (
-            powershell -Command "Write-Host 'Обновляю: !old_ip! !domain! -> !new_ip! !domain!' -ForegroundColor Cyan"
+        
+        if "!keep_line!"=="1" (
+            set "processed_domains=!processed_domains! !current_domain!"
         )
-    ) else (
-        powershell -Command "Write-Host 'Добавлено: %%a' -ForegroundColor Magenta"
     )
-    echo !new_ip! !domain!>> "%TEMP_FILE%"
+    
+    :process_line
+    if "!keep_line!"=="1" (
+        echo !line!>> "%TEMP_FILE%"
+    )
 )
 
-for /f "tokens=*" %%z in ('type "%HOSTS_FILE%"') do (
-    set "line=%%z"
-    set "domain_in_line="
-    for /f "tokens=2" %%d in ("%%z") do set "domain_in_line=%%d"
+for /f "usebackq tokens=1,2" %%A in ("%HOSTS_LIST%") do (
+    set "new_ip=%%A"
+    set "domain=%%B"
     
-    if defined domain_in_line (
-        findstr /i "!domain_in_line!" "%HOSTS_LIST%" >nul 2>&1
-        if !errorlevel! neq 0 (
-            echo %%z>> "%TEMP_FILE%"
-        )
+    findstr /i /c:"!domain!" "%HOSTS_FILE%" >nul
+    if !errorlevel! equ 0 (
+        powershell -Command "Write-Host 'Обновляю: !domain! -> !new_ip!' -ForegroundColor Cyan"
     ) else (
-        echo %%z>> "%TEMP_FILE%"
+        powershell -Command "Write-Host 'Добавлено: !new_ip! !domain!' -ForegroundColor Magenta"
     )
+    
+    echo !new_ip! !domain!>> "%TEMP_FILE%"
 )
 
 move /y "%TEMP_FILE%" "%HOSTS_FILE%" >nul 2>&1
 
-:skip_hosts
+powershell -Command "Write-Host 'Готово!' -ForegroundColor Green"
+endlocal
+exit /b
