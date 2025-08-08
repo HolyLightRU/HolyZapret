@@ -31,7 +31,7 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.1 Console' -ForegroundColor DarkMagenta"
+powershell -Command "Write-Host 'HolyZapret 1.3.2 Console' -ForegroundColor DarkMagenta"
 powershell -Command "Write-Host '=======================' -ForegroundColor Magenta"
 
 powershell -Command "Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White"
