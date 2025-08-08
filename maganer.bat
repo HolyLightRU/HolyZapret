@@ -36,18 +36,36 @@ powershell -Command "Write-Host '=======================' -ForegroundColor Magen
 
 powershell -Command "Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White"
 powershell -Command "Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan"
-powershell -Command "Write-Host '3. Проверить текущий статус Запрета'-ForegroundColor White"
+powershell -Command "Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White"
 powershell -Command "Write-Host '4. Запустить диагностику' -ForegroundColor Magenta"
-powershell -Command "Write-Host '0. Выход' -ForegroundColor DarkMagenta"
+powershell -Command "Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta"
+powershell -Command "Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
-set /p "menu_choice=Выберите пункт (0-4): "
+set /p "menu_choice=Выберите пункт (0-5): "
 
 if "%menu_choice%"=="1" goto service_install
 if "%menu_choice%"=="2" goto service_remove
 if "%menu_choice%"=="3" goto service_status
 if "%menu_choice%"=="4" goto service_diagnostics
+if "%menu_choice%"=="5" goto run_hosts_system
 if "%menu_choice%"=="0" exit /b
+goto menu
+
+
+:: RUN HOLY_HOST_SYSTEM ================
+:run_hosts_system
+cls
+chcp 65001 > nul
+powershell -Command "Write-Host 'Запускаю holy_host_system.bat...' -ForegroundColor Cyan"
+
+if exist "%~dp0holy_host_system.bat" (
+    call "%~dp0holy_host_system.bat"
+) else (
+    powershell -Command "Write-Host 'Файл holy_host_system.bat не найден в текущей директории!' -ForegroundColor Red"
+)
+
+pause
 goto menu
 
 

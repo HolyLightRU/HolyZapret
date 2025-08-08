@@ -10,6 +10,8 @@ set "LISTS=%~dp0lists\"
 set "HOSTS_FILE=C:\Windows\System32\drivers\etc\hosts"
 set "HOSTS_LIST=%LISTS%hosts-list.txt"
 set "TEMP_FILE=%TEMP%\hosts.tmp"
+set "GITHUB_URL=https://raw.githubusercontent.com/HolyLightRU/HolyZapret/main/lists/hosts-list.txt"
+
 
 NET SESSION >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -17,6 +19,10 @@ if %ERRORLEVEL% NEQ 0 (
     powershell -Command "Start-Process -FilePath '%~dpnx0' -Verb RunAs"
     exit /b
 )
+
+powershell -Command "Write-Host 'Проверяю обновления hosts-list...' -ForegroundColor Yellow"
+
+powershell -Command "try { Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%HOSTS_LIST%' -ErrorAction Stop; Write-Host 'Файл hosts-list успешно обновлён' -ForegroundColor Green } catch { Write-Host 'Ошибка при загрузке файла: $_' -ForegroundColor Red }"
 
 powershell -Command "Write-Host 'Обновляю записи в файле hosts...' -ForegroundColor Yellow"
 
