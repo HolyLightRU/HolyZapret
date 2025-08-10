@@ -58,6 +58,8 @@
 204.12.192.219 libraweb-sg.tiktok.com 
 204.12.192.219 im-ws-sg.tiktok.com 
 204.12.192.219 sf16-sg.tiktokcdn.com 
+
+#Jebrains
 204.12.192.219 plugins.jetbrains.com
 204.12.192.219 jetbrains.com
 204.12.192.219 hub.jetbrains.com
@@ -65,3 +67,32 @@
 204.12.192.219 sgtm.jetbrains.com
 204.12.192.219 downloads.marketplace.jetbrains.com
 204.12.192.219 resources.jetbrains.com
+50.7.85.221 datalore.jetbrains.com
+107.150.34.100 plugins.jetbrains.com
+204.12.192.222 download.jetbrains.com
+
+#Блокировка хуйни
+0.0.0.0 only-fans.uk
+0.0.0.0 only-fans.me
+0.0.0.0 onlyfans.wtf
+0.0.0.0 iplogger.org
+0.0.0.0 wl.gl
+0.0.0.0 ed.tc
+0.0.0.0 bc.ax
+0.0.0.0 maper.info
+0.0.0.0 2no.co
+0.0.0.0 yip.su
+0.0.0.0 iplis.ru
+0.0.0.0 ezstat.ru
+0.0.0.0 iplog.co
+0.0.0.0 grabify.org
+0.0.0.0 log16-platform-ycru.tiktokv.com
+0.0.0.0 adfox.yandex.ru
+0.0.0.0 adfstat.yandex.ru
+0.0.0.0 ads-api.tiktok.com
+0.0.0.0 ads-api.twitter.com
+0.0.0.0 ads-dev.pinterest.com
+0.0.0.0 ads-sg.tiktok.com
+0.0.0.0 an.yandex.ru
+0.0.0.0 appmetrica.yandex.ru
+0.0.0.0 mc.yandex.ru
