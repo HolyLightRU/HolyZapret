@@ -1,0 +1,13 @@
+mobile.events.data.microsoft.com
+browser-intake-datadoghq.com
+api.msn.com
+odc.officeapps.live.com
+self.events.data.microsoft.com
+browser.pipe.aria.microsoft.com
+privacy.xboxlive.com
+fd.api.iris.microsoft.com
+ecs.office.com
+ocws.officeapps.live.com
+rta.xboxlive.com
+pinterest.com
+ru.pinterest.com

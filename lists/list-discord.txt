@@ -7,6 +7,7 @@ youtubeembeddedplayer.googleapis.com
 animego.org
 findanime.net
 animego-online.vip
+anilib.me
 ytimg.l.google.com
 ytimg.com
 jnn-pa.googleapis.com
@@ -19,6 +20,8 @@ jnn-pa.googleapis.com
 youtube-nocookie.com
 ads-api.x.com
 api.x.com
+pinterest.com
+ru.pinterest.com
 business.x.com
 caps.x.com
 help.x.com

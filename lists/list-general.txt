@@ -10,6 +10,9 @@ animego-online.vip
 ytimg.l.google.com
 ytimg.com
 jnn-pa.googleapis.com
+anilib.me
+pinterest.com
+ru.pinterest.com
 1.1.1.1
 fansly.com
 1.0.0.1

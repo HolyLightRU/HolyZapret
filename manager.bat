@@ -31,15 +31,7 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.2 Console' -ForegroundColor DarkMagenta"
-powershell -Command "Write-Host '=======================' -ForegroundColor Magenta"
-
-powershell -Command "Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White"
-powershell -Command "Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan"
-powershell -Command "Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White"
-powershell -Command "Write-Host '4. Запустить диагностику' -ForegroundColor Magenta"
-powershell -Command "Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta"
-powershell -Command "Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret 1.3.3 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
 set /p "menu_choice=Выберите пункт (0-5): "

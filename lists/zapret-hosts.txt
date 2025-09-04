@@ -10,6 +10,7 @@ discord.com
 gateway.discord.gg
 cdn.discordapp.com
 discordapp.net
+anilib.me
 discordapp.com
 discord.gg
 media.discordapp.net
