@@ -24,6 +24,12 @@ if "%1"=="admin" (
     exit /b
 )
 
+if "%~1"=="load_game_filter" (
+    call :game_switch_status
+    exit /b
+)
+
+
 
 :: MENU ================================
 @echo off
@@ -60,6 +66,21 @@ if exist "%~dp0holy_host_system.bat" (
 pause
 goto menu
 
+
+:: GAME SWITCH ========================
+:game_switch_status
+chcp 437 > nul
+
+set "gameFlagFile=%~dp0bin\game_filter.enabled"
+
+if exist "%gameFlagFile%" (
+    set "GameFilterStatus=enabled"
+    set "GameFilter=1024-65535"
+) else (
+    set "GameFilterStatus=disabled"
+    set "GameFilter=12"
+)
+exit /b
 
 :: STATUS ==============================
 :service_status
