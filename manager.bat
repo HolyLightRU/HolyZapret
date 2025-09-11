@@ -1,5 +1,5 @@
 @echo off
-set "LOCAL_VERSION=1.8.3"
+set "LOCAL_VERSION=1.3.4"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -37,7 +37,7 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.3 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret 1.3.4 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
 set /p "menu_choice=Выберите пункт (0-5): "
@@ -81,6 +81,23 @@ if exist "%gameFlagFile%" (
     set "GameFilter=12"
 )
 exit /b
+
+:game_switch
+chcp 437 > nul
+cls
+
+if not exist "%gameFlagFile%" (
+    echo Enabling game filter...
+    echo ENABLED > "%gameFlagFile%"
+    call :PrintYellow "Restart the zapret to apply the changes"
+) else (
+    echo Disabling game filter...
+    del /f /q "%gameFlagFile%"
+    call :PrintYellow "Restart the zapret to apply the changes"
+)
+
+pause
+goto menu
 
 :: STATUS ==============================
 :service_status
