@@ -1,5 +1,5 @@
 @echo off
-set "LOCAL_VERSION=1.3.5"
+set "LOCAL_VERSION=1.3.6"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -37,16 +37,17 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.5 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret 1.3.6 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
-set /p "menu_choice=Выберите пункт (0-5): "
+set /p "menu_choice=Выберите пункт (0-6): "
 
 if "%menu_choice%"=="1" goto service_install
 if "%menu_choice%"=="2" goto service_remove
 if "%menu_choice%"=="3" goto service_status
 if "%menu_choice%"=="4" goto service_diagnostics
 if "%menu_choice%"=="5" goto run_hosts_system
+if "%menu_choice%"=="6" goto update_auto_update
 if "%menu_choice%"=="0" exit /b
 goto menu
 
@@ -62,6 +63,21 @@ if exist "%~dp0holy_host_system.bat" (
 ) else (
     powershell -Command "Write-Host 'Файл holy_host_system.bat не найден в текущей директории!' -ForegroundColor Red"
 )
+
+pause
+goto menu
+
+
+:: UPDATE AUTO_UPDATE.BAT ==============
+:update_auto_update
+cls
+chcp 65001 > nul
+powershell -Command "Write-Host 'Обновляю auto_update.bat с GitHub...' -ForegroundColor DarkMagenta"
+
+set "GITHUB_URL=https://raw.githubusercontent.com/HolyLightRU/HolyZapret/main/auto_update.bat"
+set "LOCAL_FILE=%~dp0auto_update.bat"
+
+powershell -Command "try { Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%LOCAL_FILE%' -ErrorAction Stop; Write-Host 'Файл auto_update.bat успешно обновлён' -ForegroundColor Green } catch { Write-Host 'Ошибка при загрузке файла: $_' -ForegroundColor Red }"
 
 pause
 goto menu
