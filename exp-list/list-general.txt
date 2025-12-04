@@ -14,6 +14,7 @@ maven.minecraftforge.net
 minecraftforge.net
 telegram.org
 ubmidrupalcandd.s3-eu-west-1.amazonaws.com
+git.io
 writerscafe.s3.amazonaws.com
 epicgames.com
 fortnite.com
