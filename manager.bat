@@ -222,6 +222,9 @@ if not defined selectedFile (
     goto menu
 )
 
+:: Choose correct lists path for the selected strategy
+set "LISTS_PATH=%~dp0lists\"
+findstr /i "exp-list" "!selectedFile!" >nul 2>&1 && set "LISTS_PATH=%~dp0exp-list\"
 
 :: Args that should be followed by value
 set "args_with_value=sni"
@@ -461,4 +464,5 @@ exit /b
 
 :PrintYellow
 powershell -Command "Write-Host \"%~1\" -ForegroundColor Yellow"
+
 exit /b
