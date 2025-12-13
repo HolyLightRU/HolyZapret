@@ -1,5 +1,7 @@
-# HolyZapret
-
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/bab61ef8-a131-4b42-aae5-5af89f0e8631" width="175" height="175" alt="Лого HolyZapret"/>
+</div>
+<h1 align="center">HolyZapret</h1>
 Набор инструментов и экспериментов для обхода интернет-цензуры и ограничений, основанный на оригинальном проекте Zapret.
 
 ## ⚡️ Возможности
@@ -18,4 +20,5 @@
 ---
 Создано с любовью. Не претендую ни на что. 🩷
 
-![krisha](https://github.com/user-attachments/assets/473cc1a9-8e86-4330-996e-9ae58401ab87)
+<a href="https://git.io/typing-svg"><img src="https://readme-typing-svg.demolab.com?font=Exo+2&weight=300&size=50&letterSpacing=3px&duration=2500&pause=750&color=F7F7F7FF&center=false&vCenter=true&width=800&height=70&lines=%D0%9C%D1%8B+%D0%BD%D0%B5+%D0%BF%D1%80%D0%BE%D0%B8%D0%B3%D1%80%D0%B0%D0%B5%D0%BC+%D0%B1%D0%BE%D0%B9!;%D0%97%D0%B0+%D1%81%D0%B2%D0%BE%D0%B1%D0%BE%D0%B4%D0%BD%D1%8B%D0%B9+%D0%B8%D0%BD%D1%82%D0%B5%D1%80%D0%BD%D0%B5%D1%82!;%D0%9F%D0%BE%D0%BA%D0%B0+%D0%B5%D1%81%D1%82%D1%8C+%D1%82%D0%B5+%D0%BA%D1%82%D0%BE+%D1%81%D1%80%D0%B0%D0%B6%D0%B0%D1%8E%D1%82%D1%81%D1%8F!" alt="Typing SVG" /></a>
+
