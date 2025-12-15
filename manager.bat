@@ -193,10 +193,12 @@ set "count=0"
 for %%f in (*.bat) do (
     set "filename=%%~nxf"
     set "lowername=!filename!"
-    if /i not "!lowername:~0,7!"=="service" if /i not "!lowername!"=="holy_host_system.bat" (
-        set /a count+=1
-        echo !count!. %%f
-        set "file!count!=%%f"
+    if /i not "!filename!"=="%~n0.bat" (
+        if /i not "!lowername:~0,7!"=="service" if /i not "!lowername!"=="holy_host_system.bat" (
+            set /a count+=1
+            echo !count!. %%f
+            set "file!count!=%%f"
+        )
     )
 )
 
