@@ -1,5 +1,6 @@
 @echo off
-set "LOCAL_VERSION=1.3.8"
+chcp 65001 > nul
+set "LOCAL_VERSION=1.3.8.1"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -29,15 +30,61 @@ if "%~1"=="load_game_filter" (
     exit /b
 )
 
+:: ====================================
+:: Проверка обновлений — только после получения прав администратора
+:: ====================================
+if not "%1"=="admin" goto :skip_update_check
 
+powershell -Command "Write-Host 'Проверка наличия обновлений...' -ForegroundColor Cyan"
 
+set "REMOTE_URL=https://raw.githubusercontent.com/HolyLightRU/HolyZapret/main/manager.bat"
+set "TEMP_FILE=%TEMP%\holyzapret_remote_version.txt"
+
+powershell -Command "try { $content = (Invoke-WebRequest -Uri '%REMOTE_URL%' -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop).Content; if ($content -match 'set \"LOCAL_VERSION=(.*?)\"') { $matches[1] | Out-File -FilePath '%TEMP_FILE%' -Encoding UTF8 } else { 'ERROR_PARSE' | Out-File -FilePath '%TEMP_FILE%' -Encoding UTF8 } } catch { 'ERROR' | Out-File -FilePath '%TEMP_FILE%' -Encoding UTF8 }"
+
+if not exist "%TEMP_FILE%" (
+    powershell -Command "Write-Host 'Не удалось проверить обновления (проблема с загрузкой).' -ForegroundColor Yellow"
+    goto :skip_update_check
+)
+
+set /p REMOTE_VERSION= < "%TEMP_FILE%"
+del "%TEMP_FILE%" 2>nul
+
+if "%REMOTE_VERSION%"=="ERROR" (
+    powershell -Command "Write-Host 'Не удалось загрузить файл с GitHub (нет интернета или ошибка сети).' -ForegroundColor Yellow"
+	pause
+    goto :skip_update_check
+)
+
+if "%REMOTE_VERSION%"=="ERROR_PARSE" (
+    powershell -Command "Write-Host 'Не удалось распознать версию в файле на GitHub.' -ForegroundColor Yellow"
+	pause
+    goto :skip_update_check
+)
+
+if not "%LOCAL_VERSION%"=="%REMOTE_VERSION%" (
+    echo.
+    powershell -Command "Write-Host '==================================================================' -ForegroundColor Red"
+    powershell -Command "Write-Host 'Обнаружена новая версия HolyZapret!' -ForegroundColor Red"
+    powershell -Command "Write-Host 'Ваша версия: %LOCAL_VERSION%    ║    Последняя версия: %REMOTE_VERSION%' -ForegroundColor Red"
+    powershell -Command "Write-Host 'Настоятельно рекомендуется обновиться!' -ForegroundColor Red"
+    powershell -Command "Write-Host '==================================================================' -ForegroundColor Red"
+    echo.
+    timeout /t 5
+    goto :skip_update_check
+) else (
+    powershell -Command "Write-Host 'Ваша версия %LOCAL_VERSION% — самая актуальная.' -ForegroundColor Green"
+)
+
+:skip_update_check
+echo.
+:: ====================================
 :: MENU ================================
-@echo off
 setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.8 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret %LOCAL_VERSION% Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
 set /p "menu_choice=Выберите пункт (0-7): "
