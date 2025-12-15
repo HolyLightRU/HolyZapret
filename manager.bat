@@ -1,5 +1,5 @@
 @echo off
-set "LOCAL_VERSION=1.3.7.2"
+set "LOCAL_VERSION=1.3.8"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -37,10 +37,10 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret 1.3.7.2 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret 1.3.8 Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
-set /p "menu_choice=Выберите пункт (0-6): "
+set /p "menu_choice=Выберите пункт (0-7): "
 
 if "%menu_choice%"=="1" goto service_install
 if "%menu_choice%"=="2" goto service_remove
@@ -48,6 +48,7 @@ if "%menu_choice%"=="3" goto service_status
 if "%menu_choice%"=="4" goto service_diagnostics
 if "%menu_choice%"=="5" goto run_hosts_system
 if "%menu_choice%"=="6" goto update_auto_update
+if "%menu_choice%"=="7" goto check_sites
 if "%menu_choice%"=="0" exit /b
 goto menu
 
@@ -318,6 +319,9 @@ for %%F in ("!file%choice%!") do (
 )
 reg add "HKLM\System\CurrentControlSet\Services\zapret" /v zapret-discord-youtube /t REG_SZ /d "!filename!" /f
 
+powershell -Command "Write-Host '--- Проверка доступности сайтов после установки ---' -ForegroundColor Magenta"
+call :check_sites
+
 pause
 goto menu
 
@@ -449,6 +453,64 @@ if /i "!CHOICE!"=="Y" (
 )
 echo:
 
+pause
+goto menu
+
+:: CHECK SITES ============
+:check_sites
+cls
+chcp 65001 > nul
+powershell -Command "Write-Host '=== Проверка доступности сайтов ===' -ForegroundColor DarkMagenta"
+echo:
+
+set "LIST_FILE=%~dp0lists\check_list.txt"
+
+if not exist "%LIST_FILE%" (
+    call :PrintRed "[ERROR] Файл списка не найден!"
+    echo Путь: %LIST_FILE%
+    pause
+    goto menu
+)
+
+set "PS_CMD="
+set "PS_CMD=!PS_CMD! Add-Type -AssemblyName System.Net.Http; "
+set "PS_CMD=!PS_CMD! $urls = Get-Content '%LIST_FILE%' | Where-Object { $_ -match '^http' }; "
+set "PS_CMD=!PS_CMD! $client = New-Object System.Net.Http.HttpClient; "
+set "PS_CMD=!PS_CMD! $client.Timeout = [TimeSpan]::FromSeconds(4); "
+set "PS_CMD=!PS_CMD! $client.DefaultRequestHeaders.UserAgent.ParseAdd('Mozilla/5.0 (Windows NT 10.0; Win64; x64)'); "
+set "PS_CMD=!PS_CMD! $taskMap = @{}; "
+set "PS_CMD=!PS_CMD! $taskList = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]; "
+set "PS_CMD=!PS_CMD! foreach ($url in $urls) { "
+set "PS_CMD=!PS_CMD!     try { "
+set "PS_CMD=!PS_CMD!         $t = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead); "
+set "PS_CMD=!PS_CMD!         $taskMap[$t] = $url; "
+set "PS_CMD=!PS_CMD!         $taskList.Add($t); "
+set "PS_CMD=!PS_CMD!     } catch {} "
+set "PS_CMD=!PS_CMD! } "
+set "PS_CMD=!PS_CMD! Write-Host 'Запросы отправлены, ожидайте ответа...' -ForegroundColor Magenta; "
+set "PS_CMD=!PS_CMD! try { [System.Threading.Tasks.Task]::WaitAll($taskList.ToArray()) } catch {} "
+set "PS_CMD=!PS_CMD! $ok = 0; $total = 0; "
+set "PS_CMD=!PS_CMD! foreach ($pair in $taskMap.GetEnumerator()) { "
+set "PS_CMD=!PS_CMD!     $t = $pair.Key; "
+set "PS_CMD=!PS_CMD!     $u = $pair.Value; "
+set "PS_CMD=!PS_CMD!     $total++; "
+set "PS_CMD=!PS_CMD!     $isSuccess = $false; "
+set "PS_CMD=!PS_CMD!     if ($t.Status -eq 'RanToCompletion') { "
+set "PS_CMD=!PS_CMD!         if ($t.Result.IsSuccessStatusCode) { $isSuccess = $true } "
+set "PS_CMD=!PS_CMD!     } "
+set "PS_CMD=!PS_CMD!     if ($isSuccess) { "
+set "PS_CMD=!PS_CMD!         $ok++; Write-Host ' [OK]   ' -NoNewline -ForegroundColor Green; Write-Host $u -ForegroundColor White; "
+set "PS_CMD=!PS_CMD!     } else { "
+set "PS_CMD=!PS_CMD!         Write-Host ' [FAIL] ' -NoNewline -ForegroundColor Red; Write-Host $u -ForegroundColor DarkGray; "
+set "PS_CMD=!PS_CMD!     } "
+set "PS_CMD=!PS_CMD! } "
+set "PS_CMD=!PS_CMD! Write-Host ''; "
+set "PS_CMD=!PS_CMD! if ($ok -eq $total) { Write-Host ('Итог: Все сайты доступны (' + $ok + '/' + $total + ')') -ForegroundColor Green } "
+set "PS_CMD=!PS_CMD! else { Write-Host ('Итог: Доступно ' + $ok + ' из ' + $total) -ForegroundColor Cyan } "
+
+powershell -Command "!PS_CMD!"
+
+echo:
 pause
 goto menu
 
