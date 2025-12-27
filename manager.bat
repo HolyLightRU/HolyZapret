@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=1.3.8.1"
+set "LOCAL_VERSION=1.3.9"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -230,6 +230,7 @@ chcp 65001 > nul
 cd /d "%~dp0"
 set "BIN_PATH=%~dp0bin\"
 set "LISTS_PATH=%~dp0lists\"
+set "GameFilter=1024-65535"
 
 :: Searching for .bat files in current folder and additional\, except files that start with "service"
 echo Выберите одну стратегию из списка:
@@ -277,7 +278,7 @@ set "LISTS_PATH=%~dp0lists\"
 findstr /i "exp-list" "!selectedFile!" >nul 2>&1 && set "LISTS_PATH=%~dp0exp-list\"
 
 :: Args that should be followed by value
-set "args_with_value=sni"
+set "args_with_value=sni host altorder"
 
 :: Parsing args (mergeargs: 2=start param|3=arg with value|1=params args|0=default)
 set "args="
@@ -322,6 +323,8 @@ for /f "tokens=*" %%a in ('type "!selectedFile!"') do (
                     ) else (
                         set "arg=\!QUOTE!%~dp0!arg!\!QUOTE!"
                     )
+                ) else if "!arg:~0,12!" EQU "%%GameFilter%%" (
+                    set "arg=%GameFilter%"
                 )
 
                 if !mergeargs!==1 (
