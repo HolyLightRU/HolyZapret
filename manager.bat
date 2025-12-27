@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=1.3.9"
+set "LOCAL_VERSION=1.4.0"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -84,10 +84,10 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret %LOCAL_VERSION% Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret %LOCAL_VERSION% Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '8. Проверить стратегии' -ForegroundColor Magenta; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
-set /p "menu_choice=Выберите пункт (0-7): "
+set /p "menu_choice=Выберите пункт (0-8): "
 
 if "%menu_choice%"=="1" goto service_install
 if "%menu_choice%"=="2" goto service_remove
@@ -96,6 +96,7 @@ if "%menu_choice%"=="4" goto service_diagnostics
 if "%menu_choice%"=="5" goto run_hosts_system
 if "%menu_choice%"=="6" goto update_auto_update
 if "%menu_choice%"=="7" goto check_sites
+if "%menu_choice%"=="8" goto run_tests
 if "%menu_choice%"=="0" exit /b
 goto menu
 
@@ -115,6 +116,26 @@ if exist "%~dp0holy_host_system.bat" (
 pause
 goto menu
 
+:: RUN TESTS =============================
+:run_tests
+chcp 65001 >nul
+cls
+
+:: Require PowerShell 2.0+
+powershell -NoProfile -Command "if ($PSVersionTable -and $PSVersionTable.PSVersion -and $PSVersionTable.PSVersion.Major -ge 2) { exit 0 } else { exit 1 }" >nul 2>&1
+if %errorLevel% neq 0 (
+    echo PowerShell 2.0 or newer is required.
+    echo Please upgrade PowerShell and rerun this script.
+    echo.
+    pause
+    goto menu
+)
+
+echo Starting configuration tests in PowerShell window...
+echo.
+start "" powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0utils\test zapret.ps1"
+pause
+goto menu
 
 :: UPDATE AUTO_UPDATE.BAT ==============
 :update_auto_update
@@ -232,53 +253,106 @@ set "BIN_PATH=%~dp0bin\"
 set "LISTS_PATH=%~dp0lists\"
 set "GameFilter=1024-65535"
 
-:: Searching for .bat files in current folder and additional\, except files that start with "service"
-echo Выберите одну стратегию из списка:
+:: Step 1: Choose folder (category)
+echo ========================================
+echo Шаг 1: Выберите категорию
+echo ========================================
 setlocal EnableDelayedExpansion
 set "count=0"
 
-:: Поиск в корне
-for %%f in (*.bat) do (
-    set "filename=%%~nxf"
-    set "lowername=!filename!"
-    if /i not "!filename!"=="%~n0.bat" (
+:: Add root folder as option
+set /a count+=1
+echo !count!. Основные стратегии (корневая папка)
+set "folder!count!=."
+
+:: Find all subfolders with .bat files
+for /d %%d in (*) do (
+    dir "%%d\*.bat" /b >nul 2>&1
+    if not errorlevel 1 (
+        set /a count+=1
+        echo !count!. %%d
+        set "folder!count!=%%d"
+    )
+)
+
+:: Choosing folder
+set "folder_choice="
+set /p "folder_choice=Выберите категорию (циферка): "
+if "!folder_choice!"=="" goto menu
+
+set "selectedFolder=!folder%folder_choice%!"
+if not defined selectedFolder (
+    echo Неверный выбор, возврат в меню...
+    pause
+    goto menu
+)
+
+:: Step 2: Choose strategy from selected folder
+cls
+echo ========================================
+echo Шаг 2: Выберите стратегию из папки: !selectedFolder!
+echo ========================================
+
+set "count=0"
+set "file_list="
+
+:: Search in selected folder (root or subfolder)
+if "!selectedFolder!"=="." (
+    :: Search in root
+    for %%f in (*.bat) do (
+        set "filename=%%~nxf"
+        set "lowername=!filename!"
+        if /i not "!filename!"=="%~n0.bat" (
+            if /i not "!lowername:~0,7!"=="service" if /i not "!lowername!"=="holy_host_system.bat" (
+                set /a count+=1
+                echo !count!. %%f
+                set "file!count!=%%f"
+                set "file_list=!file_list! %%f"
+            )
+        )
+    )
+) else (
+    :: Search in subfolder
+    for %%f in ("!selectedFolder!\*.bat") do (
+        set "filename=%%~nxf"
+        set "lowername=!filename!"
         if /i not "!lowername:~0,7!"=="service" if /i not "!lowername!"=="holy_host_system.bat" (
             set /a count+=1
             echo !count!. %%f
             set "file!count!=%%f"
+            set "file_list=!file_list! %%f"
         )
     )
 )
 
-:: Поиск в additional\
-for %%f in (additional\*.bat) do (
-    set "filename=%%~nxf"
-    set "lowername=!filename!"
-    if /i not "!lowername:~0,7!"=="service" if /i not "!lowername!"=="holy_host_system.bat" (
-        set /a count+=1
-        echo !count!. %%f
-        set "file!count!=%%f"
-    )
+if !count!==0 (
+    echo В выбранной папке не найдено подходящих .bat файлов!
+    pause
+    goto menu
 )
 
 :: Choosing file
 set "choice="
-set /p "choice=Выберите индекс необходимой стратегии (циферка): "
-if "!choice!"=="" goto :eof
+set /p "choice=Выберите стратегию (циферка): "
+if "!choice!"=="" goto menu
 
 set "selectedFile=!file%choice%!"
 if not defined selectedFile (
-    echo Invalid choice, exiting...
+    echo Неверный выбор, возврат в меню...
     pause
     goto menu
 )
+
+echo.
+echo Выбрана стратегия: !selectedFile!
+echo.
 
 :: Choose correct lists path for the selected strategy
 set "LISTS_PATH=%~dp0lists\"
 findstr /i "exp-list" "!selectedFile!" >nul 2>&1 && set "LISTS_PATH=%~dp0exp-list\"
 
 :: Args that should be followed by value
-set "args_with_value=sni host altorder"
+set "args_with_value=sni host altorder dpi-desync-fake-tls-mod dpi-desync-hostfakesplit-mod"
 
 :: Parsing args (mergeargs: 2=start param|3=arg with value|1=params args|0=default)
 set "args="
@@ -300,55 +374,14 @@ for /f "tokens=*" %%a in ('type "!selectedFile!"') do (
         )
 
         set "temp_args="
-        for %%i in (!line!) do (
-            set "arg=%%i"
-
-            if not "!arg!"=="^" (
-                if "!arg:~0,2!" EQU "--" if not !mergeargs!==0 (
-                    set "mergeargs=0"
-                )
-
-                if "!arg:~0,1!" EQU "!QUOTE!" (
-                    set "arg=!arg:~1,-1!"
-
-                    echo !arg! | findstr ":" >nul
-                    if !errorlevel!==0 (
-                        set "arg=\!QUOTE!!arg!\!QUOTE!"
-                    ) else if "!arg:~0,1!"=="@" (
-                        set "arg=\!QUOTE!@%~dp0!arg:~1!\!QUOTE!"
-                    ) else if "!arg:~0,5!"=="%%BIN%%" (
-                        set "arg=\!QUOTE!!BIN_PATH!!arg:~5!\!QUOTE!"
-                    ) else if "!arg:~0,7!"=="%%LISTS%%" (
-                        set "arg=\!QUOTE!!LISTS_PATH!!arg:~7!\!QUOTE!"
-                    ) else (
-                        set "arg=\!QUOTE!%~dp0!arg!\!QUOTE!"
-                    )
-                ) else if "!arg:~0,12!" EQU "%%GameFilter%%" (
-                    set "arg=%GameFilter%"
-                )
-
-                if !mergeargs!==1 (
-                    set "temp_args=!temp_args!,!arg!"
-                ) else if !mergeargs!==3 (
-                    set "temp_args=!temp_args!=!arg!"
-                    set "mergeargs=1"
-                ) else (
-                    set "temp_args=!temp_args! !arg!"
-                )
-
-                if "!arg:~0,2!" EQU "--" (
-                    set "mergeargs=2"
-                ) else if !mergeargs!==2 (
-                    set "mergeargs=1"
-                ) else if !mergeargs!==1 (
-                    for %%x in (!args_with_value!) do (
-                        if /i "%%x"=="!arg!" (
-                            set "mergeargs=3"
-                        )
-                    )
-                )
-            )
-        )
+        set "temp_line=!line!"
+        set "temp_line=!temp_line:*HolyZapret.exe"=!"
+        
+        set "temp_line=!temp_line:%%BIN%%=%BIN_PATH%!"
+        set "temp_line=!temp_line:%%LISTS%%=%LISTS_PATH%!"
+        set "temp_line=!temp_line:%%GameFilter%%=%GameFilter%!"
+        
+        set "args=!args! !temp_line!"
 
         if not "!temp_args!"=="" (
             set "args=!args! !temp_args!"
@@ -358,19 +391,25 @@ for /f "tokens=*" %%a in ('type "!selectedFile!"') do (
 
 :: Creating service with parsed args
 set ARGS=%args%
-echo Final args: !ARGS!
+echo Итоговые аргументы: !ARGS!
 set SRVCNAME=zapret
+
+echo.
+echo Устанавливаю сервис...
 
 net stop %SRVCNAME% >nul 2>&1
 sc delete %SRVCNAME% >nul 2>&1
 sc create %SRVCNAME% binPath= "\"%BIN_PATH%HolyZapret.exe\" %ARGS%" DisplayName= "zapret" start= auto
 sc description %SRVCNAME% "Zapret DPI bypass software"
 sc start %SRVCNAME%
-for %%F in ("!file%choice%!") do (
+
+for %%F in ("!selectedFile!") do (
     set "filename=%%~nF"
 )
 reg add "HKLM\System\CurrentControlSet\Services\zapret" /v zapret-discord-youtube /t REG_SZ /d "!filename!" /f
 
+powershell -Command "Write-Host 'Сервис успешно установлен!' -ForegroundColor Green"
+echo.
 powershell -Command "Write-Host '--- Проверка доступности сайтов после установки ---' -ForegroundColor Magenta"
 call :check_sites
 
