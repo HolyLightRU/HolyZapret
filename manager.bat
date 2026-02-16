@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=1.4.0"
+set "LOCAL_VERSION=1.4.2"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -230,13 +230,27 @@ cls
 chcp 65001 > nul
 
 set SRVCNAME=zapret
-net stop %SRVCNAME%
-sc delete %SRVCNAME%
+sc query "!SRVCNAME!" >nul 2>&1
+if !errorlevel!==0 (
+    net stop %SRVCNAME%
+    sc delete %SRVCNAME%
+    call :PrintGreen "Сервис HolyZapret / Zapret успешно удален."
+) else (
+    call :PrintYellow "Сервис HolyZapret / Zapret не установлен."
+)
 
-net stop "WinDivert"
-sc delete "WinDivert"
-net stop "WinDivert14"
-sc delete "WinDivert14"
+sc query "WinDivert" >nul 2>&1
+if !errorlevel!==0 (
+    net stop "WinDivert" >nul 2>&1
+    sc delete "WinDivert" >nul 2>&1
+)
+net stop "WinDivert14" >nul 2>&1
+sc delete "WinDivert14" >nul 2>&1
+
+tasklist /FI "IMAGENAME eq HolyZapret.exe" | find /I "HolyZapret.exe" > nul
+if !errorlevel!==0 (
+    taskkill /IM winws.exe /F > nul
+)
 
 pause
 goto menu
@@ -376,11 +390,11 @@ for /f "tokens=*" %%a in ('type "!selectedFile!"') do (
         set "temp_args="
         set "temp_line=!line!"
         set "temp_line=!temp_line:*HolyZapret.exe"=!"
-        
+
         set "temp_line=!temp_line:%%BIN%%=%BIN_PATH%!"
         set "temp_line=!temp_line:%%LISTS%%=%LISTS_PATH%!"
         set "temp_line=!temp_line:%%GameFilter%%=%GameFilter%!"
-        
+
         set "args=!args! !temp_line!"
 
         if not "!temp_args!"=="" (
