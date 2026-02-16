@@ -249,6 +249,11 @@ sc delete "WinDivert14" >nul 2>&1
 
 tasklist /FI "IMAGENAME eq HolyZapret.exe" | find /I "HolyZapret.exe" > nul
 if !errorlevel!==0 (
+    taskkill /IM HolyZapret.exe /F > nul
+)
+
+tasklist /FI "IMAGENAME eq winws.exe" | find /I "wiwns.exe" > nul
+if !errorlevel!==0 (
     taskkill /IM winws.exe /F > nul
 )
 
