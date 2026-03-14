@@ -52914,6 +52914,9 @@ gvozdoder.info
 gvt1.com
 gvv-omsk.ru
 gw-business.ru
+android.clients.google.com
+dl-ssl.google.com
+dl.google.com
 gw-way.ru
 gw7pokerdom.com
 gwadacarwash.com
@@ -148309,6 +148312,8 @@ ysshop.cc
 yt-video-upload.l.google.com
 yt.be
 yt3.ggpht.com
+yt4.ggpht.com
+yt3.googleusercontent.com
 yt7pokerdom.com
 ytaunion.com
 ytbney.com
