@@ -30,9 +30,6 @@ if "%~1"=="load_game_filter" (
     exit /b
 )
 
-:: ====================================
-:: Проверка обновлений — только после получения прав администратора
-:: ====================================
 if not "%1"=="admin" goto :skip_update_check
 
 powershell -Command "Write-Host 'Проверка наличия обновлений...' -ForegroundColor Cyan"
@@ -78,8 +75,7 @@ if not "%LOCAL_VERSION%"=="%REMOTE_VERSION%" (
 
 :skip_update_check
 echo.
-:: ====================================
-:: MENU ================================
+
 setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
@@ -100,8 +96,6 @@ if "%menu_choice%"=="8" goto run_tests
 if "%menu_choice%"=="0" exit /b
 goto menu
 
-
-:: RUN HOLY_HOST_SYSTEM ================
 :run_hosts_system
 cls
 chcp 65001 > nul
@@ -116,12 +110,10 @@ if exist "%~dp0holy_host_system.bat" (
 pause
 goto menu
 
-:: RUN TESTS =============================
 :run_tests
 chcp 65001 >nul
 cls
 
-:: Require PowerShell 2.0+
 powershell -NoProfile -Command "if ($PSVersionTable -and $PSVersionTable.PSVersion -and $PSVersionTable.PSVersion.Major -ge 2) { exit 0 } else { exit 1 }" >nul 2>&1
 if %errorLevel% neq 0 (
     echo PowerShell 2.0 or newer is required.
@@ -137,7 +129,6 @@ start "" powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0utils\test za
 pause
 goto menu
 
-:: UPDATE AUTO_UPDATE.BAT ==============
 :update_auto_update
 cls
 chcp 65001 > nul
@@ -151,8 +142,6 @@ powershell -Command "try { Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%LOCA
 pause
 goto menu
 
-
-:: GAME SWITCH ========================
 :game_switch_status
 chcp 437 > nul
 
@@ -184,7 +173,6 @@ if not exist "%gameFlagFile%" (
 pause
 goto menu
 
-:: STATUS ==============================
 :service_status
 cls
 chcp 65001 > nul
@@ -223,8 +211,6 @@ if "%ServiceStatus%"=="RUNNING" (
 
 exit /b
 
-
-:: REMOVE ==============================
 :service_remove
 cls
 chcp 65001 > nul
@@ -260,31 +246,25 @@ if !errorlevel!==0 (
 pause
 goto menu
 
-
-:: INSTALL =============================
 :service_install
 cls
 chcp 65001 > nul
 
-:: Main
 cd /d "%~dp0"
 set "BIN_PATH=%~dp0bin\"
 set "LISTS_PATH=%~dp0lists\"
 set "GameFilter=1024-65535"
 
-:: Step 1: Choose folder (category)
 echo ========================================
 echo Шаг 1: Выберите категорию
 echo ========================================
 setlocal EnableDelayedExpansion
 set "count=0"
 
-:: Add root folder as option
 set /a count+=1
 echo !count!. Основные стратегии (корневая папка)
 set "folder!count!=."
 
-:: Find all subfolders with .bat files
 for /d %%d in (*) do (
     dir "%%d\*.bat" /b >nul 2>&1
     if not errorlevel 1 (
@@ -294,7 +274,6 @@ for /d %%d in (*) do (
     )
 )
 
-:: Choosing folder
 set "folder_choice="
 set /p "folder_choice=Выберите категорию (циферка): "
 if "!folder_choice!"=="" goto menu
@@ -306,7 +285,6 @@ if not defined selectedFolder (
     goto menu
 )
 
-:: Step 2: Choose strategy from selected folder
 cls
 echo ========================================
 echo Шаг 2: Выберите стратегию из папки: !selectedFolder!
@@ -315,9 +293,7 @@ echo ========================================
 set "count=0"
 set "file_list="
 
-:: Search in selected folder (root or subfolder)
 if "!selectedFolder!"=="." (
-    :: Search in root
     for %%f in (*.bat) do (
         set "filename=%%~nxf"
         set "lowername=!filename!"
@@ -331,7 +307,6 @@ if "!selectedFolder!"=="." (
         )
     )
 ) else (
-    :: Search in subfolder
     for %%f in ("!selectedFolder!\*.bat") do (
         set "filename=%%~nxf"
         set "lowername=!filename!"
@@ -350,7 +325,6 @@ if !count!==0 (
     goto menu
 )
 
-:: Choosing file
 set "choice="
 set /p "choice=Выберите стратегию (циферка): "
 if "!choice!"=="" goto menu
@@ -366,14 +340,11 @@ echo.
 echo Выбрана стратегия: !selectedFile!
 echo.
 
-:: Choose correct lists path for the selected strategy
 set "LISTS_PATH=%~dp0lists\"
 findstr /i "exp-list" "!selectedFile!" >nul 2>&1 && set "LISTS_PATH=%~dp0exp-list\"
 
-:: Args that should be followed by value
 set "args_with_value=sni host altorder dpi-desync-fake-tls-mod dpi-desync-hostfakesplit-mod"
 
-:: Parsing args (mergeargs: 2=start param|3=arg with value|1=params args|0=default)
 set "args="
 set "capture=0"
 set "mergeargs=0"
@@ -408,7 +379,6 @@ for /f "tokens=*" %%a in ('type "!selectedFile!"') do (
     )
 )
 
-:: Creating service with parsed args
 set ARGS=%args%
 echo Итоговые аргументы: !ARGS!
 set SRVCNAME=zapret
@@ -435,8 +405,6 @@ call :check_sites
 pause
 goto menu
 
-
-:: DIAGNOSTICS =========================
 :service_diagnostics
 chcp 65001 > nul
 cls
@@ -461,7 +429,6 @@ if !errorlevel!==0 (
 )
 echo:
 
-:: Intel Connectivity Network Service
 sc query | findstr /I "Intel" | findstr /I "Connectivity" | findstr /I "Network" > nul
 if !errorlevel!==0 (
     call :PrintRed "[X] Intel Connectivity Network Service found. It conflicts with zapret"
@@ -471,7 +438,6 @@ if !errorlevel!==0 (
 )
 echo:
 
-:: Check Point
 set "checkpointFound=0"
 sc query | findstr /I "TracSrvWrapper" > nul
 if !errorlevel!==0 (
@@ -491,7 +457,6 @@ if !checkpointFound!==1 (
 )
 echo:
 
-:: SmartByte
 sc query | findstr /I "SmartByte" > nul
 if !errorlevel!==0 (
     call :PrintRed "[X] SmartByte services found. SmartByte conflicts with zapret"
@@ -501,7 +466,6 @@ if !errorlevel!==0 (
 )
 echo:
 
-:: VPN
 sc query | findstr /I "VPN" > nul
 if !errorlevel!==0 (
     call :PrintYellow "[?] Some VPN services found. Some VPNs can conflict with zapret"
@@ -511,7 +475,6 @@ if !errorlevel!==0 (
 )
 echo:
 
-:: DNS
 set "dnsfound=0"
 for /f "skip=1 tokens=*" %%a in ('wmic nicconfig where "IPEnabled=true" get DNSServerSearchOrder /format:table') do (
     echo %%a | findstr /i "192.168." >nul
@@ -527,7 +490,6 @@ if !dnsfound!==1 (
 )
 echo:
 
-:: Discord cache clearing
 set "CHOICE="
 set /p "CHOICE=Do you want to clear the Discord cache? (Y/N) (default: Y)  "
 if "!CHOICE!"=="" set "CHOICE=Y"
@@ -566,7 +528,6 @@ echo:
 pause
 goto menu
 
-:: CHECK SITES ============
 :check_sites
 cls
 chcp 65001 > nul
@@ -623,8 +584,6 @@ powershell -Command "!PS_CMD!"
 echo:
 pause
 goto menu
-
-:: Utility functions
 
 :PrintGreen
 powershell -Command "Write-Host \"%~1\" -ForegroundColor Green"
