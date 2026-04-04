@@ -659,7 +659,8 @@ if "!tg_choice!"=="3" (
     goto run_tg_ws_proxy
 )
 if "!tg_choice!"=="4" (
-    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" /t REG_SZ /d "\"%~dp0bin\tg-ws-proxy.exe\" --port 1443 --no-gui" /f >nul
+    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" /t REG_SZ ^
+        /d "cmd.exe /c start \"\" /B /D \"%~dp0bin\" \"%~dp0bin\tg-ws-proxy.exe\" --port 1443 --no-gui" /f >nul
     call :PrintGreen "TG WS Proxy добавлен в автозагрузку Windows."
     pause
     goto run_tg_ws_proxy
