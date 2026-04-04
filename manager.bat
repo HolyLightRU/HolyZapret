@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=1.4.3"
+set "LOCAL_VERSION=2.0.0"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -80,7 +80,7 @@ setlocal EnableDelayedExpansion
 chcp 65001 > nul
 :menu
 cls
-powershell -Command "Write-Host 'HolyZapret %LOCAL_VERSION% Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '8. Проверить стратегии' -ForegroundColor Magenta; Write-Host '0. Выход' -ForegroundColor White"
+powershell -Command "Write-Host 'HolyZapret %LOCAL_VERSION% Console' -ForegroundColor DarkMagenta; Write-Host '=======================' -ForegroundColor Magenta; Write-Host '1. Установить сервис (скрытая версия)' -ForegroundColor White; Write-Host '2. Удалить запрет и сервис' -ForegroundColor Cyan; Write-Host '3. Проверить текущий статус Запрета' -ForegroundColor White; Write-Host '4. Запустить диагностику' -ForegroundColor Magenta; Write-Host '5. Обновить hosts файл (holy_host_system)' -ForegroundColor DarkMagenta; Write-Host '6. Обновить auto_update.bat' -ForegroundColor White; Write-Host '7. Проверить доступность сайтов' -ForegroundColor Cyan; Write-Host '8. Проверить стратегии' -ForegroundColor Magenta; Write-Host '9. Локальный прокси для ТГ' -ForegroundColor DarkMagenta; Write-Host '0. Выход' -ForegroundColor White"
 
 set "menu_choice="
 set /p "menu_choice=Выберите пункт (0-8): "
@@ -93,6 +93,7 @@ if "%menu_choice%"=="5" goto run_hosts_system
 if "%menu_choice%"=="6" goto update_auto_update
 if "%menu_choice%"=="7" goto check_sites
 if "%menu_choice%"=="8" goto run_tests
+if "%menu_choice%"=="9" goto run_tg_ws_proxy
 if "%menu_choice%"=="0" exit /b
 goto menu
 
@@ -399,6 +400,16 @@ reg add "HKLM\System\CurrentControlSet\Services\zapret" /v zapret-discord-youtub
 
 powershell -Command "Write-Host 'Сервис успешно установлен!' -ForegroundColor Green"
 echo.
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" >nul 2>&1
+if !errorlevel! neq 0 (
+    powershell -Command "Write-Host 'Прокси для Telegram еще не настроен.' -ForegroundColor Cyan"
+    set /p "goto_tg=Перейти к настройке TG WS Proxy? (Y/N): "
+    if /i "!goto_tg!"=="Y" (
+        goto run_tg_ws_proxy
+    )
+)
+
+echo.
 powershell -Command "Write-Host '--- Проверка доступности сайтов после установки ---' -ForegroundColor Magenta"
 call :check_sites
 
@@ -524,7 +535,12 @@ if /i "!CHOICE!"=="Y" (
     )
 )
 echo:
-
+tasklist /FI "IMAGENAME eq tg-ws-proxy.exe" | find /I "tg-ws-proxy.exe" > nul
+if !errorlevel!==0 (
+    call :PrintGreen "TG WS Proxy: активен"
+) else (
+    call :PrintYellow "TG WS Proxy: не запущен"
+)
 pause
 goto menu
 
@@ -584,6 +600,78 @@ powershell -Command "!PS_CMD!"
 echo:
 pause
 goto menu
+
+:run_tg_ws_proxy
+cls
+chcp 65001 > nul
+echo ========================================
+echo Telegram WS Proxy Manager
+echo ========================================
+echo 1. Запустить прокси
+echo 2. Остановить прокси
+echo 3. Проверить статус
+echo 4. Включить автозапуск (при старте Windows)
+echo 5. Отключить автозапуск
+echo 0. Назад
+set /p "tg_choice=Выбор: "
+
+if "!tg_choice!"=="1" (
+    tasklist /FI "IMAGENAME eq tg-ws-proxy.exe" | find /I "tg-ws-proxy.exe" > nul
+    if !errorlevel!==0 (
+        call :PrintYellow "TG WS Proxy уже запущен."
+    ) else (
+        start "" /B "%~dp0bin\tg-ws-proxy.exe" --port 1443 --no-gui
+        call :PrintGreen "TG WS Proxy успешно запущен на порту 1443."
+    )
+    pause
+    goto run_tg_ws_proxy
+)
+if "!tg_choice!"=="2" (
+    taskkill /IM tg-ws-proxy.exe /F >nul 2>&1
+    if !errorlevel!==0 (
+        call :PrintYellow "Процесс tg-ws-proxy остановлен."
+    ) else (
+        call :PrintRed "Процесс не найден или уже остановлен."
+    )
+    reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" /f >nul 2>&1
+        call :PrintYellow "TG WS Proxy удален из автозагрузки."
+        pause
+        goto run_tg_ws_proxy
+)
+if "!tg_choice!"=="3" (
+    echo.
+    tasklist /FI "IMAGENAME eq tg-ws-proxy.exe" | find /I "tg-ws-proxy.exe" > nul
+    if !errorlevel!==0 (
+        call :PrintGreen "Статус процесса: АКТИВЕН"
+        netstat -ano | findstr :1443
+    ) else (
+        call :PrintRed "Статус процесса: НЕ ЗАПУЩЕН"
+    )
+
+    reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" >nul 2>&1
+    if !errorlevel!==0 (
+        call :PrintGreen "Автозагрузка: ВКЛЮЧЕНА"
+    ) else (
+        call :PrintYellow "Автозагрузка: ВЫКЛЮЧЕНА"
+    )
+    echo.
+    pause
+    goto run_tg_ws_proxy
+)
+if "!tg_choice!"=="4" (
+    reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" /t REG_SZ /d "\"%~dp0bin\tg-ws-proxy.exe\" --port 1443 --no-gui" /f >nul
+    call :PrintGreen "TG WS Proxy добавлен в автозагрузку Windows."
+    pause
+    goto run_tg_ws_proxy
+)
+if "!tg_choice!"=="5" (
+    reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "HolyTGProxy" /f >nul 2>&1
+    call :PrintYellow "TG WS Proxy удален из автозагрузки."
+    pause
+    goto run_tg_ws_proxy
+)
+if "!tg_choice!"=="0" goto menu
+goto run_tg_ws_proxy
 
 :PrintGreen
 powershell -Command "Write-Host \"%~1\" -ForegroundColor Green"
