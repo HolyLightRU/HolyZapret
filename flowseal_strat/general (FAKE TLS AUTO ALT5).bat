@@ -7,7 +7,7 @@ set "BIN=%CD%\bin\"
 set "LISTS=%CD%\exp-list\"
 set "GameFilter=1024-65535"
 
-powershell -Command "Write-Host 'Стратегия из репозитория FlowersOfMind' -ForegroundColor DarkMagenta"
+powershell -Command "Write-Host 'Стратегия из оригинального репозитория' -ForegroundColor DarkMagenta"
 powershell -Command "Write-Host 'Перебирайте все additional по очереди' -ForegroundColor Magenta"
 
 "%BIN%HolyZapret.exe" --wf-tcp=80,443,2053,2083,2087,2096,8443,%GameFilter% --wf-udp=443,19294-19344,50000-50100,%GameFilter% ^
