@@ -3,6 +3,10 @@
 7tv.app
 7tv.gg
 7tv.io
+e4mc.link
+eu.e4mc.link
+backend.e4mc.link
+broker.e4mc.link
 a-007.ru
 a-196.ru
 a-3studio.ru

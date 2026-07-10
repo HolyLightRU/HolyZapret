@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=2.0.1"
+set "LOCAL_VERSION=2.0.2"
 
 :: External commands
 if "%~1"=="status_zapret" (
@@ -93,7 +93,6 @@ if "%menu_choice%"=="5" goto run_hosts_system
 if "%menu_choice%"=="6" goto update_auto_update
 if "%menu_choice%"=="7" goto check_sites
 if "%menu_choice%"=="8" goto run_tests
-if "%menu_choice%"=="9" goto run_tg_ws_proxy
 if "%menu_choice%"=="0" exit /b
 goto menu
 
