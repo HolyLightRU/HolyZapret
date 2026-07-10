@@ -10,7 +10,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content '%~f0'; $i = [Array]::IndexOf($c, '#=== PURE POWERSHELL ===#'); Invoke-Expression ($c[($i+1)..$c.Length] -join [Environment]::NewLine)"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = [System.IO.File]::ReadAllLines(\"%~f0\", [System.Text.Encoding]::UTF8); $i = [Array]::IndexOf($c, '#=== PURE POWERSHELL ===#'); Invoke-Expression ($c[($i+1)..$c.Length] -join [Environment]::NewLine)"
 exit /b
 
 #=== PURE POWERSHELL ===#
@@ -45,7 +45,6 @@ foreach ($line in Get-Content $HostsList) {
     }
 }
 
-# Читаем старый hosts
 $oldHostsContent = if (Test-Path $HostsFile) { Get-Content $HostsFile } else { @() }
 $updatedHosts = [System.Collections.Generic.List[string]]::new()
 $seenDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -61,7 +60,6 @@ foreach ($line in $oldHostsContent) {
         $domain = $Matches[2]
         $oldDomains.Add($domain) | Out-Null
 
-        # Если домен есть в новом списке или уже обрабатывался (дубликат) — пропускаем старую запись
         if ($newMappings.ContainsKey($domain) -or $seenDomains.Contains($domain)) {
             continue
         }
@@ -83,6 +81,5 @@ foreach ($kvp in $newMappings.GetEnumerator()) {
     $updatedHosts.Add("$ip $domain")
 }
 
-# Запись без BOM-маркеров, чтобы системный DNS-клиент Windows не спотыкался
 [System.IO.File]::WriteAllLines($HostsFile, $updatedHosts)
 Write-Host 'Готово!' -ForegroundColor Green
