@@ -1,1 +1,3 @@
-ENABLED 
+mode=all
+tcp=1024-65535
+udp=1024-65535

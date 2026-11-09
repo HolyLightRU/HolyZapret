@@ -9,7 +9,7 @@ set "LISTS=%~dp0exp-list\"
 powershell -Command "Write-Host 'Удобно обновляемый bat файл.' -ForegroundColor DarkMagenta"
 powershell -Command "Write-Host 'Используйте manager.bat для обновлений' -ForegroundColor Magenta"
 	
-"%BIN%HolyZapret.exe" --wf-tcp=80,443,2053,2083,2087,2096,8443 --wf-udp=443,19294-19344,50000-50100 ^
+"%BIN%HolyZapret.exe" --wf-tcp=80,443,2053,2083,2087,2096,8443 --wf-udp=443,1400,19294-19344,50000-50100 ^
 --comment Telegram Calls --filter-udp=1400 --filter-l7=discord,stun --dpi-desync=fake --dpi-desync-repeats=6 --new ^
 --comment YouTube QUIC/QUIC --filter-udp=443 --hostlist="%LISTS%list-general.txt" --dpi-desync=fake --dpi-desync-repeats=11 --dpi-desync-fake-quic="%BIN%quic_initial_www_google_com.bin" --new ^
 --comment YouTube Streaming/HTTP --filter-tcp=80 --hostlist="%LISTS%list-general.txt" --dpi-desync=fake,multisplit --dpi-desync-fake-tls-mod=rnd,dupsid,sni=yandex.ru --dpi-desync-fooling=badseq --new ^
