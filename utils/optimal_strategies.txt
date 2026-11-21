@@ -1,8 +1,5 @@
 general.bat
-flowseal_strat/general (ALT3).bat
-flowseal_strat/general (ALT11).bat
-flowseal_strat/general (FAKE TLS AUTO).bat
-flowseal_strat/general (FAKE TLS AUTO ALT3).bat
-flowseal_strat/general (FAKE TLS AUTO ALT4).bat
-flowseal_strat/general (FAKE TLS AUTO ALT5).bat
-flowseal_strat/general (FAKE TLS AUTO ALT6).bat
+flowseal/general (ALT3).bat
+flowseal/general (ALT11).bat
+flowseal/general (FAKE TLS AUTO).bat
+flowseal/general (FAKE TLS AUTO ALT3).bat

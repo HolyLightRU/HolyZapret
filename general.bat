@@ -9,7 +9,7 @@ set "LISTS=%~dp0exp-list\"
 set "GameFilter=1024-65535"
 
 @echo off
-powershell -Command "Write-Host 'Самые быстрые фиксы беспредела РКН' -ForegroundColor DarkMagenta; Write-Host 'Расчитано и проверяется в Сибирском регионе' -ForegroundColor Magenta; Write-Host 'Мои соц. сетки:' -ForegroundColor White; Write-Host 'https://github.com/HolyLightRU' -ForegroundColor White; Write-Host 'Так-же в папках additional и flowseal_strat' -ForegroundColor Magenta; Write-Host 'Лежат дополнительные стратегии' -ForegroundColor DarkMagenta"
+powershell -Command "Write-Host 'Самые быстрые фиксы беспредела РКН' -ForegroundColor DarkMagenta; Write-Host 'Расчитано и проверяется в Сибирском регионе' -ForegroundColor Magenta; Write-Host 'Мои соц. сетки:' -ForegroundColor White; Write-Host 'https://github.com/HolyLightRU' -ForegroundColor White; Write-Host 'Так-же в папках additional и flowseal' -ForegroundColor Magenta; Write-Host 'Лежат дополнительные стратегии' -ForegroundColor DarkMagenta"
 
 "%BIN%HolyZapret.exe" --wf-tcp=80,443,2053,2083,2087,2096,8443,%GameFilter% --wf-udp=443,19294-19344,50000-50100,%GameFilter% ^
 --filter-udp=443 --hostlist="%LISTS%list-general.txt" --hostlist="%LISTS%list-general-user.txt" --hostlist-exclude="%LISTS%list-exclude.txt" --hostlist-exclude="%LISTS%list-exclude-user.txt" --ipset-exclude="%LISTS%ipset-exclude.txt" --ipset-exclude="%LISTS%ipset-exclude-user.txt" --dpi-desync=fake --dpi-desync-repeats=11 --dpi-desync-fake-quic="%BIN%quic_initial_www_google_com.bin" --new ^

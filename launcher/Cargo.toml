@@ -1,0 +1,27 @@
+[package]
+name = "holyzapret-launcher"
+version = "2.0.2"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", features = ["default", "glow"] }
+raw-window-handle = "0.6"
+serde_json = "1.0.154"
+tray-icon = "0.26.1"
+ureq = "3.5.2"
+window-vibrancy = "0.8.1"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+winreg = "0.56.0"
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
+embed-resource = "3.0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
