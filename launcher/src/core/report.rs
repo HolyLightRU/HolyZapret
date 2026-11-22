@@ -1,0 +1,188 @@
+use super::diagnostics::{Finding, Level};
+use super::picker::{self, CheckKind, Outcome, Target};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+pub struct Input<'a> {
+    pub when: String,
+    pub version: String,
+    pub launcher: String,
+    pub flowseal: Option<String>,
+    pub game: String,
+    pub root: &'a Path,
+    pub targets: &'a [Target],
+    pub ordered: Vec<&'a Outcome>,
+    pub noisy: Vec<String>,
+    pub diag: &'a [Finding],
+}
+
+fn kind(k: CheckKind) -> &'static str {
+    match k {
+        CheckKind::Tls12 => "TLS 1.2",
+        CheckKind::Tls13 => "TLS 1.3",
+        CheckKind::Freeze => "загрузка",
+    }
+}
+
+pub fn windows_name() -> String {
+    let k = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion").ok();
+    let get = |n: &str| k.as_ref().and_then(|k| k.get_value::<String, _>(n).ok()).unwrap_or_default();
+    let build = picker::windows_build();
+    let mut product = get("ProductName");
+    if build >= 22000 {
+        product = product.replace("Windows 10", "Windows 11");
+    }
+    format!("{product} {} (сборка {build})", get("DisplayVersion")).trim().to_string()
+}
+
+fn outcome_block(out: &mut String, place: Option<usize>, o: &Outcome, input: &Input) {
+    let (ok, total) = o.score();
+    let title = match place {
+        Some(n) => format!("{n}. {}", o.name),
+        None => o.name.clone(),
+    };
+    let id = o
+        .path
+        .as_ref()
+        .map(|p| p.strip_prefix(input.root).unwrap_or(p).display().to_string())
+        .map(|s| format!(" [{s}]"))
+        .unwrap_or_default();
+    let _ = writeln!(out, "\n== {title}{id}: {ok}/{total}, {} мс ==", o.avg_ms());
+    if let Some(e) = &o.error {
+        let _ = writeln!(out, "Не запустилась: {e}");
+        return;
+    }
+    let cats: Vec<String> = picker::categories(input.targets)
+        .iter()
+        .map(|c| {
+            let (a, b) = o.category(input.targets, c);
+            format!("{c} {a}/{b}")
+        })
+        .collect();
+    let _ = writeln!(out, "{}", cats.join(" | "));
+    let failed: Vec<String> = input
+        .targets
+        .iter()
+        .zip(&o.checks)
+        .filter(|(_, c)| !c.ok)
+        .map(|(t, c)| format!("  - {} / {} ({}): {}", t.category, t.name, kind(t.kind), c.detail()))
+        .collect();
+    if failed.is_empty() {
+        let _ = writeln!(out, "Все проверки пройдены");
+    } else {
+        let _ = writeln!(out, "Не прошли:");
+        for f in failed {
+            let _ = writeln!(out, "{f}");
+        }
+    }
+}
+
+pub fn build(input: &Input) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Отчёт подбора HolyZapret");
+    let _ = writeln!(out, "Дата: {}", input.when);
+    let _ = writeln!(out, "HolyZapret: {} (лаунчер {})", input.version, input.launcher);
+    let _ = writeln!(out, "Flowseal: {}", input.flowseal.as_deref().unwrap_or("не установлен"));
+    let _ = writeln!(out, "Windows: {}", windows_name());
+    let _ = writeln!(out, "TLS 1.3 в проверках: {}", if picker::tls13_supported() { "да" } else { "нет, Windows не поддерживает" });
+    let _ = writeln!(out, "Игровой фильтр: {}", input.game);
+    let _ = writeln!(out, "Провайдер и город: (впишите сами)");
+    let _ = writeln!(out, "Что не работает, хотя подбор зелёный (голос Discord, игры, видео): (впишите сами)");
+    if !input.noisy.is_empty() {
+        let _ = writeln!(out, "Не учитывались при выборе лучшей (случайный успех): {}", input.noisy.join(", "));
+    }
+    let mut place = 0;
+    for o in &input.ordered {
+        if o.path.is_some() {
+            place += 1;
+            outcome_block(&mut out, Some(place), o, input);
+        } else {
+            outcome_block(&mut out, None, o, input);
+        }
+    }
+    let _ = writeln!(out, "\n== Диагностика ==");
+    if input.diag.is_empty() {
+        let _ = writeln!(out, "не запускалась");
+    }
+    for f in input.diag {
+        let mark = match f.level {
+            Level::Ok => "OK ",
+            Level::Warn => "?  ",
+            Level::Bad => "ERR",
+        };
+        let _ = writeln!(out, "{mark} {}", f.title);
+    }
+    out
+}
+
+pub fn desktop() -> PathBuf {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("Desktop").ok())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("Desktop"))
+}
+
+pub fn file_name(when: &str) -> String {
+    let safe: String = when.chars().map(|c| if c == ':' || c == ' ' { '-' } else { c }).collect();
+    format!("HolyZapret-отчёт-{safe}.txt")
+}
+
+pub fn save(text: &str, when: &str) -> anyhow::Result<PathBuf> {
+    let dir = desktop();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(file_name(when));
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(text.replace('\n', "\r\n").as_bytes());
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+pub fn reveal(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::picker::{Check, parse_targets};
+
+    #[test]
+    fn report_lists_failures_by_target() {
+        let targets = parse_targets("### Discord\nDiscordMain = \"https://discord.com\"\n");
+        let c = |ok, exit, code| Check { ok, frozen: false, ms: 100, code, exit };
+        let base = Outcome { name: "Без обхода".into(), path: None, error: None, checks: vec![c(false, 28, 0), c(false, 35, 0)] };
+        let root = PathBuf::from(r"C:\hz");
+        let best = Outcome {
+            name: "general".into(),
+            path: Some(root.join("general.bat")),
+            error: None,
+            checks: vec![c(true, 0, 200), c(false, 35, 0)],
+        };
+        let broken = Outcome { name: "x".into(), path: Some(root.join("x.bat")), error: Some("could not read".into()), checks: vec![] };
+        let input = Input {
+            when: "22.11 01:10".into(),
+            version: "3.0.0".into(),
+            launcher: "3.0.0".into(),
+            flowseal: None,
+            game: "Выключен".into(),
+            root: &root,
+            targets: &targets,
+            ordered: vec![&base, &best, &broken],
+            noisy: vec!["Хостинги / CDN77".into()],
+            diag: &[],
+        };
+        let r = build(&input);
+        assert!(r.contains("== Без обхода: 0/2"));
+        assert!(r.contains("(случайный успех): Хостинги / CDN77"));
+        assert!(r.contains("== 1. general [general.bat]: 1/2"));
+        assert!(r.contains("Discord / DiscordMain (TLS 1.3): ошибка TLS"));
+        assert!(r.contains("Discord / DiscordMain (TLS 1.2): таймаут"));
+        assert!(r.contains("== 2. x [x.bat]"));
+        assert!(r.contains("Не запустилась: could not read"));
+        assert_eq!(file_name("22.11 01:10"), "HolyZapret-отчёт-22.11-01-10.txt");
+    }
+}

@@ -1,17 +1,25 @@
 [package]
 name = "holyzapret-launcher"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 
 [dependencies]
+aes = "0.8"
 anyhow = "1.0.104"
+ctr = "0.9"
+getrandom = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
 eframe = { version = "0.37.0", features = ["default", "glow"] }
 raw-window-handle = "0.6"
 serde_json = "1.0.154"
 tray-icon = "0.26.1"
 ureq = "3.5.2"
 window-vibrancy = "0.8.1"
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power"] }
 winreg = "0.56.0"
 zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 

@@ -31,6 +31,10 @@ fn image_path(pid: u32) -> Option<PathBuf> {
 }
 
 pub fn list(names: &[&str]) -> Vec<Proc> {
+    find(|name| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
+}
+
+pub fn find(pred: impl Fn(&str) -> bool) -> Vec<Proc> {
     let mut out = Vec::new();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -43,7 +47,7 @@ pub fn list(names: &[&str]) -> Vec<Proc> {
         while more {
             let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
             let name = String::from_utf16_lossy(&e.szExeFile[..len]);
-            if names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            if pred(&name) {
                 out.push(Proc { name, path: image_path(e.th32ProcessID) });
             }
             more = Process32NextW(snap, &mut e) != 0;

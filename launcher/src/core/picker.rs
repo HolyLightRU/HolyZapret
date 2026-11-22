@@ -22,6 +22,11 @@ const ENGINE_WARMUP: Duration = Duration::from_secs(3);
 pub const HOSTING: &str = "Хостинги";
 pub const MY_SITES: &str = "Мои сайты";
 
+const HEAVY: &[(&str, &str, &str)] = &[
+    ("YouTubeThumb", "YouTube", "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"),
+    ("DiscordAsset", "Discord", "https://discord.com/assets/favicon.ico"),
+];
+
 const FREEZE_SUITE: &[(&str, &str)] = &[
     ("Cloudflare", "https://cdn.cookielaw.org/scripttemplates/202501.2.0/otBannerSdk.js"),
     ("DigitalOcean", "https://genderize.io/"),
@@ -57,6 +62,41 @@ pub struct Check {
     pub ok: bool,
     pub frozen: bool,
     pub ms: u32,
+    pub code: u32,
+    pub exit: i32,
+}
+
+impl Check {
+    pub fn failed() -> Check {
+        Check { ok: false, frozen: false, ms: 0, code: 0, exit: -1 }
+    }
+
+    pub fn detail(&self) -> String {
+        if self.frozen {
+            "заморозка 16-20 КБ".into()
+        } else if self.code > 0 && !self.ok {
+            format!("HTTP {}, обрыв при загрузке", self.code)
+        } else if self.code > 0 {
+            format!("HTTP {}", self.code)
+        } else if self.exit >= 0 {
+            super::checks::curl_error(self.exit)
+        } else {
+            "не выполнена".into()
+        }
+    }
+}
+
+pub fn windows_build() -> u32 {
+    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("CurrentBuildNumber").ok())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn tls13_supported() -> bool {
+    windows_build() >= 20348
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +124,27 @@ impl Outcome {
         (ok, total)
     }
 
+    pub fn clean_score(&self, noisy: &[bool]) -> usize {
+        self.score_without(noisy).0
+    }
+
+    pub fn score_without(&self, noisy: &[bool]) -> (usize, usize) {
+        let kept = self.checks.iter().enumerate().filter(|(i, _)| !noisy.get(*i).copied().unwrap_or(false));
+        kept.fold((0, 0), |(ok, total), (_, c)| (ok + c.ok as usize, total + 1))
+    }
+
+    pub fn category_without(&self, targets: &[Target], cat: &str, noisy: &[bool]) -> (usize, usize) {
+        let mut ok = 0;
+        let mut total = 0;
+        for (i, (t, c)) in targets.iter().zip(&self.checks).enumerate() {
+            if t.category == cat && !noisy.get(i).copied().unwrap_or(false) {
+                total += 1;
+                ok += c.ok as usize;
+            }
+        }
+        (ok, total)
+    }
+
     pub fn frozen(&self) -> usize {
         self.checks.iter().filter(|c| c.frozen).count()
     }
@@ -102,6 +163,28 @@ pub enum Event {
     Done(Outcome),
     Finished { cancelled: bool, restore: Option<Result<(), String>> },
     Failed(String),
+}
+
+pub fn noisy_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> {
+    let none = vec![false; targets.len()];
+    let Some(base) = results.iter().find(|o| o.path.is_none() && o.checks.len() == targets.len()) else { return none };
+    let runs: Vec<&Outcome> =
+        results.iter().filter(|o| o.path.is_some() && o.error.is_none() && o.checks.len() == targets.len()).collect();
+    if runs.len() < 4 {
+        return none;
+    }
+    targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let b = &base.checks[i];
+            if t.kind != CheckKind::Freeze || b.ok || b.frozen || runs.iter().any(|o| o.checks[i].frozen) {
+                return false;
+            }
+            let pass = runs.iter().filter(|o| o.checks[i].ok).count();
+            pass > 0 && pass * 3 < runs.len()
+        })
+        .collect()
 }
 
 pub fn categories(targets: &[Target]) -> Vec<String> {
@@ -149,6 +232,9 @@ pub fn load_targets(paths: &Paths) -> Vec<Target> {
             "### Discord\nDiscord = \"https://discord.com\"\n### YouTube\nYouTube = \"https://www.youtube.com\"\nVideo = \"https://redirector.googlevideo.com\"\n",
         );
     }
+    for (name, category, url) in HEAVY {
+        t.push(Target { name: name.to_string(), category: category.to_string(), url: url.to_string(), kind: CheckKind::Freeze });
+    }
     for url in super::checks::load_my_sites(paths) {
         let name = url.split_once("://").map(|x| x.1).unwrap_or(&url).split('/').next().unwrap_or(&url).to_string();
         for kind in [CheckKind::Tls12, CheckKind::Tls13] {
@@ -160,10 +246,71 @@ pub fn load_targets(paths: &Paths) -> Vec<Target> {
             t.push(Target { name: name.into(), category: "WARP".into(), url: url.into(), kind });
         }
     }
+    if !tls13_supported() {
+        t.retain(|x| x.kind != CheckKind::Tls13);
+    }
     for (name, url) in FREEZE_SUITE {
         t.push(Target { name: name.to_string(), category: HOSTING.into(), url: url.to_string(), kind: CheckKind::Freeze });
     }
     t
+}
+
+pub fn parse_sites(text: &str) -> (Vec<String>, Vec<String>) {
+    let (mut ok, mut bad) = (Vec::<String>::new(), Vec::new());
+    for tok in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';').filter(|t| !t.is_empty()) {
+        match super::checks::normalize_url(tok) {
+            Ok(u) if !ok.iter().any(|x| x.eq_ignore_ascii_case(&u)) => ok.push(u),
+            Ok(_) => {}
+            Err(_) => bad.push(format!("«{tok}» не похоже на адрес сайта")),
+        }
+    }
+    (ok, bad)
+}
+
+pub fn host_of(url: &str) -> String {
+    url.split_once("://").map(|x| x.1).unwrap_or(url).split('/').next().unwrap_or(url).to_string()
+}
+
+pub fn custom_targets(urls: &[String]) -> Vec<Target> {
+    let per_site = urls.len() <= 4;
+    let mut t = Vec::new();
+    for url in urls {
+        let name = host_of(url);
+        let category = if per_site { name.clone() } else { MY_SITES.to_string() };
+        for kind in [CheckKind::Tls12, CheckKind::Tls13] {
+            if kind == CheckKind::Tls13 && !tls13_supported() {
+                continue;
+            }
+            t.push(Target { name: name.clone(), category: category.clone(), url: url.clone(), kind });
+        }
+    }
+    t
+}
+
+pub fn site_domains(urls: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in urls {
+        let d = super::discover::base_domain(&host_of(u));
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+pub fn add_to_user_lists(dirs: &[PathBuf], domains: &[String]) -> anyhow::Result<usize> {
+    let mut added = 0;
+    for dir in dirs {
+        super::lists::ensure_user_files(dir)?;
+        let path = dir.join("list-general-user.txt");
+        let mut doc = super::lists::Doc::load(&path);
+        let n = doc.add(domains);
+        if n > 0 {
+            doc.save(&path, super::lists::Kind::Domains)?;
+            added += n;
+        }
+    }
+    Ok(added)
 }
 
 pub fn optimal(paths: &Paths, strategies: &[Strategy]) -> Vec<usize> {
@@ -192,20 +339,26 @@ fn parse_w(out: &str) -> (u32, u64, f64) {
     (code, size, time)
 }
 
-pub fn judge(kind: CheckKind, exit_ok: bool, w: &str) -> Check {
+pub fn judge(kind: CheckKind, exit: i32, w: &str) -> Check {
+    let exit_ok = exit == 0;
     let (code, size, time) = parse_w(w);
     let ms = (time * 1000.0) as u32;
     match kind {
-        CheckKind::Tls12 | CheckKind::Tls13 => Check { ok: exit_ok && code > 0, frozen: false, ms },
+        CheckKind::Tls12 | CheckKind::Tls13 => Check { ok: exit_ok && code > 0, frozen: false, ms, code, exit },
         CheckKind::Freeze => {
             let kb = size as f64 / 1024.0;
             let frozen = !exit_ok && (14.0..=22.0).contains(&kb);
-            Check { ok: code > 0 && (exit_ok || kb > 22.0), frozen, ms }
+            Check { ok: code > 0 && (exit_ok || kb > 22.0), frozen, ms, code, exit }
         }
     }
 }
 
 fn run_check(t: &Target) -> Check {
+    let c = curl_check(t);
+    if t.kind == CheckKind::Freeze && !c.ok && !c.frozen { curl_check(t) } else { c }
+}
+
+fn curl_check(t: &Target) -> Check {
     let mut args: Vec<&str> = vec!["-s", "-o", "NUL", "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"];
     match t.kind {
         CheckKind::Tls12 => args.extend(["-I", "-m", "5", "--tlsv1.2", "--tls-max", "1.2", "-w", "%{http_code} 0 %{time_total}"]),
@@ -223,8 +376,8 @@ fn run_check(t: &Target) -> Check {
     args.push(&t.url);
     let out = Command::new("curl.exe").args(&args).creation_flags(CREATE_NO_WINDOW).output();
     match out {
-        Ok(o) => judge(t.kind, o.status.success(), &String::from_utf8_lossy(&o.stdout)),
-        Err(_) => Check { ok: false, frozen: false, ms: 0 },
+        Ok(o) => judge(t.kind, o.status.code().unwrap_or(-1), &String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Check::failed(),
     }
 }
 
@@ -253,7 +406,7 @@ fn run_suite(targets: &Arc<Vec<Target>>, cancel: &Arc<AtomicBool>, emit: &(impl 
         .into_inner()
         .unwrap()
         .into_iter()
-        .map(|c| c.unwrap_or(Check { ok: false, frozen: false, ms: 0 }))
+        .map(|c| c.unwrap_or_else(Check::failed))
         .collect()
 }
 
@@ -405,7 +558,7 @@ pub fn run(
             Err(e) => outcome.error = Some(e.to_string()),
         }
         if outcome.error.is_some() {
-            outcome.checks = vec![Check { ok: false, frozen: false, ms: 0 }; targets.len()];
+            outcome.checks = vec![Check::failed(); targets.len()];
         }
         if !cancel.load(Ordering::Relaxed) || outcome.error.is_some() {
             emit(Event::Done(outcome));
@@ -424,6 +577,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lucky_timeouts_are_noise() {
+        let t = |name: &str, kind| Target { name: name.into(), category: "x".into(), url: String::new(), kind };
+        let targets = vec![t("yt", CheckKind::Tls12), t("cdn77", CheckKind::Freeze), t("hetzner", CheckKind::Freeze)];
+        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let run = |name: &str, yt, cdn, het| Outcome {
+            name: name.into(),
+            path: Some(PathBuf::from(name)),
+            error: None,
+            checks: vec![c(yt, false), c(cdn, false), c(het, false)],
+        };
+        let base = Outcome { name: "base".into(), path: None, error: None, checks: vec![c(false, false), c(false, false), c(false, true)] };
+        let mut results = vec![base, run("lucky", true, true, true), run("b", true, false, true), run("c", true, false, false), run("d", false, false, false)];
+        assert_eq!(noisy_checks(&targets, &results), vec![false, true, false]);
+        let noisy = noisy_checks(&targets, &results);
+        assert_eq!(results[1].clean_score(&noisy), 2);
+        assert_eq!(results[1].score_without(&noisy), (2, 2));
+        assert_eq!(results[0].score_without(&noisy), (0, 2));
+        assert_eq!(results[1].category_without(&targets, "x", &noisy), (2, 2));
+        results.truncate(3);
+        assert_eq!(noisy_checks(&targets, &results), vec![false, false, false]);
+    }
+
+    #[test]
+    fn custom_sites_become_targets() {
+        let (ok, bad) = parse_sites("rutracker.org, https://www.kinopoisk.ru/film/1\nhttps://rutracker.org/\nftp://x");
+        assert_eq!(ok, vec!["https://rutracker.org/".to_string(), "https://www.kinopoisk.ru/film/1".to_string()]);
+        assert_eq!(bad.len(), 1);
+        let t = custom_targets(&ok);
+        assert!(t.iter().all(|x| x.kind != CheckKind::Freeze));
+        assert_eq!(categories(&t), vec!["rutracker.org".to_string(), "www.kinopoisk.ru".to_string()]);
+        assert_eq!(site_domains(&ok), vec!["rutracker.org".to_string(), "kinopoisk.ru".to_string()]);
+    }
+
+    #[test]
     fn targets_parsed_with_categories() {
         let t = parse_targets(
             "# c\n### Discord\nDiscordMain = \"https://discord.com\"\n### DNS\nX = \"PING:1.1.1.1\"\n### YouTube\nYT = \"https://www.youtube.com\"\n",
@@ -438,15 +625,15 @@ mod tests {
 
     #[test]
     fn judging() {
-        assert!(judge(CheckKind::Tls13, true, "200 0 0.150").ok);
-        assert_eq!(judge(CheckKind::Tls13, true, "200 0 0,150").ms, 150);
-        assert!(!judge(CheckKind::Tls12, false, "000 0 5.0").ok);
-        let f = judge(CheckKind::Freeze, false, "206 17408 6.0");
+        assert!(judge(CheckKind::Tls13, 0, "200 0 0.150").ok);
+        assert_eq!(judge(CheckKind::Tls13, 0, "200 0 0,150").ms, 150);
+        assert!(!judge(CheckKind::Tls12, 28, "000 0 5.0").ok);
+        let f = judge(CheckKind::Freeze, 28, "206 17408 6.0");
         assert!(!f.ok && f.frozen);
-        let e = judge(CheckKind::Freeze, false, "000 0 6.0");
+        let e = judge(CheckKind::Freeze, 28, "000 0 6.0");
         assert!(!e.ok && !e.frozen);
-        assert!(judge(CheckKind::Freeze, true, "206 262144 1.2").ok);
-        assert!(judge(CheckKind::Freeze, false, "206 81506 8.0").ok);
+        assert!(judge(CheckKind::Freeze, 0, "206 262144 1.2").ok);
+        assert!(judge(CheckKind::Freeze, 28, "206 81506 8.0").ok);
     }
 
     #[test]
@@ -459,7 +646,7 @@ mod tests {
     #[test]
     fn outcome_scores() {
         let targets = parse_targets("### A\nA = \"https://a.com\"\n### B\nB = \"https://b.com\"\n");
-        let c = |ok, ms| Check { ok, frozen: false, ms };
+        let c = |ok, ms| Check { ok, frozen: false, ms, code: 0, exit: 0 };
         let o = Outcome { name: "x".into(), path: None, error: None, checks: vec![c(true, 100), c(true, 300), c(false, 0), c(true, 200)] };
         assert_eq!(o.score(), (3, 4));
         assert_eq!(o.category(&targets, "B"), (1, 2));

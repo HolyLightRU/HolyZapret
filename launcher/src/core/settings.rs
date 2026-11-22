@@ -9,11 +9,12 @@ pub struct Settings {
     pub close_to_tray: bool,
     pub sidebar_open: bool,
     pub wizard_done: bool,
+    pub flow: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { advanced: true, close_to_tray: true, sidebar_open: true, wizard_done: false }
+        Self { advanced: true, close_to_tray: true, sidebar_open: true, wizard_done: false, flow: true }
     }
 }
 
@@ -29,6 +30,7 @@ pub fn load() -> Settings {
             close_to_tray: read(&k, "CloseToTray", d.close_to_tray),
             sidebar_open: read(&k, "SidebarOpen", d.sidebar_open),
             wizard_done: read(&k, "WizardDone", d.wizard_done),
+            flow: read(&k, "Flow", d.flow),
         },
         Err(_) => d,
     }
@@ -54,5 +56,6 @@ pub fn save(s: &Settings) {
         let _ = k.set_value("CloseToTray", &(s.close_to_tray as u32));
         let _ = k.set_value("SidebarOpen", &(s.sidebar_open as u32));
         let _ = k.set_value("WizardDone", &(s.wizard_done as u32));
+        let _ = k.set_value("Flow", &(s.flow as u32));
     }
 }

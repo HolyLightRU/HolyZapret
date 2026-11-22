@@ -4,6 +4,7 @@ mod lists_tab;
 mod picker_tab;
 mod sites_tab;
 mod tools_tab;
+mod tg_ui;
 mod trial;
 mod warp_ui;
 mod wizard;
@@ -43,6 +44,7 @@ enum Msg {
     Updated,
     Autostart(bool),
     Warp(crate::core::warp::State),
+    TgForeign(Vec<String>),
     PostInstallCheck,
     TrialStarted(Result<trial::Trial, String>),
     Done,
@@ -66,6 +68,7 @@ fn result_msg(tx: &Sender<Msg>, r: anyhow::Result<String>, err_prefix: &str) {
 fn category_label(c: &str) -> String {
     match c {
         "additional" => "Additional".into(),
+        "experimental" => "Эксперимент".into(),
         other => other.to_string(),
     }
 }
@@ -105,6 +108,7 @@ enum Tab {
     Sites,
     Diagnostics,
     Tools,
+    Telegram,
     Lists,
     Log,
 }
@@ -132,6 +136,10 @@ pub struct App {
     autostart: Option<bool>,
     last_pick: Option<crate::core::pickstore::LastPick>,
     warp: Option<crate::core::warp::State>,
+    tg: tg_ui::TgState,
+    flow_last: f64,
+    flow: bool,
+    flow_phase: f32,
     last_action: f64,
     confirm: Option<confirm::Confirm>,
     site_input: String,
@@ -192,6 +200,10 @@ impl App {
             autostart: None,
             last_pick: crate::core::pickstore::load(),
             warp: None,
+            tg: tg_ui::TgState::detect(),
+            flow_last: 0.0,
+            flow: saved.flow,
+            flow_phase: 0.0,
             last_action: 0.0,
             confirm: None,
             site_input: String::new(),
@@ -220,6 +232,11 @@ impl App {
         if app.paths.is_none() {
             app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\HolyZapret.exe — положите лаунчер внутрь HolyZapret"));
         }
+        match crate::core::tgproxy::control::autostart() {
+            Some(Ok(m)) => app.log.push(Entry::new(Lvl::Ok, m)),
+            Some(Err(e)) => app.log.push(Entry::new(Lvl::Err, format!("Telegram-прокси не запустился: {e}"))),
+            None => {}
+        }
         if let Ok(h) = cc.window_handle() {
             if let RawWindowHandle::Win32(w) = h.as_raw() {
                 tray::set_hwnd(w.hwnd.get());
@@ -237,6 +254,7 @@ impl App {
             std::thread::spawn(move || {
                 let _ = tx.send(Msg::Autostart(crate::core::autostart::enabled()));
                 let _ = tx.send(Msg::Warp(crate::core::warp::query()));
+                let _ = tx.send(Msg::TgForeign(tg_ui::foreign_names()));
                 ctx.request_repaint();
             });
         }
@@ -262,6 +280,7 @@ impl App {
                     if tick % 3 == 0 {
                         let _ = tx.send(Msg::Warp(crate::core::warp::query()));
                     }
+                    let _ = tx.send(Msg::TgForeign(tg_ui::foreign_names()));
                     if tx.send(Msg::Status(st)).is_err() {
                         break;
                     }
@@ -282,6 +301,9 @@ impl App {
     }
 
     fn update_available(&self) -> Option<String> {
+        if crate::core::TEST_BUILD {
+            return None;
+        }
         let r = self.remote_version.as_ref()?;
         let l = self.local_version.clone().unwrap_or_default();
         selfupdate::is_newer(&l, r).then(|| r.clone())
@@ -414,6 +436,7 @@ impl App {
                 }
                 Msg::Autostart(on) => self.autostart = Some(on),
                 Msg::Warp(w) => self.warp = Some(w),
+                Msg::TgForeign(f) => self.tg.foreign = f,
                 Msg::Rescan => self.rescan(),
                 Msg::Updated => {
                     self.local_version = self.paths.as_ref().and_then(update::local_version);
@@ -516,10 +539,15 @@ impl App {
         let mut items = vec![
             (Tab::Main, theme::icon::HOME, "Главная"),
             (Tab::Picker, theme::icon::PICK, "Подбор"),
+        ];
+        if self.tg.client.is_some() {
+            items.push((Tab::Telegram, theme::icon::TELEGRAM, "Telegram"));
+        }
+        items.extend([
             (Tab::Sites, theme::icon::GLOBE, "Сайты"),
             (Tab::Diagnostics, theme::icon::DIAGNOSTIC, "Диагностика"),
             (Tab::Tools, theme::icon::TOOLS, "Инструменты"),
-        ];
+        ]);
         if self.advanced {
             items.push((Tab::Lists, theme::icon::LISTS, "Списки"));
         }
@@ -903,10 +931,7 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, sidebar_open: &mut bool, ve
         if resp.on_hover_text("Свернуть или развернуть меню").clicked() {
             *sidebar_open = !*sidebar_open;
         }
-        ui.add_space(8.0);
-        ui.label(theme::gradient_text("HolyZapret", 16.0, PINK, CYAN));
-        ui.add_space(6.0);
-        ui.label(RichText::new(format!("v{version}")).color(Color32::from_gray(140)).size(13.0));
+        title_text(ui, full.center().x, c.y, version);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (resp, r) = theme::chrome_button(ui, true);
             let c = r.center();
@@ -939,6 +964,26 @@ fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, sidebar_open: &mut bool, ve
             }
         });
     });
+}
+
+fn baseline(g: &egui::Galley) -> f32 {
+    g.rows.first().map(|r| r.pos.y + r.row.glyphs.first().map(|gl| gl.pos.y).unwrap_or(0.0)).unwrap_or(0.0)
+}
+
+fn title_text(ui: &egui::Ui, center_x: f32, center_y: f32, version: &str) {
+    const SIZE: f32 = 16.0;
+    const CAP: f32 = 0.7;
+    let p = ui.painter();
+    let title = p.layout_job(theme::gradient_text("HolyZapret", SIZE, PINK, CYAN));
+    let ver = p.layout_no_wrap(format!("v{version}"), egui::FontId::proportional(13.0), Color32::from_gray(140));
+    let gap = 6.0;
+    let width = title.size().x + gap + ver.size().x;
+    let line = (center_y + SIZE * CAP / 2.0).round();
+    let left = (center_x - width / 2.0).round();
+    let t_top = line - baseline(&title);
+    let v_top = line - baseline(&ver);
+    p.galley(egui::pos2(left, t_top), title.clone(), Color32::WHITE);
+    p.galley(egui::pos2(left + title.size().x + gap, v_top), ver, Color32::from_gray(140));
 }
 
 fn resize_edges(ctx: &egui::Context) {
@@ -995,6 +1040,15 @@ impl eframe::App for App {
         if tray::busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        let now = ctx.input(|i| i.time);
+        let dt = (now - self.flow_last).clamp(0.0, 0.1);
+        self.flow_last = now;
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+        if self.flow && focused && theme::animations_allowed() && tray::window_visible() {
+            self.flow_phase = (self.flow_phase + (dt / theme::FLOW_PERIOD) as f32).rem_euclid(1.0);
+            theme::set_flow(self.flow_phase);
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.close_to_tray {
@@ -1016,7 +1070,10 @@ impl eframe::App for App {
             .exact_size(36.0)
             .frame(Frame::new().fill(Color32::from_black_alpha(30)))
             .show(ui, |ui| {
-                let version = self.local_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+                let mut version = self.local_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+                if crate::core::TEST_BUILD {
+                    version.push_str(" · тестовая сборка");
+                }
                 title_bar(ui, &ctx, &mut self.sidebar_open, &version)
             });
 
@@ -1038,6 +1095,7 @@ impl eframe::App for App {
                 Tab::Sites => self.sites_tab(ui, &ctx),
                 Tab::Diagnostics => self.diag_tab(ui, &ctx),
                 Tab::Tools => self.tools_tab(ui, &ctx),
+                Tab::Telegram => self.tg_tab(ui, &ctx),
                 Tab::Lists => self.lists_tab(ui, &ctx),
                 Tab::Log => self.log_tab(ui, &ctx),
             });
@@ -1048,6 +1106,7 @@ impl eframe::App for App {
             close_to_tray: self.close_to_tray,
             sidebar_open: self.sidebar_open,
             wizard_done: self.wizard_done,
+            flow: self.flow,
         };
         if now != self.saved {
             settings::save(&now);

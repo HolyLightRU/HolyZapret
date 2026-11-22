@@ -11,9 +11,11 @@ pub mod paths;
 pub mod picker;
 pub mod pickstore;
 pub mod procs;
+pub mod report;
 pub mod selfupdate;
 pub mod service;
 pub mod settings;
+pub mod tgproxy;
 pub mod strategy;
 pub mod update;
 pub mod warp;
@@ -22,6 +24,9 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub const TEST_BUILD: bool = option_env!("HZ_CHANNEL").is_some();
+pub const EXPERIMENTAL: &str = "experimental";
 
 pub fn run_hidden(program: &str, args: &[&str]) -> (bool, String) {
     match Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW).output() {

@@ -3,6 +3,8 @@ use eframe::egui::{
     Stroke, TextStyle, Ui, Vec2, Widget,
 };
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const PINK: Color32 = Color32::from_rgb(242, 143, 201);
 pub const CYAN: Color32 = Color32::from_rgb(105, 205, 245);
@@ -76,6 +78,27 @@ pub mod icon {
     pub const CHECK: &str = "\u{E73E}";
     pub const ERROR: &str = "\u{E783}";
     pub const INFO: &str = "\u{E946}";
+    pub const TELEGRAM: &str = "tg-plane";
+}
+
+pub fn paint_icon(painter: &egui::Painter, center: egui::Pos2, glyph: &str, size: f32, color: Color32) {
+    if glyph != icon::TELEGRAM {
+        painter.text(center, egui::Align2::CENTER_CENTER, glyph, icon_font(size), color);
+        return;
+    }
+    let s = size * 0.5;
+    let p = |x: f32, y: f32| center + Vec2::new(x * s, y * s);
+    let stroke = Stroke::new((size / 11.0).max(1.2), color);
+    let body = vec![p(-0.95, 0.02), p(0.92, -0.74), p(0.6, 0.78), p(0.02, 0.36)];
+    painter.add(egui::Shape::closed_line(body, stroke));
+    painter.line_segment([p(0.02, 0.36), p(0.62, -0.42)], stroke);
+    painter.add(egui::Shape::line(vec![p(0.02, 0.36), p(-0.12, 0.8), p(0.2, 0.52)], stroke));
+}
+
+pub fn icon_label(ui: &mut Ui, glyph: &str, size: f32, color: Color32) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size + 2.0), Sense::hover());
+    paint_icon(ui.painter(), rect.center(), glyph, size, color);
+    resp
 }
 
 pub fn icon_font(size: f32) -> FontId {
@@ -140,31 +163,95 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
-pub fn gradient_rect(painter: &egui::Painter, rect: egui::Rect, radius: f32, c0: Color32, c1: Color32) {
-    let r = radius.min(rect.height() / 2.0).min(rect.width() / 2.0);
-    let corners = [
-        (egui::pos2(rect.left() + r, rect.top() + r), std::f32::consts::PI),
-        (egui::pos2(rect.right() - r, rect.top() + r), std::f32::consts::PI * 1.5),
-        (egui::pos2(rect.right() - r, rect.bottom() - r), 0.0),
-        (egui::pos2(rect.left() + r, rect.bottom() - r), std::f32::consts::FRAC_PI_2),
-    ];
-    let steps = 10;
-    let mut outline = Vec::new();
-    for (c, start) in corners {
-        for i in 0..=steps {
-            let a = start + std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
-            outline.push(c + Vec2::new(a.cos(), a.sin()) * r);
+pub const FLOW_PERIOD: f64 = 40.0;
+static FLOW: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_flow(phase: f32) {
+    FLOW.store(phase.rem_euclid(1.0).to_bits(), Ordering::Relaxed);
+}
+
+pub fn flow_mix(t: f32) -> f32 {
+    let u = (t.clamp(0.0, 1.0) * 0.5 + f32::from_bits(FLOW.load(Ordering::Relaxed))).rem_euclid(1.0);
+    1.0 - (1.0 - 2.0 * u).abs()
+}
+
+pub fn animations_allowed() -> bool {
+    static CACHE: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+    let mut g = CACHE.lock().unwrap();
+    if let Some((at, v)) = *g {
+        if at.elapsed().as_secs() < 5 {
+            return v;
         }
     }
-    let color_at = |x: f32| c0.lerp_to_gamma(c1, ((x - rect.left()) / rect.width()).clamp(0.0, 1.0));
+    let mut on: i32 = 1;
+    let ok = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+            windows_sys::Win32::UI::WindowsAndMessaging::SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut on as *mut i32 as *mut _,
+            0,
+        )
+    };
+    let mut power: windows_sys::Win32::System::Power::SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    let saver = unsafe { windows_sys::Win32::System::Power::GetSystemPowerStatus(&mut power) } != 0 && power.SystemStatusFlag == 1;
+    let v = (ok == 0 || on != 0) && !saver;
+    *g = Some((std::time::Instant::now(), v));
+    v
+}
+
+pub fn gradient_rect(painter: &egui::Painter, rect: egui::Rect, radius: f32, c0: Color32, c1: Color32) {
+    let r = radius.min(rect.height() / 2.0).min(rect.width() / 2.0).max(0.5);
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let steps = (r * 1.5).ceil().clamp(4.0, 32.0) as usize;
+    let color_at = |x: f32| c0.lerp_to_gamma(c1, flow_mix((x - rect.left()) / rect.width()));
+    let inset = |x: f32| {
+        let dx = (rect.left() + r - x).max(x - (rect.right() - r)).max(0.0);
+        r - (r * r - dx * dx).max(0.0).sqrt()
+    };
+    let mut xs = Vec::new();
+    for i in 0..=steps {
+        xs.push(rect.left() + r - r * (quarter * i as f32 / steps as f32).cos());
+    }
+    let span = rect.width() - 2.0 * r;
+    let mid = (span / 6.0).ceil().max(1.0) as usize;
+    for i in 1..mid {
+        xs.push(rect.left() + r + span * i as f32 / mid as f32);
+    }
+    for i in 0..=steps {
+        xs.push(rect.right() - r + r * (quarter * i as f32 / steps as f32).sin());
+    }
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.center(), color_at(rect.center().x));
+    for &x in &xs {
+        let d = inset(x);
+        let col = color_at(x);
+        mesh.colored_vertex(egui::pos2(x, rect.top() + d), col);
+        mesh.colored_vertex(egui::pos2(x, rect.bottom() - d), col);
+    }
+    for i in 0..xs.len() as u32 - 1 {
+        let a = 2 * i;
+        mesh.add_triangle(a, a + 1, a + 2);
+        mesh.add_triangle(a + 1, a + 3, a + 2);
+    }
+    let outline: Vec<egui::Pos2> = xs
+        .iter()
+        .map(|&x| egui::pos2(x, rect.top() + inset(x)))
+        .chain(xs.iter().rev().map(|&x| egui::pos2(x, rect.bottom() - inset(x))))
+        .collect();
+    let feather = 1.0 / painter.ctx().pixels_per_point();
+    let base = mesh.vertices.len() as u32;
     for p in &outline {
-        mesh.colored_vertex(*p, color_at(p.x));
+        let c = egui::pos2(p.x.clamp(rect.left() + r, rect.right() - r), p.y.clamp(rect.top() + r, rect.bottom() - r));
+        let n = (*p - c).normalized();
+        let inner = *p - n * (feather / 2.0);
+        mesh.colored_vertex(inner, color_at(inner.x));
+        mesh.colored_vertex(*p + n * (feather / 2.0), Color32::TRANSPARENT);
     }
     let n = outline.len() as u32;
     for i in 0..n {
-        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+        let j = (i + 1) % n;
+        let (ia, oa, ib, ob) = (base + 2 * i, base + 2 * i + 1, base + 2 * j, base + 2 * j + 1);
+        mesh.add_triangle(ia, oa, ib);
+        mesh.add_triangle(ib, oa, ob);
     }
     painter.add(egui::Shape::mesh(mesh));
 }
@@ -175,7 +262,7 @@ pub fn gradient_text(text: &str, size: f32, c0: Color32, c1: Color32) -> egui::t
     for (i, ch) in text.chars().enumerate() {
         let fmt = egui::TextFormat {
             font_id: FontId::new(size, FontFamily::Proportional),
-            color: c0.lerp_to_gamma(c1, i as f32 / count as f32),
+            color: c0.lerp_to_gamma(c1, flow_mix(i as f32 / count as f32)),
             ..Default::default()
         };
         job.append(&ch.to_string(), 0.0, fmt);
@@ -191,7 +278,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
         resp.mark_changed();
     }
     let t = ui.ctx().animate_bool_responsive(resp.id, *on);
-    ui.painter().rect_filled(rect, CornerRadius::same(11), Color32::from_white_alpha(28));
+    ui.painter().rect_filled(rect, CornerRadius::same(11), Color32::from_white_alpha((28.0 * (1.0 - t)) as u8));
     if t > 0.01 {
         gradient_rect(ui.painter(), rect, 11.0, PINK.gamma_multiply(t), CYAN.gamma_multiply(t));
     }
@@ -244,13 +331,7 @@ pub fn nav_item(ui: &mut Ui, selected: bool, glyph: &str, label: &str, expand: f
     }
     let color = if selected { Color32::WHITE } else { Color32::from_gray(190) };
     let painter = ui.painter().with_clip_rect(rect);
-    painter.text(
-        egui::pos2(rect.left() + 20.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        icon_font(16.0),
-        if selected { PINK } else { color },
-    );
+    paint_icon(&painter, egui::pos2(rect.left() + 20.0, rect.center().y), glyph, 16.0, if selected { PINK } else { color });
     if expand > 0.05 {
         painter.text(
             egui::pos2(rect.left() + 44.0, rect.center().y),
@@ -300,7 +381,7 @@ pub fn backdrop(painter: &egui::Painter, rect: egui::Rect) {
 }
 
 pub fn grad(t: f32) -> Color32 {
-    PINK.lerp_to_gamma(CYAN, t.clamp(0.0, 1.0))
+    PINK.lerp_to_gamma(CYAN, flow_mix(t))
 }
 
 pub fn power_button(ui: &mut Ui, on: bool, busy: bool) -> Response {
@@ -353,6 +434,28 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str) -> Response {
 
 pub fn segmented(ui: &mut Ui, items: &[String], selected: &mut usize) -> bool {
     let mut changed = false;
+    let font = FontId::new(13.5, FontFamily::Proportional);
+    let need: f32 = items
+        .iter()
+        .map(|l| ui.painter().layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x + 26.0)
+        .sum::<f32>()
+        + 2.0 * items.len().saturating_sub(1) as f32
+        + 8.0;
+    if need > ui.available_width() {
+        let current = items.get(*selected).cloned().unwrap_or_default();
+        egui::ComboBox::from_id_salt(("segmented", items.first().cloned().unwrap_or_default()))
+            .selected_text(current)
+            .width(ui.available_width().clamp(120.0, 260.0))
+            .show_ui(ui, |ui| {
+                for (i, label) in items.iter().enumerate() {
+                    if ui.selectable_label(*selected == i, label.as_str()).clicked() && *selected != i {
+                        *selected = i;
+                        changed = true;
+                    }
+                }
+            });
+        return changed;
+    }
     egui::Frame::new()
         .fill(Color32::from_white_alpha(8))
         .stroke(Stroke::new(1.0, Color32::from_white_alpha(12)))
@@ -446,9 +549,35 @@ pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     .inner
 }
 
+pub fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub fn row_label(ui: &mut Ui, text: &str, width: f32) {
     let w = ui.label(RichText::new(text).color(Color32::from_gray(170))).rect.width();
     if w < width {
         ui.add_space(width - w);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_shifts_colors_along_gradient() {
+        set_flow(0.0);
+        assert!((flow_mix(0.0) - 0.0).abs() < 1e-6 && (flow_mix(1.0) - 1.0).abs() < 1e-6 && (flow_mix(0.3) - 0.3).abs() < 1e-6);
+        set_flow(0.5);
+        assert!((flow_mix(0.0) - 1.0).abs() < 1e-6 && (flow_mix(1.0) - 0.0).abs() < 1e-6);
+        set_flow(0.25);
+        assert!((flow_mix(0.5) - 1.0).abs() < 1e-6 && (flow_mix(0.0) - 0.5).abs() < 1e-6);
+        set_flow(0.0);
+        assert_eq!(ellipsize("abcdef", 4), "abc…");
     }
 }

@@ -81,16 +81,6 @@ impl App {
         let mut install = false;
         theme::card(ui, |ui| {
             theme::row(ui, 44.0, |ui| {
-                ui.label(RichText::new(theme::icon::PICK).font(theme::icon_font(18.0)).color(CYAN));
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(format!("Пробный запуск: {name}")).strong());
-                    ui.label(
-                        RichText::new("Обход работает, пока открыт лаунчер. Служба не установлена")
-                            .color(Color32::from_gray(165))
-                            .size(12.5),
-                    );
-                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_enabled_ui(!self.busy, |ui| {
                         if ui.add(theme::Primary("Установить службой".into())).clicked() {
@@ -99,6 +89,22 @@ impl App {
                         if ui.button("Остановить").clicked() {
                             stop = true;
                         }
+                    });
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(theme::icon::PICK).font(theme::icon_font(18.0)).color(CYAN));
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(RichText::new(format!("Пробный запуск: {name}")).strong()).truncate());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("Обход работает, пока открыт лаунчер. Служба не установлена")
+                                        .color(Color32::from_gray(165))
+                                        .size(12.5),
+                                )
+                                .truncate(),
+                            );
+                        });
                     });
                 });
             });

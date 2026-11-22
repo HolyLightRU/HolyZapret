@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow};
+use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow};
 
 static HWND: AtomicIsize = AtomicIsize::new(0);
 static STATE: Mutex<Option<View>> = Mutex::new(None);
@@ -69,6 +69,8 @@ struct TrayUi {
     icon: TrayIcon,
     status: MenuItem,
     toggle: MenuItem,
+    tg: MenuItem,
+    tg_shown: Option<bool>,
     lit: Icon,
     dim: Icon,
     shown: Option<View>,
@@ -80,6 +82,11 @@ thread_local! {
 
 pub fn set_hwnd(h: isize) {
     HWND.store(h, Ordering::Relaxed);
+}
+
+pub fn window_visible() -> bool {
+    let h = HWND.load(Ordering::Relaxed);
+    h == 0 || unsafe { IsWindowVisible(h as _) != 0 && IsIconic(h as _) == 0 }
 }
 
 pub fn show_window() {
@@ -113,6 +120,11 @@ fn sync() {
     UI.with(|u| {
         let mut u = u.borrow_mut();
         let Some(ui) = u.as_mut() else { return };
+        let tg = crate::core::tgproxy::control::running();
+        if ui.tg_shown != Some(tg) {
+            ui.tg.set_text(if tg { "Выключить Telegram-прокси" } else { "Включить Telegram-прокси" });
+            ui.tg_shown = Some(tg);
+        }
         if view.is_none() || ui.shown == view {
             return;
         }
@@ -176,19 +188,29 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
     let menu = Menu::new();
     let status = MenuItem::new("HolyZapret", false, None);
     let toggle_item = MenuItem::new("Включить защиту", paths.is_some(), None);
+    let tg_item = MenuItem::new("Включить Telegram-прокси", true, None);
     let open = MenuItem::new("Открыть HolyZapret", true, None);
     let quit = MenuItem::new("Выход", true, None);
     let sep = PredefinedMenuItem::separator();
     let sep2 = PredefinedMenuItem::separator();
-    if menu.append_items(&[&status, &sep, &toggle_item, &open, &sep2, &quit]).is_err() {
+    if menu.append_items(&[&status, &sep, &toggle_item, &tg_item, &open, &sep2, &quit]).is_err() {
         return false;
     }
     let (open_id, quit_id, toggle_id) = (open.id().clone(), quit.id().clone(), toggle_item.id().clone());
+    let tg_id = tg_item.id().clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == open_id {
             show_window();
         } else if e.id == quit_id {
             std::process::exit(0);
+        } else if e.id == tg_id {
+            std::thread::spawn(|| {
+                let on = !crate::core::tgproxy::control::running();
+                match crate::core::tgproxy::control::enable(on) {
+                    Ok(m) => report(true, format!("Из трея: {m}")),
+                    Err(e) => report(false, format!("Из трея: Telegram-прокси не запустился: {e}")),
+                }
+            });
         } else if e.id == toggle_id {
             if let Some(p) = paths.clone() {
                 toggle(p);
@@ -203,7 +225,7 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
     let Ok(icon) = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("HolyZapret").with_icon(dim.clone()).build() else {
         return false;
     };
-    UI.with(|u| *u.borrow_mut() = Some(TrayUi { icon, status, toggle: toggle_item, lit, dim, shown: None }));
+    UI.with(|u| *u.borrow_mut() = Some(TrayUi { icon, status, toggle: toggle_item, tg: tg_item, tg_shown: None, lit, dim, shown: None }));
     unsafe {
         SetTimer(std::ptr::null_mut(), 0, 1500, Some(on_timer));
     }

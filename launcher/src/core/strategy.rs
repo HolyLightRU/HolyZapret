@@ -78,7 +78,8 @@ fn collect(paths: &Paths, dir: &Path, category: &str, out: &mut Vec<Strategy>) {
         }
         let name = file.trim_end_matches(".bat").trim_end_matches(".BAT").to_string();
         let (engine, bin, lists) = if own_engine {
-            (dir.join("bin").join("winws.exe"), dir.join("bin"), dir.join("lists"))
+            let exe = if lower.contains("holyzapret.exe") { paths.engine() } else { dir.join("bin").join("winws.exe") };
+            (exe, dir.join("bin"), dir.join("lists"))
         } else if text.contains("exp-list") {
             (paths.engine(), paths.bin(), paths.exp_lists())
         } else {
@@ -209,6 +210,25 @@ mod tests {
         );
         let tcp_only = GameFilter { mode: Mode::Tcp, ..gf };
         assert_eq!(apply_game_filter("--wf-udp=443,%GameFilterUDP% --wf-tcp=%GameFilterTCP%", &tcp_only), "--wf-udp=443,12 --wf-tcp=1000-2000");
+    }
+
+    #[test]
+    fn subfolder_can_run_on_our_engine() {
+        let root = std::env::temp_dir().join(format!("hz-engine-test-{}", std::process::id()));
+        let dir = root.join("experimental");
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin").join("winws.exe"), b"").unwrap();
+        fs::write(dir.join("a.bat"), "start \"\" /min \"%BIN%winws.exe\" --wf-tcp=443\r\n").unwrap();
+        fs::write(dir.join("b.bat"), "start \"\" /min \"%~dp0..\\bin\\HolyZapret.exe\" --wf-tcp=443\r\n").unwrap();
+        let p = Paths { root: root.clone() };
+        let all = discover(&p);
+        let _ = fs::remove_dir_all(&root);
+        let a = all.iter().find(|s| s.name == "a").unwrap();
+        let b = all.iter().find(|s| s.name == "b").unwrap();
+        assert_eq!(a.engine, dir.join("bin").join("winws.exe"));
+        assert_eq!(b.engine, p.engine());
+        assert_eq!(b.bin, dir.join("bin"));
+        assert_eq!(b.lists, dir.join("lists"));
     }
 
     #[test]

@@ -199,6 +199,7 @@ impl App {
                 let local = self.local_version.clone().unwrap_or_else(|| "?".into());
                 let (ver_text, ver_color) = match (&newer, &self.remote_version) {
                     (Some(r), _) => (format!("{local} → {r}"), YELLOW),
+                    (None, _) if crate::core::TEST_BUILD => ("Тестовая сборка: обновления выключены".to_string(), YELLOW),
                     (None, Some(_)) => (format!("Установлена {local}, последняя"), Color32::from_gray(150)),
                     (None, None) => match &self.version_error {
                         Some(e) => (format!("Не удалось проверить: {e}"), RED),
@@ -257,6 +258,9 @@ impl App {
                 );
             });
             self.warp_card(ui, ctx);
+            if self.tg.client.is_none() {
+                self.tg_card(ui, ctx);
+            }
             self.settings_card(ui, ctx);
             if clicks[0].is_some() {
                 self.run_hosts(ctx);
@@ -295,6 +299,10 @@ impl App {
                 self.close_to_tray = tray;
             }
             self.autostart_row(ui, ctx);
+            let mut flow = self.flow;
+            if setting_row(ui, &mut flow, true, "Живые градиенты", "Цвета акцентов медленно перетекают, пока окно лаунчера активно") {
+                self.flow = flow;
+            }
             let mut adv = self.advanced;
             if setting_row(ui, &mut adv, true, "Продвинутый режим", "Вкладка «Списки»: свои домены и IP, поиск доменов по ссылке") {
                 self.advanced = adv;
