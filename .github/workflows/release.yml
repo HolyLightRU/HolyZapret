@@ -95,6 +95,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $env:TAG $zip --clobber
           } else {
-            gh release create $env:TAG $zip --title "Version ${{ steps.ver.outputs.version }}" --generate-notes
+            gh release create $env:TAG $zip --title "HolyZapret ${{ steps.ver.outputs.version }}" --generate-notes
           }
           if ($LASTEXITCODE -ne 0) { throw "gh завершился с кодом $LASTEXITCODE" }

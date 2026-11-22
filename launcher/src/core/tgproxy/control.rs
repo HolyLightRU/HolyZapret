@@ -1,5 +1,7 @@
 use super::{Config, DEFAULT_PORT, Handle, hex, new_secret, parse_secret};
 use crate::core::procs::{self, Proc};
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use winreg::RegKey;
@@ -145,42 +147,141 @@ pub fn close_foreign() -> usize {
     names.iter().filter(|n| crate::core::kill_process(n)).count()
 }
 
-pub fn open_in_telegram(link: &str) {
-    use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("\"{link}\"")).spawn();
+const CLIENTS: [&str; 6] = ["Telegram.exe", "AyuGram.exe", "Kotatogram.exe", "64Gram.exe", "materialgram.exe", "Forkgram.exe"];
+const INSTALLED: [(&str, &str); 4] = [
+    ("Telegram Desktop", "Telegram.exe"),
+    ("AyuGram Desktop", "AyuGram.exe"),
+    ("Kotatogram Desktop", "Kotatogram.exe"),
+    ("64Gram Desktop", "64Gram.exe"),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Client {
+    pub name: String,
+    pub exe: Option<PathBuf>,
 }
 
-fn handler_exe(command: &str) -> Option<std::path::PathBuf> {
+impl Client {
+    fn from_exe(exe: PathBuf) -> Client {
+        let name = exe.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Telegram".into());
+        Client { name, exe: Some(exe) }
+    }
+}
+
+fn is_client(name: &str) -> bool {
+    CLIENTS.iter().any(|c| c.eq_ignore_ascii_case(name))
+}
+
+fn running_client() -> Option<PathBuf> {
+    procs::find(is_client).into_iter().find_map(|p| p.path)
+}
+
+fn plain(p: &Path) -> String {
+    p.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase()
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    plain(a) == plain(b)
+}
+
+fn handler() -> Option<PathBuf> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().find_map(|root| {
+        let cmd = RegKey::predef(root)
+            .open_subkey(r"Software\Classes\tg\shell\open\command")
+            .ok()?
+            .get_value::<String, _>("")
+            .ok()?;
+        handler_exe(&cmd).filter(|p| p.is_file())
+    })
+}
+
+fn remembered() -> Option<PathBuf> {
+    let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok()?;
+    let p = PathBuf::from(k.get_value::<String, _>("TgClient").ok()?);
+    p.is_file().then_some(p)
+}
+
+fn remember(exe: &Path) {
+    if remembered().is_some_and(|p| same_file(&p, exe)) {
+        return;
+    }
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("TgClient", &exe.to_string_lossy().into_owned());
+    }
+}
+
+pub fn desktop_client() -> Option<Client> {
+    if let Some(exe) = running_client() {
+        remember(&exe);
+        return Some(Client::from_exe(exe));
+    }
+    if let Some(exe) = remembered().or_else(handler) {
+        return Some(Client::from_exe(exe));
+    }
+    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap_or_default());
+    if let Some(exe) = INSTALLED.iter().map(|(dir, exe)| appdata.join(dir).join(exe)).find(|p| p.is_file()) {
+        return Some(Client::from_exe(exe));
+    }
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let store = std::fs::read_dir(Path::new(&local).join("Packages"))
+        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("TelegramMessengerLLP.TelegramDesktop")))
+        .unwrap_or(false);
+    store.then(|| Client { name: "Telegram".into(), exe: None })
+}
+
+fn shell_open(target: &OsStr) {
+    use std::os::windows::process::CommandExt;
+    let mut arg = OsString::from("\"");
+    arg.push(target);
+    arg.push("\"");
+    let _ = std::process::Command::new("explorer.exe").raw_arg(arg).spawn();
+}
+
+fn forward(exe: &Path, link: &str) -> bool {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--").arg(link);
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
+    cmd.spawn().is_ok()
+}
+
+fn wait_running(exe: &Path, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if running_client().is_some_and(|p| same_file(&p, exe)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+pub fn open_in_telegram(link: &str, client: Option<&Client>) {
+    if running_client().is_some_and(|exe| forward(&exe, link)) {
+        return;
+    }
+    let exe = client.and_then(|c| c.exe.clone()).filter(|p| p.is_file());
+    match exe {
+        Some(exe) if handler().is_none_or(|h| !same_file(&h, &exe)) => {
+            shell_open(exe.as_os_str());
+            if wait_running(&exe, 20) {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                forward(&exe, link);
+            }
+        }
+        _ => shell_open(OsStr::new(link)),
+    }
+}
+
+fn handler_exe(command: &str) -> Option<PathBuf> {
     let c = command.trim();
     let path = match c.strip_prefix('"') {
         Some(rest) => rest.split('"').next()?,
         None => c.split_whitespace().next()?,
     };
-    Some(std::path::PathBuf::from(path))
-}
-
-pub fn desktop_client() -> Option<String> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-        let cmd = RegKey::predef(root)
-            .open_subkey(r"Software\Classes\tg\shell\open\command")
-            .and_then(|k| k.get_value::<String, _>(""));
-        if let Some(exe) = cmd.ok().as_deref().and_then(handler_exe).filter(|p| p.is_file()) {
-            return exe.file_stem().map(|n| n.to_string_lossy().into_owned());
-        }
-    }
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    if std::path::Path::new(&appdata).join("Telegram Desktop").join("Telegram.exe").is_file() {
-        return Some("Telegram".into());
-    }
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let store = std::fs::read_dir(std::path::Path::new(&local).join("Packages"))
-        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("TelegramMessengerLLP.TelegramDesktop")))
-        .unwrap_or(false);
-    if store {
-        return Some("Telegram".into());
-    }
-    procs::running("Telegram.exe").then(|| "Telegram".into())
+    Some(PathBuf::from(path))
 }
 
 pub fn human(bytes: u64) -> String {
@@ -202,6 +303,9 @@ mod tests {
             assert!(is_original(n), "{n}");
         }
         assert!(!is_original("Telegram.exe"));
+        assert!(is_client("ayugram.exe") && is_client("Telegram.exe") && !is_client("TgWsProxy.exe"));
+        assert!(same_file(Path::new(r"\\?\C:\Users\я\Desktop\⠀\AyuGram.exe"), Path::new(r"C:\Users\я\Desktop\⠀\ayugram.exe")));
+        assert_eq!(Client::from_exe(PathBuf::from(r"C:\Users\я\Desktop\⠀\AyuGram.exe")).name, "AyuGram");
         assert_eq!(handler_exe(r#""C:\Apps\AyuGram\AyuGram.exe"  -- "%1""#), Some(r"C:\Apps\AyuGram\AyuGram.exe".into()));
         assert_eq!(handler_exe(r"C:\T\Telegram.exe -- %1"), Some(r"C:\T\Telegram.exe".into()));
         assert_eq!(human(512), "512 Б");

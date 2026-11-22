@@ -101,14 +101,69 @@ pub fn stop_engines() {
 }
 
 
+fn command(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
+    let args = strategy::extract_args(s, paths, &super::gamefilter::load(paths))?;
+    Ok(format!("\"{}\" {}", s.engine.display(), args))
+}
+
+fn installed_command() -> Option<String> {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"System\CurrentControlSet\Services\zapret")
+        .ok()?
+        .get_value::<String, _>("ImagePath")
+        .ok()
+}
+
+fn same_command(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    norm(a) == norm(b)
+}
+
+pub struct Paused {
+    strategy: String,
+    running: bool,
+}
+
+pub fn pause_ours(paths: &Paths) -> Option<Paused> {
+    let st = status(paths);
+    let strategy = st.active_strategy()?.to_string();
+    let running = st.service == ServiceState::Running;
+    if running {
+        run_hidden("net", &["stop", SERVICE]);
+    }
+    Some(Paused { strategy, running })
+}
+
+pub fn resume(paths: &Paths, p: Paused) -> anyhow::Result<String> {
+    let Some(s) = strategy::discover(paths).into_iter().find(|s| s.id == p.strategy) else {
+        if p.running {
+            start()?;
+        }
+        anyhow::bail!("стратегии «{}» больше нет, служба осталась на старой версии", p.strategy);
+    };
+    let fresh = command(paths, &s)?;
+    if installed_command().is_some_and(|old| same_command(&old, &fresh)) {
+        if p.running {
+            start()?;
+            return Ok(format!("Служба снова запущена, стратегия «{}» не изменилась", s.name));
+        }
+        return Ok(format!("Стратегия службы «{}» не изменилась", s.name));
+    }
+    install(paths, &s)?;
+    if !p.running {
+        run_hidden("net", &["stop", SERVICE]);
+    }
+    Ok(format!("Стратегия «{}» обновилась, служба переустановлена", s.name))
+}
+
 pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
     super::lists::ensure_user_files(&strategy::lists_dir(s, paths))?;
     remove_quiet();
     stop_engines();
-    let args = strategy::extract_args(s, paths, &super::gamefilter::load(paths))?;
+    let command = command(paths, s)?;
     remove_quiet();
 
-    let bin_path = format!("\"{}\" {}", s.engine.display(), args).replace('"', "\\\"");
+    let bin_path = command.replace('"', "\\\"");
     let raw = format!("create {SERVICE} binPath= \"{bin_path}\" DisplayName= \"zapret\" start= auto");
     let out = Command::new("sc").raw_arg(raw).creation_flags(CREATE_NO_WINDOW).output()?;
     if !out.status.success() {
@@ -172,4 +227,17 @@ pub fn remove() -> String {
     kill_process("HolyZapret.exe");
     kill_process("winws.exe");
     if existed { "Служба HolyZapret удалена".into() } else { "Служба не была установлена, процессы остановлены".into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_compare_ignores_spacing_and_case() {
+        let a = r#""C:\HZ\bin\HolyZapret.exe"  --wf-tcp=80,443 --hostlist="C:\HZ\lists\a.txt""#;
+        let b = r#""c:\hz\bin\HolyZapret.exe" --wf-tcp=80,443 --hostlist="C:\HZ\lists\a.txt" "#;
+        assert!(same_command(a, b));
+        assert!(!same_command(a, &a.replace("443", "443,2053")));
+    }
 }

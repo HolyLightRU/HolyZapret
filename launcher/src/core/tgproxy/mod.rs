@@ -178,7 +178,7 @@ async fn client(mut s: TcpStream, sh: &Shared) {
     let target = Target { dc: hello.dc, media: hello.media, test: hello.test };
     let Some((kind, up)) = sh.routes.connect(&target).await else {
         sh.stats.failed.fetch_add(1, Ordering::Relaxed);
-        sh.stats.error(format!("DC{}: ни WebSocket, ни Cloudflare, ни прямое подключение не отвечают", hello.dc));
+        sh.stats.error(format!("DC{} недоступен: WebSocket, Cloudflare и прямое подключение не отвечают", hello.dc));
         return;
     };
     match &kind {

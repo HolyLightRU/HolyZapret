@@ -331,17 +331,13 @@ fn ensure_stopped() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn apply(paths: &Paths, rel: &Release) -> anyhow::Result<Summary> {
+pub fn download(rel: &Release) -> anyhow::Result<Vec<u8>> {
+    Ok(agent(300).get(&rel.zip_url).call()?.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec()?)
+}
+
+pub fn install(paths: &Paths, rel: &Release, bytes: &[u8]) -> anyhow::Result<Summary> {
     ensure_stopped()?;
-    let bytes = agent(300)
-        .get(&rel.zip_url)
-        .call()?
-        .body_mut()
-        .with_config()
-        .limit(MAX_DOWNLOAD)
-        .read_to_vec()?;
-    ensure_stopped()?;
-    install_zip(paths, &bytes, &rel.version)
+    install_zip(paths, bytes, &rel.version)
 }
 
 fn collect_old(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
@@ -418,7 +414,8 @@ mod tests {
         assert!(parse_release(r#"{"message":"Not Found"}"#).is_err());
         assert!(parse_release("not json").is_err());
         let _: fn() -> anyhow::Result<Release> = latest;
-        let _: fn(&Paths, &Release) -> anyhow::Result<Summary> = apply;
+        let _: fn(&Release) -> anyhow::Result<Vec<u8>> = download;
+        let _: fn(&Paths, &Release, &[u8]) -> anyhow::Result<Summary> = install;
     }
 
     #[test]

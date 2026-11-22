@@ -7,7 +7,7 @@ use eframe::egui::{self, Color32, RichText};
 #[derive(Default)]
 pub struct TgState {
     pub foreign: Vec<String>,
-    pub client: Option<String>,
+    pub client: Option<control::Client>,
     saved: Option<control::Saved>,
     port: String,
     domain: String,
@@ -50,7 +50,7 @@ impl App {
     pub(super) fn tg_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             self.tg_card(ui, ctx);
-            let client = self.tg.client.clone().unwrap_or_else(|| "Telegram".into());
+            let client = self.tg.client.as_ref().map_or_else(|| "Telegram".to_string(), |c| c.name.clone());
             theme::card(ui, |ui| {
                 theme::row(ui, 32.0, |ui| {
                     ui.label(RichText::new(theme::icon::INFO).font(theme::icon_font(17.0)).color(CYAN));
@@ -154,7 +154,10 @@ impl App {
                     control::human(s.up),
                     control::human(s.down)
                 )));
-                if s.bad_secret > 0 || s.failed > 0 {
+                let working = s.via_ws + s.via_cf + s.via_tcp > 0;
+                if s.failed > 0 && working && s.bad_secret == 0 {
+                    ui.add(egui::Label::new(muted(format!("{}. Это не мешает: Telegram работает через остальные дата-центры", s.last_error))).wrap());
+                } else if s.bad_secret > 0 || s.failed > 0 {
                     let col = if s.failed > 0 { RED } else { YELLOW };
                     ui.add(egui::Label::new(RichText::new(&s.last_error).color(col).size(12.5)).wrap());
                 }
@@ -224,7 +227,8 @@ impl App {
                 });
             }
             Act::Open => {
-                control::open_in_telegram(&link);
+                let client = self.tg.client.clone();
+                std::thread::spawn(move || control::open_in_telegram(&link, client.as_ref()));
                 self.toast(ctx, Lvl::Info, "Подтвердите подключение прокси в Telegram");
             }
             Act::Copy => {

@@ -136,18 +136,28 @@ impl App {
             self.check_version(ctx);
             return;
         };
-        if self.trial.is_some() || self.status.as_ref().is_some_and(|s| s.engine_running) {
+        let only_service = self.status.as_ref().is_some_and(|s| s.active_strategy().is_some() && s.foreign_engines.is_empty());
+        if self.trial.is_some() || (self.status.as_ref().is_some_and(|s| s.engine_running) && !only_service) {
             self.toast(ctx, Lvl::Err, "Сначала выключите защиту и пробный запуск: движок держит файлы, которые нужно обновить");
             return;
         }
         self.spawn(ctx, move |p, tx| {
             send(tx, Lvl::Info, format!("Скачиваю HolyZapret {}…", rel.version));
-            match crate::core::selfupdate::apply(p, &rel) {
-                Ok(sum) => {
-                    let lvl = Lvl::Ok;
-                    notify(tx, lvl, sum.to_string());
+            let bytes = match crate::core::selfupdate::download(&rel) {
+                Ok(b) => b,
+                Err(e) => {
+                    notify(tx, Lvl::Err, format!("Обновление не удалось: {e}"));
+                    let _ = tx.send(Msg::Updated);
+                    return;
                 }
+            };
+            let paused = crate::core::service::pause_ours(p);
+            match crate::core::selfupdate::install(p, &rel, &bytes) {
+                Ok(sum) => notify(tx, Lvl::Ok, sum.to_string()),
                 Err(e) => notify(tx, Lvl::Err, format!("Обновление не удалось: {e}")),
+            }
+            if let Some(paused) = paused {
+                result_msg(tx, crate::core::service::resume(p, paused), "Служба после обновления");
             }
             let _ = tx.send(Msg::Updated);
         });

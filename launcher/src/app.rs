@@ -45,6 +45,7 @@ enum Msg {
     Autostart(bool),
     Warp(crate::core::warp::State),
     TgForeign(Vec<String>),
+    TgClient(Option<crate::core::tgproxy::control::Client>),
     PostInstallCheck,
     TrialStarted(Result<trial::Trial, String>),
     Done,
@@ -281,6 +282,7 @@ impl App {
                         let _ = tx.send(Msg::Warp(crate::core::warp::query()));
                     }
                     let _ = tx.send(Msg::TgForeign(tg_ui::foreign_names()));
+                    let _ = tx.send(Msg::TgClient(crate::core::tgproxy::control::desktop_client()));
                     if tx.send(Msg::Status(st)).is_err() {
                         break;
                     }
@@ -437,6 +439,12 @@ impl App {
                 Msg::Autostart(on) => self.autostart = Some(on),
                 Msg::Warp(w) => self.warp = Some(w),
                 Msg::TgForeign(f) => self.tg.foreign = f,
+                Msg::TgClient(c) => {
+                    if c.is_none() && self.tab == Tab::Telegram {
+                        self.tab = Tab::Tools;
+                    }
+                    self.tg.client = c;
+                }
                 Msg::Rescan => self.rescan(),
                 Msg::Updated => {
                     self.local_version = self.paths.as_ref().and_then(update::local_version);
