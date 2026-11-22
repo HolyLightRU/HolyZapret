@@ -72,7 +72,7 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           git archive --format=tar HEAD -o "$env:RUNNER_TEMP/src.tar"
           tar -xf "$env:RUNNER_TEMP/src.tar" -C $stage
-          foreach ($p in @("launcher", ".idea", ".github", ".gitignore", "docs", "experimental", "bin/game_filter.enabled")) {
+          foreach ($p in @("launcher", ".idea", ".github", ".gitignore", "docs", "bin/game_filter.enabled")) {
             $full = Join-Path $stage $p
             if (Test-Path $full) { Remove-Item $full -Recurse -Force }
           }

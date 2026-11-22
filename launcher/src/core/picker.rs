@@ -35,6 +35,7 @@ const FREEZE_SUITE: &[(&str, &str)] = &[
     ("Google Cloud", "https://api.usercentrics.eu/gvl/v3/en.json"),
     ("Fastly", "https://openoffice.apache.org/images/blog/rejected.png"),
     ("Akamai", "https://www.lg.com/lg5-common-gp/library/jquery.min.js"),
+    ("OVH", "https://proof.ovh.net/files/1Mb.dat"),
     ("CDN77", "https://cdn.eso.org/images/banner1920/eso2520a.jpg"),
     (
         "Contabo",
@@ -163,6 +164,7 @@ pub enum Event {
     Done(Outcome),
     Finished { cancelled: bool, restore: Option<Result<(), String>> },
     Failed(String),
+    Lists { added: Vec<String>, open: Vec<String>, error: Option<String> },
 }
 
 pub fn noisy_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> {
@@ -185,6 +187,30 @@ pub fn noisy_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> {
             pass > 0 && pass * 3 < runs.len()
         })
         .collect()
+}
+
+pub fn unreachable_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> {
+    let none = vec![false; targets.len()];
+    let Some(base) = results.iter().find(|o| o.path.is_none() && o.checks.len() == targets.len()) else { return none };
+    let runs: Vec<&Outcome> =
+        results.iter().filter(|o| o.path.is_some() && o.error.is_none() && o.checks.len() == targets.len()).collect();
+    if runs.is_empty() {
+        return none;
+    }
+    let dead = |c: &Check| !c.ok && !c.frozen;
+    (0..targets.len()).map(|i| dead(&base.checks[i]) && runs.iter().all(|o| dead(&o.checks[i]))).collect()
+}
+
+pub fn either(a: &[bool], b: &[bool]) -> Vec<bool> {
+    a.iter().zip(b).map(|(x, y)| *x || *y).collect()
+}
+
+pub fn check_label(t: &Target) -> String {
+    match t.kind {
+        CheckKind::Freeze => format!("{} / {}", t.category, t.name),
+        CheckKind::Tls12 => format!("{} / {} (TLS 1.2)", t.category, t.name),
+        CheckKind::Tls13 => format!("{} / {} (TLS 1.3)", t.category, t.name),
+    }
 }
 
 pub fn categories(targets: &[Target]) -> Vec<String> {
@@ -298,6 +324,19 @@ pub fn site_domains(urls: &[String]) -> Vec<String> {
     out
 }
 
+pub fn blocked_sites(targets: &[Target], base: &[Check]) -> (Vec<String>, Vec<String>) {
+    let mut blocked: Vec<String> = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    for t in targets {
+        let failed = targets.iter().zip(base).any(|(u, c)| u.url == t.url && !c.ok);
+        let side = if failed { &mut blocked } else { &mut open };
+        if !side.contains(&t.url) {
+            side.push(t.url.clone());
+        }
+    }
+    (blocked, open)
+}
+
 pub fn add_to_user_lists(dirs: &[PathBuf], domains: &[String]) -> anyhow::Result<usize> {
     let mut added = 0;
     for dir in dirs {
@@ -353,7 +392,7 @@ pub fn judge(kind: CheckKind, exit: i32, w: &str) -> Check {
     }
 }
 
-fn run_check(t: &Target) -> Check {
+pub(crate) fn run_check(t: &Target) -> Check {
     let c = curl_check(t);
     if t.kind == CheckKind::Freeze && !c.ok && !c.frozen { curl_check(t) } else { c }
 }
@@ -435,17 +474,21 @@ pub fn log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join("holyzapret-picker").join(format!("{safe}.log"))
 }
 
-fn start_engine(paths: &Paths, s: &Strategy, game_filter: &GameFilter) -> anyhow::Result<Child> {
+fn start_engine(paths: &Paths, s: &Strategy, game_filter: &GameFilter, rules: bool) -> anyhow::Result<Child> {
     super::lists::ensure_user_files(&strategy::lists_dir(s, paths))?;
-    let args = strategy::extract_args(s, paths, game_filter)?;
-    let path = log_path(&s.name);
+    let args = if rules { super::rules::with_rules(paths, s, game_filter)? } else { strategy::extract_args(s, paths, game_filter)? };
+    start_raw(&s.engine, &s.bin, &args, &s.name)
+}
+
+pub(crate) fn start_raw(engine: &std::path::Path, bin: &std::path::Path, args: &str, name: &str) -> anyhow::Result<Child> {
+    let path = log_path(name);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let log = fs::File::create(path)?;
-    let child = Command::new(&s.engine)
+    let child = Command::new(engine)
         .raw_arg(args)
-        .current_dir(&s.bin)
+        .current_dir(bin)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -472,7 +515,7 @@ pub fn engine_error(log: &str) -> String {
     if tail.is_empty() { "движок завершился сразу после запуска".into() } else { tail }
 }
 
-fn warm_up(child: &mut Child, name: &str, cancel: &AtomicBool) -> Result<(), String> {
+pub(crate) fn warm_up(child: &mut Child, name: &str, cancel: &AtomicBool) -> Result<(), String> {
     let t = Instant::now();
     while t.elapsed() < ENGINE_WARMUP {
         if cancel.load(Ordering::Relaxed) {
@@ -487,7 +530,7 @@ fn warm_up(child: &mut Child, name: &str, cancel: &AtomicBool) -> Result<(), Str
 }
 
 pub fn start_trial(paths: &Paths, s: &Strategy, game_filter: &GameFilter) -> anyhow::Result<Child> {
-    let mut child = start_engine(paths, s, game_filter)?;
+    let mut child = start_engine(paths, s, game_filter, true)?;
     match warm_up(&mut child, &s.name, &AtomicBool::new(false)) {
         Ok(()) => Ok(child),
         Err(e) => {
@@ -501,7 +544,7 @@ pub fn stop_trial(child: Child) {
     stop_engine(Some(child));
 }
 
-fn stop_engine(child: Option<Child>) {
+pub(crate) fn stop_engine(child: Option<Child>) {
     if let Some(mut c) = child {
         let _ = c.kill();
         let _ = c.wait();
@@ -516,6 +559,7 @@ pub fn run(
     strategies: Vec<Strategy>,
     targets: Vec<Target>,
     game_filter: GameFilter,
+    add_to: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
     emit: impl Fn(Event) + Sync,
 ) {
@@ -535,7 +579,13 @@ pub fn run(
     emit(Event::Phase { index: 0, name: "Без обхода".into() });
     let base = run_suite(&targets, &cancel, &emit);
     if !cancel.load(Ordering::Relaxed) {
-        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base }));
+        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone() }));
+        if !add_to.is_empty() {
+            let (blocked, open) = blocked_sites(&targets, &base);
+            let added = site_domains(&blocked);
+            let error = if added.is_empty() { None } else { add_to_user_lists(&add_to, &added).err().map(|e| e.to_string()) };
+            emit(Event::Lists { added, open: site_domains(&open), error });
+        }
     }
 
     for (i, s) in strategies.iter().enumerate() {
@@ -544,10 +594,26 @@ pub fn run(
         }
         emit(Event::Phase { index: i + 1, name: s.name.clone() });
         let mut outcome = Outcome { name: s.name.clone(), path: Some(s.path.clone()), error: None, checks: Vec::new() };
-        match start_engine(&paths, s, &game_filter) {
+        match start_engine(&paths, s, &game_filter, false) {
             Ok(mut child) => match warm_up(&mut child, &s.name, &cancel) {
                 Ok(()) => {
                     outcome.checks = run_suite(&targets, &cancel, &emit);
+                    recheck(&targets, &base, &mut outcome.checks, &cancel);
+                    if blackout(&base, &outcome.checks) && !cancel.load(Ordering::Relaxed) {
+                        stop_engine(Some(child));
+                        child = match start_engine(&paths, s, &game_filter, false) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                outcome.error = Some(e.to_string());
+                                emit(Event::Done(Outcome { checks: vec![Check::failed(); targets.len()], ..outcome }));
+                                continue;
+                            }
+                        };
+                        if warm_up(&mut child, &s.name, &cancel).is_ok() {
+                            outcome.checks = run_suite(&targets, &cancel, &emit);
+                            recheck(&targets, &base, &mut outcome.checks, &cancel);
+                        }
+                    }
                     stop_engine(Some(child));
                 }
                 Err(e) => {
@@ -572,9 +638,60 @@ pub fn run(
     emit(Event::Finished { cancelled: cancel.load(Ordering::Relaxed), restore });
 }
 
+fn regressions(base: &[Check], checks: &[Check]) -> Vec<usize> {
+    (0..checks.len().min(base.len())).filter(|&i| base[i].ok && !checks[i].ok).collect()
+}
+
+fn blackout(base: &[Check], checks: &[Check]) -> bool {
+    base.iter().any(|c| c.ok) && !checks.is_empty() && checks.iter().all(|c| !c.ok)
+}
+
+fn recheck(targets: &[Target], base: &[Check], checks: &mut [Check], cancel: &AtomicBool) {
+    let again = regressions(base, checks);
+    if again.is_empty() || cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let fresh: Vec<(usize, Check)> = std::thread::scope(|s| {
+        let jobs: Vec<_> = again.iter().map(|&i| s.spawn(move || (i, run_check(&targets[i])))).collect();
+        jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+    });
+    for (i, c) in fresh {
+        if c.ok {
+            checks[i] = c;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_blocked_sites_go_to_lists() {
+        let t = |url: &str, kind| Target { name: url.into(), category: "x".into(), url: url.into(), kind };
+        let targets = vec![
+            t("https://soundcloud.com", CheckKind::Tls12),
+            t("https://soundcloud.com", CheckKind::Tls13),
+            t("https://store.steampowered.com", CheckKind::Tls12),
+            t("https://store.steampowered.com", CheckKind::Tls13),
+        ];
+        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let (blocked, open) = blocked_sites(&targets, &[c(true), c(false), c(true), c(true)]);
+        assert_eq!(blocked, vec!["https://soundcloud.com".to_string()]);
+        assert_eq!(open, vec!["https://store.steampowered.com".to_string()]);
+        assert_eq!(site_domains(&open), vec!["steampowered.com".to_string()]);
+    }
+
+    #[test]
+    fn regressions_and_blackouts() {
+        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let base = vec![c(true), c(false), c(true)];
+        assert_eq!(regressions(&base, &[c(false), c(false), c(true)]), vec![0]);
+        assert!(blackout(&base, &[c(false), c(false), c(false)]));
+        assert!(!blackout(&base, &[c(false), c(true), c(false)]));
+        assert!(!blackout(&[c(false), c(false)], &[c(false), c(false)]));
+    }
 
     #[test]
     fn lucky_timeouts_are_noise() {
@@ -597,6 +714,25 @@ mod tests {
         assert_eq!(results[1].category_without(&targets, "x", &noisy), (2, 2));
         results.truncate(3);
         assert_eq!(noisy_checks(&targets, &results), vec![false, false, false]);
+    }
+
+    #[test]
+    fn blocked_everywhere_is_marked() {
+        let t = |name: &str| Target { name: name.into(), category: "x".into(), url: String::new(), kind: CheckKind::Freeze };
+        let targets = vec![t("yt"), t("cdn77"), t("frozen"), t("ok")];
+        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks };
+        let base = out(None, vec![c(false, false), c(false, false), c(false, true), c(true, false)]);
+        let a = out(Some("a"), vec![c(true, false), c(false, false), c(false, true), c(true, false)]);
+        let b = out(Some("b"), vec![c(false, false), c(false, false), c(false, true), c(true, false)]);
+        let mut results = vec![base];
+        assert_eq!(unreachable_checks(&targets, &results), vec![false; 4]);
+        results.extend([a, b]);
+        let u = unreachable_checks(&targets, &results);
+        assert_eq!(u, vec![false, true, false, false]);
+        assert_eq!(either(&u, &[true, false, false, false]), vec![true, true, false, false]);
+        assert_eq!(results[1].score_without(&u), (2, 3));
+        assert_eq!(check_label(&targets[1]), "x / cdn77");
     }
 
     #[test]

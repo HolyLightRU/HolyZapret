@@ -2,6 +2,7 @@ mod confirm;
 mod diag_tab;
 mod lists_tab;
 mod picker_tab;
+mod rules_ui;
 mod sites_tab;
 mod tools_tab;
 mod tg_ui;
@@ -40,6 +41,7 @@ enum Msg {
     Found(Result<Found, String>),
     FlowsealLatest(Result<Release, String>),
     Pick(picker::Event),
+    Rules(crate::core::rules::Event),
     Rescan,
     Updated,
     Autostart(bool),
@@ -158,6 +160,7 @@ pub struct App {
     saved: Settings,
     lists: lists_tab::ListsState,
     picker: picker_tab::PickerState,
+    rules: rules_ui::RulesState,
     flowseal_version: Option<String>,
     flowseal_latest: Option<Release>,
     flowseal_checking: bool,
@@ -222,6 +225,7 @@ impl App {
             saved,
             lists: Default::default(),
             picker: Default::default(),
+            rules: Default::default(),
             flowseal_version,
             flowseal_latest: None,
             flowseal_checking: false,
@@ -409,6 +413,7 @@ impl App {
                     self.lists.search_failed();
                     self.toast(ctx, Lvl::Err, format!("Поиск не удался: {e}"));
                 }
+                Msg::Rules(e) => self.on_rules_event(ctx, e),
                 Msg::Pick(e) => {
                     let fin = matches!(e, picker::Event::Finished { .. } | picker::Event::Failed(_));
                     let completed = matches!(e, picker::Event::Finished { cancelled: false, .. });
@@ -510,6 +515,19 @@ impl App {
             match service::install(p, &s) {
                 Ok(m) => {
                     notify(tx, Lvl::Ok, m);
+                    let mut others: Vec<String> = crate::core::rules::load(p)
+                        .into_iter()
+                        .map(|r| r.origin)
+                        .filter(|o| !o.is_empty() && !s.matches(o))
+                        .collect();
+                    others.dedup();
+                    if !others.is_empty() {
+                        notify(
+                            tx,
+                            Lvl::Info,
+                            format!("Часть правил для сайтов подобрана под «{}»: проверьте эти сайты на новой стратегии на вкладке «Сайты»", others.join("», «")),
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     let _ = tx.send(Msg::PostInstallCheck);
                 }

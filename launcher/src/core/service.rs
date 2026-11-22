@@ -102,7 +102,7 @@ pub fn stop_engines() {
 
 
 fn command(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
-    let args = strategy::extract_args(s, paths, &super::gamefilter::load(paths))?;
+    let args = super::rules::with_rules(paths, s, &super::gamefilter::load(paths))?;
     Ok(format!("\"{}\" {}", s.engine.display(), args))
 }
 

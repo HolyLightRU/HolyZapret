@@ -13,7 +13,7 @@ const SECONDS_PER_STRATEGY: usize = 11;
 pub struct PickerState {
     mode: usize,
     priority: usize,
-    running: bool,
+    pub(super) running: bool,
     cancel: Option<Arc<AtomicBool>>,
     strategies: usize,
     checks: usize,
@@ -24,8 +24,9 @@ pub struct PickerState {
     results: Vec<Outcome>,
     chosen: Option<usize>,
     optimal: Option<usize>,
-    scope: usize,
-    sites: String,
+    pub(super) scope: usize,
+    report_form: Option<(String, String, String)>,
+    pub(super) sites: String,
     skip_lists: bool,
     default_targets: Vec<Target>,
 }
@@ -131,6 +132,20 @@ impl PickerState {
                 self.cancel = None;
                 Some((Lvl::Err, e))
             }
+            Event::Lists { added, open, error } => {
+                let mut parts = Vec::new();
+                if !added.is_empty() {
+                    parts.push(format!("Добавлено в «Мои домены»: {}", added.join(", ")));
+                }
+                if !open.is_empty() {
+                    parts.push(format!("открываются без обхода, в «Мои домены» не добавлены: {}", open.join(", ")));
+                }
+                match error {
+                    Some(e) => Some((Lvl::Err, format!("Не удалось дополнить «Мои домены»: {e}"))),
+                    None if parts.is_empty() => None,
+                    None => Some((if added.is_empty() { Lvl::Info } else { Lvl::Ok }, parts.join(". "))),
+                }
+            }
         }
     }
 
@@ -146,13 +161,41 @@ impl PickerState {
         self.targets.iter().zip(self.noisy()).filter(|(_, n)| *n).map(|(t, _)| format!("{} / {}", t.category, t.name)).collect()
     }
 
+    fn unreachable(&self) -> Vec<bool> {
+        picker::unreachable_checks(&self.targets, &self.results)
+    }
+
+    fn unreachable_names(&self) -> Vec<String> {
+        self.targets.iter().zip(self.unreachable()).filter(|(_, n)| *n).map(|(t, _)| picker::check_label(t)).collect()
+    }
+
+    fn mask(&self) -> Vec<bool> {
+        picker::either(&self.noisy(), &self.unreachable())
+    }
+
     fn key(&self, o: &Outcome, noisy: &[bool]) -> (bool, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>, usize) {
         let pri = self.priority_cat().map(|c| o.category(&self.targets, &c).0).unwrap_or(0);
         (o.error.is_some(), std::cmp::Reverse(pri), std::cmp::Reverse(o.clean_score(noisy)), o.frozen())
     }
 
+    fn broken(&self) -> Option<(String, Vec<String>)> {
+        let best = self.best().map(|i| &self.results[i]).filter(|o| o.path.is_some() && o.error.is_none())?;
+        let base = self.results.iter().find(|o| o.path.is_none())?;
+        let mut domains: Vec<String> = Vec::new();
+        for (i, t) in self.targets.iter().enumerate() {
+            let (Some(b), Some(c)) = (base.checks.get(i), best.checks.get(i)) else { continue };
+            if b.ok && !c.ok {
+                let d = crate::core::discover::base_domain(&picker::host_of(&t.url));
+                if !domains.contains(&d) {
+                    domains.push(d);
+                }
+            }
+        }
+        (!domains.is_empty()).then(|| (best.name.clone(), domains))
+    }
+
     fn best(&self) -> Option<usize> {
-        let noisy = self.noisy();
+        let noisy = self.mask();
         let top = self.ranked_with(&noisy).first().copied().filter(|&i| self.results[i].error.is_none());
         let base = self.results.iter().position(|o| o.path.is_none());
         match (top, base) {
@@ -164,7 +207,7 @@ impl PickerState {
     }
 
     fn ranked(&self) -> Vec<usize> {
-        self.ranked_with(&self.noisy())
+        self.ranked_with(&self.mask())
     }
 
     fn ranked_with(&self, noisy: &[bool]) -> Vec<usize> {
@@ -179,6 +222,7 @@ impl PickerState {
 
 impl App {
     pub(super) fn picker_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.report_dialog(ctx);
         if let Some(p) = &self.paths {
             if self.picker.default_targets.is_empty() {
                 self.picker.default_targets = picker::load_targets(p);
@@ -260,8 +304,8 @@ impl App {
             theme::row(ui, 30.0, |ui| {
                 theme::row_label(ui, "", 110.0);
                 let mut add = !self.picker.skip_lists;
-                ui.checkbox(&mut add, "Добавить домены в «Мои домены»")
-                    .on_hover_text("Стратегии обходят блокировку только для доменов из списков, поэтому без этого сайт не откроется даже с подходящей стратегией");
+                ui.checkbox(&mut add, "Добавить заблокированные в «Мои домены»")
+                    .on_hover_text("Стратегии обходят блокировку только для доменов из списков. Добавятся только сайты, которые не открылись без обхода: обход рабочих сайтов может их сломать");
                 self.picker.skip_lists = !add;
             });
         }
@@ -341,10 +385,11 @@ impl App {
         let base_idx = self.picker.results.iter().position(|o| o.path.is_none());
         let baseline = base_idx.map(|i| self.picker.results[i].clone());
         let best = self.picker.best();
-        let mask = self.picker.noisy();
+        let mask = self.picker.mask();
         let mut install = None;
         let mut remove = false;
         let mut report = false;
+        let mut exclude = None;
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
                 ui.label(RichText::new("Результаты").size(17.0).strong());
@@ -388,6 +433,40 @@ impl App {
                     .weak()
                     .size(12.5),
                 );
+            }
+            let dead = self.picker.unreachable_names();
+            if !dead.is_empty() && !self.picker.running {
+                ui.label(
+                    RichText::new(format!(
+                        "Недоступны и без обхода, и со всеми стратегиями, похоже на блокировку по IP. Обход тут не поможет, в счёт не идут: {}",
+                        dead.join(", ")
+                    ))
+                    .weak()
+                    .size(12.5),
+                );
+            }
+            if let Some((name, domains)) = self.picker.broken().filter(|_| !self.picker.running) {
+                theme::row(ui, 30.0, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Не обходить их"))
+                            .on_hover_text("Добавит правило на вкладке «Сайты»: стратегия не будет трогать эти сайты")
+                            .clicked()
+                        {
+                            exclude = Some((name.clone(), domains.clone()));
+                        }
+                        let w = ui.available_width();
+                        ui.add_sized(
+                            [w, 18.0],
+                            egui::Label::new(
+                                RichText::new(format!("С «{name}» перестают открываться сайты, которые работают без обхода: {}", domains.join(", ")))
+                                    .color(YELLOW)
+                                    .size(12.5),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
             }
             let h = (ui.available_height() - 52.0).max(120.0);
             egui::ScrollArea::vertical().max_height(h).auto_shrink([false, false]).show(ui, |ui| {
@@ -438,7 +517,11 @@ impl App {
             });
         });
         if report {
-            self.save_report(ctx);
+            let (isp, city) = crate::core::settings::report_place();
+            self.picker.report_form = Some((isp, city, String::new()));
+        }
+        if let Some((origin, domains)) = exclude {
+            self.add_rule(ctx, crate::core::rules::Rule { technique: crate::core::rules::NONE.into(), domains, origin });
         }
         if remove {
             self.confirm = Some(super::confirm::Confirm::RemoveService);
@@ -453,12 +536,66 @@ impl App {
         }
     }
 
-    fn save_report(&mut self, ctx: &egui::Context) {
+    fn report_dialog(&mut self, ctx: &egui::Context) {
+        let Some((isp, city, problem)) = self.picker.report_form.as_mut() else { return };
+        let mut answer = None;
+        let frame = egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(26, 22, 32, 250))
+            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
+            .corner_radius(CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(20));
+        let modal = egui::Modal::new(egui::Id::NULL.with("report_form")).frame(frame).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(RichText::new("Сохранить отчёт").size(17.0).strong());
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Провайдер и город сильно влияют на то, какая стратегия работает. Их можно не заполнять").color(Color32::from_gray(170)).size(12.5),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            for (label, value, hint) in [("Провайдер", &mut *isp, "Ростелеком, МТС, Билайн…"), ("Город", &mut *city, "Омск")] {
+                theme::row(ui, 34.0, |ui| {
+                    theme::row_label(ui, label, 92.0);
+                    ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(ui.available_width()));
+                });
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Что не работает, хотя подбор зелёный").color(Color32::from_gray(170)));
+            ui.add(egui::TextEdit::multiline(problem).hint_text("голос Discord, игры, видео…").desired_rows(2).desired_width(f32::INFINITY));
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(theme::Primary("Сохранить".into())).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Отмена").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if answer.is_none() && modal.should_close() {
+            answer = Some(false);
+        }
+        match answer {
+            Some(true) => {
+                if let Some((isp, city, problem)) = self.picker.report_form.take() {
+                    crate::core::settings::set_report_place(isp.trim(), city.trim());
+                    self.save_report(ctx, isp, city, problem);
+                }
+            }
+            Some(false) => self.picker.report_form = None,
+            None => {}
+        }
+    }
+
+    fn save_report(&mut self, ctx: &egui::Context, isp: String, city: String, problem: String) {
         let mut order: Vec<usize> = self.picker.results.iter().position(|o| o.path.is_none()).into_iter().collect();
         order.extend(self.picker.ranked());
         let results: Vec<picker::Outcome> = order.iter().map(|&i| self.picker.results[i].clone()).collect();
         let targets = self.picker.targets.clone();
         let noisy = self.picker.noisy_names();
+        let unreachable = self.picker.unreachable();
         let version = self.local_version.clone().unwrap_or_else(|| "?".into());
         let flowseal = self.flowseal_version.clone();
         let game = self.status.as_ref().map(|s| s.game.summary()).unwrap_or_default();
@@ -476,6 +613,10 @@ impl App {
                 targets: &targets,
                 ordered: results.iter().collect(),
                 noisy,
+                isp,
+                city,
+                problem,
+                unreachable,
                 diag: &diag,
             };
             let text = crate::core::report::build(&input);
@@ -510,6 +651,7 @@ impl App {
             return;
         }
         let list: Vec<crate::core::strategy::Strategy> = idx.iter().map(|&i| self.strategies[i].clone()).collect();
+        let mut add_to: Vec<std::path::PathBuf> = Vec::new();
         let targets = if self.picker.scope == 1 {
             let urls = picker::parse_sites(&self.picker.sites).0;
             if urls.is_empty() {
@@ -517,18 +659,11 @@ impl App {
                 return;
             }
             if !self.picker.skip_lists {
-                let mut dirs: Vec<std::path::PathBuf> = Vec::new();
                 for s in &list {
                     let d = crate::core::strategy::lists_dir(s, &p);
-                    if !dirs.contains(&d) {
-                        dirs.push(d);
+                    if !add_to.contains(&d) {
+                        add_to.push(d);
                     }
-                }
-                let domains = picker::site_domains(&urls);
-                match picker::add_to_user_lists(&dirs, &domains) {
-                    Ok(n) if n > 0 => self.note(Lvl::Ok, format!("Добавлено в «Мои домены»: {}", domains.join(", "))),
-                    Ok(_) => {}
-                    Err(e) => self.note(Lvl::Err, format!("Не удалось дополнить «Мои домены»: {e}")),
                 }
             }
             picker::custom_targets(&urls)
@@ -553,7 +688,7 @@ impl App {
         let gf = crate::core::gamefilter::load(&p);
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            picker::run(p, list, targets, gf, cancel, move |e| {
+            picker::run(p, list, targets, gf, add_to, cancel, move |e| {
                 let _ = tx.send(Msg::Pick(e));
                 ctx2.request_repaint();
             });

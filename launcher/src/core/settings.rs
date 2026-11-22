@@ -44,6 +44,19 @@ pub fn last_strategy() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+pub fn report_place() -> (String, String) {
+    let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok();
+    let get = |n: &str| k.as_ref().and_then(|k| k.get_value::<String, _>(n).ok()).unwrap_or_default();
+    (get("ReportIsp"), get("ReportCity"))
+}
+
+pub fn set_report_place(isp: &str, city: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("ReportIsp", &isp);
+        let _ = k.set_value("ReportCity", &city);
+    }
+}
+
 pub fn set_last_strategy(id: &str) {
     if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
         let _ = k.set_value("LastStrategy", &id);

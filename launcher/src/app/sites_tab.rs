@@ -145,6 +145,7 @@ impl App {
     }
 
     pub(super) fn sites_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.rules_card(ui, ctx);
         let done = self.sites.len();
         let total = self.sites_total.max(done);
         let ok = self.sites.iter().filter(|s| s.ok).count();

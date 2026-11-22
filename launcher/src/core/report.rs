@@ -13,6 +13,10 @@ pub struct Input<'a> {
     pub targets: &'a [Target],
     pub ordered: Vec<&'a Outcome>,
     pub noisy: Vec<String>,
+    pub isp: String,
+    pub city: String,
+    pub problem: String,
+    pub unreachable: Vec<bool>,
     pub diag: &'a [Finding],
 }
 
@@ -64,8 +68,12 @@ fn outcome_block(out: &mut String, place: Option<usize>, o: &Outcome, input: &In
         .targets
         .iter()
         .zip(&o.checks)
-        .filter(|(_, c)| !c.ok)
-        .map(|(t, c)| format!("  - {} / {} ({}): {}", t.category, t.name, kind(t.kind), c.detail()))
+        .enumerate()
+        .filter(|(_, (_, c))| !c.ok)
+        .map(|(i, (t, c))| {
+            let mark = if input.unreachable.get(i).copied().unwrap_or(false) { ", недоступно везде" } else { "" };
+            format!("  - {} / {} ({}): {}{mark}", t.category, t.name, kind(t.kind), c.detail())
+        })
         .collect();
     if failed.is_empty() {
         let _ = writeln!(out, "Все проверки пройдены");
@@ -81,15 +89,28 @@ pub fn build(input: &Input) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Отчёт подбора HolyZapret");
     let _ = writeln!(out, "Дата: {}", input.when);
-    let _ = writeln!(out, "HolyZapret: {} (лаунчер {})", input.version, input.launcher);
+    let build = if super::TEST_BUILD { ", тестовая сборка" } else { "" };
+    let _ = writeln!(out, "HolyZapret: {} (лаунчер {}{build})", input.version, input.launcher);
     let _ = writeln!(out, "Flowseal: {}", input.flowseal.as_deref().unwrap_or("не установлен"));
     let _ = writeln!(out, "Windows: {}", windows_name());
     let _ = writeln!(out, "TLS 1.3 в проверках: {}", if picker::tls13_supported() { "да" } else { "нет, Windows не поддерживает" });
     let _ = writeln!(out, "Игровой фильтр: {}", input.game);
-    let _ = writeln!(out, "Провайдер и город: (впишите сами)");
-    let _ = writeln!(out, "Что не работает, хотя подбор зелёный (голос Discord, игры, видео): (впишите сами)");
+    let or_blank = |s: &str| if s.trim().is_empty() { "(впишите сами)".to_string() } else { s.trim().to_string() };
+    let _ = writeln!(out, "Провайдер: {}", or_blank(&input.isp));
+    let _ = writeln!(out, "Город: {}", or_blank(&input.city));
+    let _ = writeln!(out, "Что не работает, хотя подбор зелёный (голос Discord, игры, видео): {}", or_blank(&input.problem.replace(['\r', '\n'], " ")));
     if !input.noisy.is_empty() {
         let _ = writeln!(out, "Не учитывались при выборе лучшей (случайный успех): {}", input.noisy.join(", "));
+    }
+    let dead: Vec<String> = input
+        .targets
+        .iter()
+        .zip(&input.unreachable)
+        .filter(|(_, u)| **u)
+        .map(|(t, _)| format!("{} / {} ({})", t.category, t.name, kind(t.kind)))
+        .collect();
+    if !dead.is_empty() {
+        let _ = writeln!(out, "Недоступны и без обхода, и со всеми стратегиями (похоже на блокировку по IP): {}", dead.join(", "));
     }
     let mut place = 0;
     for o in &input.ordered {
@@ -173,11 +194,20 @@ mod tests {
             targets: &targets,
             ordered: vec![&base, &best, &broken],
             noisy: vec!["Хостинги / CDN77".into()],
+            isp: "Ростелеком".into(),
+            city: String::new(),
+            problem: "голос\nDiscord".into(),
+            unreachable: vec![false, true],
             diag: &[],
         };
         let r = build(&input);
         assert!(r.contains("== Без обхода: 0/2"));
         assert!(r.contains("(случайный успех): Хостинги / CDN77"));
+        assert!(r.contains("Провайдер: Ростелеком\nГород: (впишите сами)\n"));
+        assert!(r.contains("(голос Discord, игры, видео): голос Discord\n"));
+        assert!(r.contains("(похоже на блокировку по IP): Discord / DiscordMain (TLS 1.3)"));
+        assert!(r.contains("Discord / DiscordMain (TLS 1.3): ошибка TLS, недоступно везде"));
+        assert!(r.contains("Discord / DiscordMain (TLS 1.2): таймаут\n"));
         assert!(r.contains("== 1. general [general.bat]: 1/2"));
         assert!(r.contains("Discord / DiscordMain (TLS 1.3): ошибка TLS"));
         assert!(r.contains("Discord / DiscordMain (TLS 1.2): таймаут"));

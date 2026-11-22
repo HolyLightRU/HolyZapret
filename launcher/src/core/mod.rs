@@ -10,6 +10,7 @@ pub mod net;
 pub mod paths;
 pub mod picker;
 pub mod pickstore;
+pub mod rules;
 pub mod procs;
 pub mod report;
 pub mod selfupdate;
