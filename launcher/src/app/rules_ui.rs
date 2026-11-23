@@ -70,6 +70,19 @@ impl App {
         }
     }
 
+    pub(super) fn rules_summary(&mut self) -> Option<(String, String)> {
+        if !self.rules.loaded {
+            self.reload_rules();
+        }
+        let n = self.rules.list.len();
+        if n == 0 {
+            return None;
+        }
+        let hover = self.rules.list.iter().map(|r| format!("{} — {}", r.domains.join(", "), rules::label(&r.technique))).collect::<Vec<_>>().join("
+");
+        Some((format!("+ {n} {} для сайтов", plural(n)), hover))
+    }
+
     pub(super) fn reload_rules(&mut self) {
         self.rules.list = self.paths.as_ref().map(rules::load).unwrap_or_default();
         self.rules.loaded = true;
@@ -109,6 +122,9 @@ impl App {
     }
 
     fn start_recheck(&mut self, ctx: &egui::Context) {
+        if self.warp_blocks_checks() {
+            return;
+        }
         if self.trial.is_some() || self.picker.running {
             self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
             return;
@@ -138,7 +154,7 @@ impl App {
     }
 
     fn start_rule_check(&mut self, ctx: &egui::Context) {
-        if self.busy || self.rules.running() {
+        if self.busy || self.rules.running() || self.warp_blocks_checks() {
             return;
         }
         if self.trial.is_some() || self.picker.running {
@@ -235,15 +251,17 @@ impl App {
                     Advice::Works(s) => (format!("Сайт открывается со стратегией «{s}», правило не нужно"), None),
                     Advice::Exclude => (
                         format!("Стратегия ломает сайт, который работает и без обхода. Не обходить: {}", v.domains.join(", ")),
-                        Some(Rule { technique: rules::NONE.into(), domains: v.domains.clone(), origin: v.origin.clone() }),
+                        Some(Rule { technique: rules::NONE.into(), domains: v.domains.clone(), origin: v.origin.clone(), ..Default::default() }),
                     ),
-                    Advice::Use(id) => {
-                        let best = v.techniques.iter().find(|t| t.technique.as_deref() == Some(id.as_str()));
+                    Advice::Use(rule) => {
+                        let best = v.techniques.iter().find(|t| t.rule.as_ref() == Some(rule));
                         let ms = best.map(|t| t.ms).unwrap_or(0);
-                        (
-                            format!("Помогает приём «{}», {ms} мс. Правило для: {}", rules::label(id), v.domains.join(", ")),
-                            Some(Rule { technique: id.clone(), domains: v.domains.clone(), origin: v.origin.clone() }),
-                        )
+                        let what = if rule.borrowed() {
+                            format!("Помогает профиль стратегии: {}", rules::label(&rule.technique).to_lowercase())
+                        } else {
+                            format!("Помогает приём «{}»", rules::label(&rule.technique))
+                        };
+                        (format!("{what}, {ms} мс. Правило для: {}", v.domains.join(", ")), Some(rule.clone()))
                     }
                     Advice::Nothing => (
                         "Ни один приём не помог. Похоже, сайт заблокирован по IP: такой обход тут бессилен".to_string(),

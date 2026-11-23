@@ -63,7 +63,7 @@ impl Share {
             }
         }
         if !self.rules.is_empty() {
-            let r: Vec<String> = self.rules.iter().map(|r| format!("{}|{}|{}", r.technique, r.domains.join(","), r.origin)).collect();
+            let r: Vec<String> = self.rules.iter().map(Rule::line).collect();
             j["r"] = json!(r);
         }
         let mut z = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -164,7 +164,16 @@ mod tests {
             strategy: Some("experimental\\R06 general, наложение у SNI".into()),
             game: Some(GameFilter::all()),
             lists: [vec!["rutracker.org".into(), "kinozal.tv".into()], vec![], vec!["104.16.0.0/13".into()], vec![]],
-            rules: vec![Rule { technique: "alt3-ts".into(), domains: vec!["example.com".into(), "cdn.example.com".into()], origin: "general".into() }],
+            rules: vec![
+                Rule { technique: "alt3-ts".into(), domains: vec!["example.com".into(), "cdn.example.com".into()], origin: "general".into(), ..Default::default() },
+                Rule {
+                    technique: "from:ALT 2".into(),
+                    domains: vec!["soundcloud.com".into()],
+                    origin: "general".into(),
+                    tcp: "--dpi-desync=fake --dpi-desync-fake-tls=\"{BIN}tls_clienthello_www_google_com.bin\"".into(),
+                    udp: String::new(),
+                },
+            ],
         }
     }
 

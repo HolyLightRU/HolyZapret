@@ -359,7 +359,7 @@ async fn udp_relay(mut s: TcpStream, stats: Arc<Stats>, local: bool) -> anyhow::
     Ok(())
 }
 
-async fn dial(host: &str, port: u16, local: bool) -> anyhow::Result<TcpStream> {
+async fn dial(host: &str, port: u16, local: bool, warp: Option<SocketAddr>) -> anyhow::Result<TcpStream> {
     let addrs: Vec<SocketAddr> = timeout(CONNECT, tokio::net::lookup_host((host, port)))
         .await
         .map_err(|_| anyhow::anyhow!("{host}: DNS не ответил"))??
@@ -367,6 +367,13 @@ async fn dial(host: &str, port: u16, local: bool) -> anyhow::Result<TcpStream> {
         .collect();
     if addrs.is_empty() {
         anyhow::bail!("{host}: адрес недоступен через раздачу");
+    }
+    if let Some(p) = warp {
+        for a in addrs.iter().filter(|a| crate::core::tgwarp::telegram(&a.ip())) {
+            if let Ok(s) = crate::core::tgwarp::connect(p, *a).await {
+                return Ok(s);
+            }
+        }
     }
     let mut last = None;
     for a in addrs {
@@ -417,7 +424,7 @@ async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> 
             (host, port, head, b"")
         }
     };
-    let mut up = match dial(&host, port, local).await {
+    let mut up = match dial(&host, port, local, crate::core::tgwarp::via()).await {
         Ok(u) => u,
         Err(e) => {
             let fail: &[u8] = if first[0] == 5 { &[5, 4, 0, 1, 0, 0, 0, 0, 0, 0] } else { b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n" };
@@ -638,6 +645,21 @@ mod tests {
         assert!(u.recv(&mut back).is_err());
         drop(c);
         handle.stop();
+    }
+
+    #[test]
+    fn telegram_goes_through_warp() {
+        let (port, hits) = crate::core::tgwarp::fake::socks();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let warp = Some(SocketAddr::from(([127, 0, 0, 1], port)));
+        rt.block_on(async {
+            let mut s = dial("149.154.167.51", 443, false, warp).await.unwrap();
+            s.write_all(b"tg").await.unwrap();
+            let mut back = [0u8; 2];
+            s.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"tg");
+        });
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 
     #[test]

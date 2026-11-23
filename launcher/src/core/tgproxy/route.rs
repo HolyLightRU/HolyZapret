@@ -63,6 +63,7 @@ pub enum Kind {
     Ws,
     Cf(String),
     Tcp,
+    Warp,
 }
 
 pub enum Upstream {
@@ -312,7 +313,17 @@ impl Routes {
         }
     }
 
+    async fn warp(&self, t: &Target, proxy: SocketAddr) -> Option<TcpStream> {
+        let ip = dc_ip(t.dc, t.test)?;
+        crate::core::tgwarp::connect(proxy, SocketAddr::new(ip, 443)).await.ok()
+    }
+
     pub async fn connect(&self, t: &Target) -> Option<(Kind, Upstream)> {
+        if let Some(p) = crate::core::tgwarp::via() {
+            if let Some(s) = self.warp(t, p).await {
+                return Some((Kind::Warp, Upstream::Tcp(s)));
+            }
+        }
         if let Some(s) = self.direct(t).await {
             return Some((Kind::Ws, Upstream::Ws(s)));
         }
@@ -342,6 +353,19 @@ mod tests {
         let mut out = (p.len() as u32).to_le_bytes().to_vec();
         out.extend(p);
         out
+    }
+
+    #[test]
+    fn warp_route_goes_through_socks() {
+        let (port, hits) = crate::core::tgwarp::fake::socks();
+        let routes = Routes::new(None, false).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let t = Target { dc: 2, media: false, test: false };
+        let up = rt.block_on(routes.warp(&t, SocketAddr::from(([127, 0, 0, 1], port))));
+        assert!(up.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        assert!(rt.block_on(routes.warp(&t, closed)).is_none());
     }
 
     fn is_res_pq(plain: &[u8]) -> bool {
@@ -411,6 +435,19 @@ mod tests {
         let s = r.tcp(&Target { dc: 2, media: false, test: false }).await.expect("tcp");
         assert!(ask(Upstream::Tcp(s), 2).await);
         println!("tcp DC2: resPQ");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn live_warp() {
+        let r = Routes::new(None, false).unwrap();
+        let proxy = SocketAddr::from(([127, 0, 0, 1], crate::core::warp::PROXY_PORT));
+        for dc in [1u16, 2, 3, 4, 5] {
+            let t = Target { dc, media: false, test: false };
+            let s = r.warp(&t, proxy).await.expect("warp");
+            assert!(ask(Upstream::Tcp(s), dc).await, "DC{dc}");
+            println!("warp DC{dc}: resPQ");
+        }
     }
 
     #[test]

@@ -8,6 +8,49 @@ use winreg::enums::HKEY_CURRENT_USER;
 const KEY: &str = r"Software\HolyZapret";
 const RULE: &str = "HolyZapret LAN proxy";
 static PROXY: Mutex<Option<Handle>> = Mutex::new(None);
+static FIREWALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetProfile {
+    pub public: bool,
+    pub index: u32,
+    pub name: String,
+}
+
+fn powershell(cmd: &str) -> (bool, String) {
+    let full = format!("[Console]::OutputEncoding = [Text.Encoding]::UTF8; {cmd}");
+    run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &full])
+}
+
+fn parse_profile(out: &str) -> Option<NetProfile> {
+    let line = out.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    let mut it = line.splitn(3, '|');
+    let category = it.next()?.trim();
+    let index = it.next()?.trim().parse().ok()?;
+    let name = it.next().unwrap_or("").trim().to_string();
+    Some(NetProfile { public: category.eq_ignore_ascii_case("Public"), index, name })
+}
+
+pub fn net_profile() -> Option<NetProfile> {
+    let ip = super::lan_ip()?;
+    let (ok, out) = powershell(&format!(
+        "$p = Get-NetIPAddress -IPAddress '{ip}' -ErrorAction Stop | Get-NetConnectionProfile -ErrorAction Stop | Select-Object -First 1; $p.NetworkCategory.ToString() + '|' + $p.InterfaceIndex + '|' + $p.Name"
+    ));
+    if ok { parse_profile(&out) } else { None }
+}
+
+pub fn make_private(index: u32) -> anyhow::Result<()> {
+    let (ok, out) = powershell(&format!("Set-NetConnectionProfile -InterfaceIndex {index} -NetworkCategory Private -ErrorAction Stop"));
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("Windows не разрешил сменить тип сети"))
+    }
+}
+
+pub fn firewall_error() -> Option<String> {
+    FIREWALL_ERROR.lock().unwrap().clone()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saved {
@@ -33,14 +76,19 @@ pub fn save(s: &Saved) {
 
 fn firewall(port: Option<u16>) {
     run_hidden("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={RULE}")]);
+    *FIREWALL_ERROR.lock().unwrap() = None;
     if let Some(p) = port {
-        run_hidden(
+        let (ok, out) = run_hidden(
             "netsh",
             &[
                 "advfirewall", "firewall", "add", "rule", &format!("name={RULE}"), "dir=in", "action=allow", "protocol=TCP",
                 &format!("localport={p}"), "remoteip=localsubnet", "profile=any",
             ],
         );
+        if !ok {
+            let why = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+            *FIREWALL_ERROR.lock().unwrap() = Some(if why.is_empty() { "netsh завершился с ошибкой".into() } else { why });
+        }
         if let Ok(exe) = std::env::current_exe() {
             run_hidden(
                 "netsh",
@@ -147,4 +195,22 @@ pub fn snapshot() -> Option<Snapshot> {
         down: s.down.load(Ordering::Relaxed),
         last_error: s.last_error.lock().unwrap().clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_line_parsed() {
+        assert_eq!(parse_profile("\r\nPublic|12|Сеть\r\n"), Some(NetProfile { public: true, index: 12, name: "Сеть".into() }));
+        assert_eq!(parse_profile("Private|7|Home|Wi-Fi"), Some(NetProfile { public: false, index: 7, name: "Home|Wi-Fi".into() }));
+        assert_eq!(parse_profile("ошибка"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn live_profile() {
+        println!("{:?}", net_profile());
+    }
 }

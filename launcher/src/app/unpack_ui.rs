@@ -6,6 +6,7 @@ use eframe::egui::{self, Color32, CornerRadius, RichText};
 use std::path::PathBuf;
 
 pub struct UnpackState {
+    pub source: Option<PathBuf>,
     pub zip: Option<PathBuf>,
     pub target: PathBuf,
     pub installed: Option<PathBuf>,
@@ -22,6 +23,7 @@ impl UnpackState {
         let hint = std::env::current_exe().ok().and_then(|e| unpack::zip_hint(&e));
         let zip = unpack::find_zip(hint.as_deref());
         Some(UnpackState {
+            source: crate::core::paths::find_root(),
             delete_zip: zip.is_some(),
             zip,
             target: relocate::target_dir(),
@@ -38,11 +40,16 @@ impl App {
         u.running = true;
         u.error = None;
         let zip = u.zip.clone();
+        let source = u.source.clone();
         let target = u.target.clone();
         let delete = u.delete_zip;
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let r = unpack::install(zip.as_deref(), &target).map(|(root, exe)| {
+            let r = match &source {
+                Some(src) => unpack::copy_from(src, &target),
+                None => unpack::install(zip.as_deref(), &target),
+            };
+            let r = r.map(|(root, exe)| {
                 let recycled = delete && zip.as_deref().is_some_and(unpack::recycle);
                 (root, exe, recycled)
             });
@@ -91,7 +98,7 @@ impl App {
             ui.add(
                 egui::Label::new(
                     RichText::new(format!(
-                        "Так лаунчер не видит свои стратегии и движок. Распакую HolyZapret в {} и перезапущу его оттуда.",
+                        "Архиватор удалит эти файлы, как только его закроют, и HolyZapret перестанет работать. Распакую HolyZapret в {} и перезапущу его оттуда.",
                         target.display()
                     ))
                     .color(Color32::from_gray(190)),
@@ -117,6 +124,7 @@ impl App {
                     ui.add(egui::Label::new(RichText::new(format!("Архив: {}", z.display())).color(Color32::from_gray(160)).size(12.5)).wrap());
                     ui.add_enabled(!u.running, egui::Checkbox::new(&mut u.delete_zip, "Удалить архив после распаковки"));
                 }
+                None if u.source.is_some() => {}
                 None => {
                     ui.add(
                         egui::Label::new(

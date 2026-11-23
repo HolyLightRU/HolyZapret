@@ -125,6 +125,9 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult) -> bool {
 
 impl App {
     pub(super) fn start_site_check(&mut self, ctx: &egui::Context) {
+        if self.warp_blocks_checks() {
+            return;
+        }
         let Some(p) = &self.paths else { return };
         let sites = checks::load_sites(p);
         self.sites.clear();

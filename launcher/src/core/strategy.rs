@@ -22,7 +22,8 @@ pub struct Strategy {
 
 impl Strategy {
     pub fn matches(&self, stored: &str) -> bool {
-        self.id.eq_ignore_ascii_case(stored) || self.name.eq_ignore_ascii_case(stored)
+        let hit = |s: &str| self.id.eq_ignore_ascii_case(s) || self.name.eq_ignore_ascii_case(s);
+        hit(stored) || super::names::repair(stored).is_some_and(|f| hit(&f))
     }
 }
 

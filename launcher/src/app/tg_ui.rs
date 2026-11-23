@@ -1,5 +1,7 @@
 use super::{App, Msg};
 use crate::core::tgproxy::{self, control, route};
+use crate::core::tgwarp;
+use crate::core::warp::{Conn, Mode};
 use crate::log::Lvl;
 use crate::theme::{self, CYAN, GREEN, RED, YELLOW};
 use eframe::egui::{self, Color32, RichText};
@@ -38,6 +40,8 @@ enum Act {
     NewSecret,
     Save,
     Cloudflare(bool),
+    Warp(bool),
+    WarpProxy,
 }
 
 fn muted(text: impl Into<String>) -> RichText {
@@ -127,6 +131,41 @@ impl App {
                 ))
                 .wrap(),
             );
+            let warp = self.warp.clone().filter(|w| w.installed);
+            let via_warp = tgwarp::enabled();
+            theme::row(ui, 34.0, |ui| {
+                ui.label(RichText::new("Telegram через WARP").color(Color32::from_gray(225)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = via_warp;
+                    ui.add_enabled_ui(warp.is_some() || via_warp, |ui| {
+                        if theme::toggle(ui, &mut on).changed() {
+                            act = Some(Act::Warp(on));
+                        }
+                    });
+                });
+            });
+            ui.add(
+                egui::Label::new(muted(
+                    "Если в вашем регионе Telegram не подключается даже через этот прокси, его трафик пойдёт через Cloudflare WARP, а всё остальное как обычно через обход. Касается и Telegram на телефоне через раздачу.",
+                ))
+                .wrap(),
+            );
+            match &warp {
+                None => {
+                    ui.label(RichText::new("Нужен Cloudflare WARP: скачайте его в Настройках").color(YELLOW).size(12.5));
+                }
+                Some(w) if via_warp && (w.mode != Mode::Proxy || (w.conn != Conn::Connected && !tgwarp::proxy_up())) => {
+                    theme::row(ui, 34.0, |ui| {
+                        ui.label(RichText::new("WARP должен быть подключён в режиме прокси").color(YELLOW).size(12.5));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled(!self.busy, egui::Button::new("Подключить WARP")).clicked() {
+                                act = Some(Act::WarpProxy);
+                            }
+                        });
+                    });
+                }
+                _ => {}
+            }
             if !self.tg.foreign.is_empty() {
                 theme::row(ui, 34.0, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -149,16 +188,17 @@ impl App {
             }
             if let Some(s) = &snap {
                 ui.label(muted(format!(
-                    "Сейчас подключений: {} · всего {}: WebSocket {}, Cloudflare {}, напрямую {} · ↑ {} ↓ {}",
+                    "Сейчас подключений: {} · всего {}: WebSocket {}, Cloudflare {}, напрямую {}{} · ↑ {} ↓ {}",
                     s.active,
                     s.total,
                     s.via_ws,
                     s.via_cf,
                     s.via_tcp,
+                    if s.via_warp > 0 || via_warp { format!(", через WARP {}", s.via_warp) } else { String::new() },
                     control::human(s.up),
                     control::human(s.down)
                 )));
-                let working = s.via_ws + s.via_cf + s.via_tcp > 0;
+                let working = s.via_ws + s.via_cf + s.via_tcp + s.via_warp > 0;
                 if s.failed > 0 && working && s.bad_secret == 0 {
                     ui.add(egui::Label::new(muted(format!("{}. Это не мешает: Telegram работает через остальные дата-центры", s.last_error))).wrap());
                 } else if s.bad_secret > 0 || s.failed > 0 {
@@ -243,6 +283,20 @@ impl App {
                 let config = tgproxy::Config { secret: tgproxy::new_secret(), ..saved.config.clone() };
                 self.tg_apply(ctx, config, "Secret сменён: добавьте прокси в Telegram заново кнопкой «Открыть в Telegram»");
             }
+            Act::Warp(on) => {
+                tgwarp::set(on);
+                let ready = self.warp.as_ref().is_some_and(|w| w.mode == Mode::Proxy && (w.conn == Conn::Connected || tgwarp::proxy_up()));
+                if on && !ready {
+                    self.warp_proxy_on(ctx);
+                } else if on {
+                    self.toast(ctx, Lvl::Ok, "Telegram пойдёт через WARP, остальное как обычно через обход");
+                } else if self.warp.as_ref().is_some_and(|w| w.conn == Conn::Connected) {
+                    self.toast(ctx, Lvl::Info, "Telegram снова идёт как обычно. WARP остался подключён, отключить его можно в Настройках");
+                } else {
+                    self.toast(ctx, Lvl::Info, "Telegram снова идёт как обычно");
+                }
+            }
+            Act::WarpProxy => self.warp_proxy_on(ctx),
             Act::Cloudflare(cf) => {
                 let config = tgproxy::Config { cloudflare: cf, ..saved.config.clone() };
                 self.tg_apply(ctx, config, if cf { "Запасной путь через Cloudflare включён" } else { "Запасной путь через Cloudflare выключен" });

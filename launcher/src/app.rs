@@ -252,7 +252,10 @@ impl App {
         theme::apply(&cc.egui_ctx);
         tray::set_ctx(&cc.egui_ctx);
         let (tx, rx) = channel();
-        let paths = paths::find_root().map(|root| Paths { root });
+        let archived = crate::core::unpack::from_archive();
+        let paths = paths::find_root().filter(|_| !archived).map(|root| Paths { root });
+        crate::core::tgwarp::init();
+        let renamed = paths.as_ref().map(|p| crate::core::names::repair_tree(&p.root)).unwrap_or_default();
         let strategies = paths.as_ref().map(strategy::discover).unwrap_or_default();
         let local_version = paths.as_ref().and_then(update::local_version);
         let flowseal_version = paths.as_ref().and_then(flowseal::installed);
@@ -321,6 +324,9 @@ impl App {
             tx,
             rx,
         };
+        if !renamed.is_empty() {
+            app.log.push(Entry::new(Lvl::Ok, format!("Исправлены имена файлов, испорченные при распаковке архива: {}", renamed.join(", "))));
+        }
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == crate::core::relocate::MOVED_ARG) {
             let old = args.get(i + 1).cloned().unwrap_or_default();
@@ -340,7 +346,9 @@ impl App {
         }
         if app.paths.is_none() {
             app.unpack = unpack_ui::UnpackState::detect();
-            app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\HolyZapret.exe — положите лаунчер внутрь HolyZapret"));
+            if app.unpack.is_none() {
+                app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\HolyZapret.exe — положите лаунчер внутрь HolyZapret"));
+            }
         }
         match crate::core::lanproxy::control::autostart() {
             Some(Ok(m)) => app.log.push(Entry::new(Lvl::Ok, m)),
@@ -787,6 +795,8 @@ impl App {
             return;
         };
         let running = s.service == ServiceState::Running;
+        let extra = if s.foreign_dir().is_none() && s.active_strategy().is_some() { self.rules_summary() } else { None };
+        let mut to_sites = false;
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 let tip = match s.service {
@@ -816,7 +826,21 @@ impl App {
                         (None, Some(n)) => format!("Стратегия: {n}"),
                         _ => "Выберите стратегию и нажмите на кнопку старта".to_string(),
                     };
-                    ui.label(RichText::new(sub).color(Color32::from_gray(160)));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new(sub).color(Color32::from_gray(160)));
+                        if let Some((text, hover)) = &extra {
+                            let link = ui
+                                .add(egui::Label::new(RichText::new(text).color(theme::CYAN)).sense(egui::Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("{hover}
+
+Нажмите, чтобы открыть правила на вкладке «Сайты»"));
+                            if link.clicked() {
+                                to_sites = true;
+                            }
+                        }
+                    });
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -872,6 +896,9 @@ impl App {
                 });
             });
         });
+        if to_sites {
+            self.tab = Tab::Sites;
+        }
     }
 
     fn main_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

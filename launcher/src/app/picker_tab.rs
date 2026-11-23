@@ -1,4 +1,4 @@
-use super::{App, Msg, Tab};
+use super::{App, Msg, Tab, notify};
 use crate::core::picker::{self, Event, Outcome, Target};
 use crate::core::service::ServiceState;
 use crate::log::Lvl;
@@ -210,6 +210,42 @@ impl PickerState {
         self.ranked_with(&self.mask())
     }
 
+    fn constructor(&self, base: &std::path::Path, donor_ok: impl Fn(&std::path::Path) -> bool) -> Option<Vec<(usize, Vec<String>)>> {
+        let bi = self.results.iter().position(|o| o.path.as_deref() == Some(base) && o.error.is_none())?;
+        let mask = self.mask();
+        let mut left: Vec<usize> = (0..self.targets.len())
+            .filter(|&i| !mask.get(i).copied().unwrap_or(false))
+            .filter(|&i| self.results[bi].checks.get(i).is_some_and(|c| c.counted() && !c.ok))
+            .collect();
+        let order = self.ranked();
+        let mut used: Vec<String> = Vec::new();
+        let mut out = Vec::new();
+        while !left.is_empty() && out.len() < 3 {
+            let best = order
+                .iter()
+                .enumerate()
+                .filter(|(_, ri)| **ri != bi && self.results[**ri].error.is_none() && self.results[**ri].path.as_deref().is_some_and(&donor_ok))
+                .map(|(rank, &ri)| (ri, rank, left.iter().filter(|&&i| self.results[ri].checks.get(i).is_some_and(|c| c.ok)).count()))
+                .filter(|(_, _, n)| *n > 0)
+                .max_by_key(|(_, rank, n)| (*n, std::cmp::Reverse(*rank)));
+            let Some((ri, _, _)) = best else { break };
+            let covered: Vec<usize> = left.iter().copied().filter(|&i| self.results[ri].checks.get(i).is_some_and(|c| c.ok)).collect();
+            left.retain(|i| !covered.contains(i));
+            let mut domains = Vec::new();
+            for i in covered {
+                let d = crate::core::discover::base_domain(&picker::host_of(&self.targets[i].url));
+                if !d.is_empty() && !used.contains(&d) {
+                    used.push(d.clone());
+                    domains.push(d);
+                }
+            }
+            if !domains.is_empty() {
+                out.push((ri, domains));
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     fn ranked_with(&self, noisy: &[bool]) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.results.len()).filter(|&i| self.results[i].path.is_some()).collect();
         idx.sort_by_key(|&i| {
@@ -390,6 +426,18 @@ impl App {
         let mut remove = false;
         let mut report = false;
         let mut exclude = None;
+        let mut build = None;
+        let base = self
+            .status
+            .as_ref()
+            .and_then(|s| s.active_strategy())
+            .and_then(|id| self.strategies.iter().find(|s| s.matches(id)))
+            .cloned();
+        let engine = self.paths.as_ref().map(|p| p.engine());
+        let plan = base.as_ref().filter(|_| !self.picker.running).and_then(|b| {
+            let ok = |path: &std::path::Path| self.strategies.iter().any(|s| s.path == path && Some(&s.engine) == engine.as_ref());
+            self.picker.constructor(&b.path, ok)
+        });
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
                 ui.label(RichText::new("Результаты").size(17.0).strong());
@@ -444,6 +492,36 @@ impl App {
                     .weak()
                     .size(12.5),
                 );
+            }
+            if let (Some(b), Some(plan)) = (&base, &plan) {
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(CYAN.gamma_multiply(0.10))
+                    .stroke(egui::Stroke::new(1.0, CYAN.gamma_multiply(0.40)))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(format!("Собрать: «{}» + правила для сайтов", b.name)).strong());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Установленная «{}» не открывает часть сайтов, а другие стратегии открывают. Можно оставить «{}» для всего остального, а эти сайты пустить через профиль другой стратегии:",
+                                    b.name, b.name
+                                ))
+                                .color(Color32::from_gray(190))
+                                .size(12.5),
+                            )
+                            .wrap(),
+                        );
+                        for (ri, domains) in plan {
+                            ui.label(RichText::new(format!("• {} — как в «{}»", domains.join(", "), self.picker.results[*ri].name)).size(12.5));
+                        }
+                        ui.add_space(2.0);
+                        if ui.add_enabled(!self.busy, egui::Button::new("Собрать")).on_hover_text("Правила появятся на вкладке «Сайты», служба перезапустится").clicked() {
+                            build = Some(plan.clone());
+                        }
+                    });
             }
             if let Some((name, domains)) = self.picker.broken().filter(|_| !self.picker.running) {
                 theme::row(ui, 30.0, |ui| {
@@ -520,8 +598,42 @@ impl App {
             let (isp, city) = crate::core::settings::report_place();
             self.picker.report_form = Some((isp, city, String::new()));
         }
+        if let (Some(base), Some(plan)) = (base, build) {
+            let donors: Vec<(crate::core::strategy::Strategy, Vec<String>)> = plan
+                .into_iter()
+                .filter_map(|(ri, d)| {
+                    let path = self.picker.results[ri].path.clone()?;
+                    self.strategies.iter().find(|s| s.path == path).cloned().map(|s| (s, d))
+                })
+                .collect();
+            self.spawn(ctx, move |p, tx| {
+                let mut list = crate::core::rules::load(p);
+                let mut made = Vec::new();
+                for (donor, domains) in donors {
+                    match crate::core::rules::borrow_rule(p, &donor, domains.clone(), &base.name) {
+                        Ok(r) => {
+                            made.push(format!("{} как в «{}»", domains.join(", "), donor.name));
+                            crate::core::rules::upsert(&mut list, r);
+                        }
+                        Err(e) => notify(tx, Lvl::Err, format!("{}: {e}", domains.join(", "))),
+                    }
+                }
+                if made.is_empty() {
+                    return;
+                }
+                if let Err(e) = crate::core::rules::save(p, &list) {
+                    notify(tx, Lvl::Err, format!("Не удалось сохранить правила: {e}"));
+                    return;
+                }
+                match crate::core::service::install(p, &base) {
+                    Ok(_) => notify(tx, Lvl::Ok, format!("Собрано: «{}» + {}. Служба перезапущена", base.name, made.join("; "))),
+                    Err(e) => notify(tx, Lvl::Err, format!("Правила сохранены, но службу не удалось перезапустить: {e}")),
+                }
+                let _ = tx.send(Msg::Shared);
+            });
+        }
         if let Some((origin, domains)) = exclude {
-            self.add_rule(ctx, crate::core::rules::Rule { technique: crate::core::rules::NONE.into(), domains, origin });
+            self.add_rule(ctx, crate::core::rules::Rule { technique: crate::core::rules::NONE.into(), domains, origin, ..Default::default() });
         }
         if remove {
             self.confirm = Some(super::confirm::Confirm::RemoveService);
@@ -685,7 +797,19 @@ impl App {
         }
     }
 
+    pub(super) fn warp_blocks_checks(&mut self) -> bool {
+        use crate::core::warp::{Conn, Mode};
+        let on = self.warp.as_ref().is_some_and(|w| w.mode == Mode::Warp && matches!(w.conn, Conn::Connected | Conn::Connecting));
+        if on {
+            self.confirm = Some(super::confirm::Confirm::WarpBlocksCheck);
+        }
+        on
+    }
+
     pub(super) fn start_pick(&mut self, ctx: &egui::Context) {
+        if self.warp_blocks_checks() {
+            return;
+        }
         let Some(p) = self.paths.clone() else { return };
         let idx: Vec<usize> = match self.picker.mode {
             0 => picker::optimal(&p, &self.strategies),
@@ -865,4 +989,37 @@ fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) ->
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::picker::{Check, CheckKind};
+    use std::path::{Path, PathBuf};
+
+    fn outcome(name: &str, path: Option<&str>, ok: &[bool]) -> Outcome {
+        let checks = ok.iter().map(|&o| Check { ok: o, ms: 100, code: if o { 200 } else { 0 }, exit: if o { 0 } else { 28 }, ..Check::failed() }).collect();
+        Outcome { name: name.into(), path: path.map(PathBuf::from), error: None, checks }
+    }
+
+    #[test]
+    fn constructor_picks_donors() {
+        let mut st = PickerState::default();
+        st.targets = ["a.com", "b.com", "web.whatsapp.com", "soundcloud.com", "x.org"]
+            .iter()
+            .map(|h| Target { name: h.to_string(), category: "Сайты".into(), url: format!("https://{h}/"), kind: CheckKind::Tls13 })
+            .collect();
+        st.results = vec![
+            outcome("Без обхода", None, &[false, false, false, false, false]),
+            outcome("general", Some("g.bat"), &[true, true, false, false, false]),
+            outcome("ALT 2", Some("a2.bat"), &[false, false, true, true, false]),
+            outcome("ALT 3", Some("a3.bat"), &[true, false, true, false, false]),
+            outcome("Flowseal", Some("f.bat"), &[true, true, true, true, true]),
+        ];
+        let ours = |p: &Path| p != Path::new("f.bat");
+        let plan = st.constructor(Path::new("g.bat"), ours).unwrap();
+        assert_eq!(plan, vec![(2, vec!["whatsapp.com".to_string(), "soundcloud.com".to_string()])]);
+        assert!(st.constructor(Path::new("f.bat"), ours).is_none());
+        assert!(st.constructor(Path::new("missing.bat"), ours).is_none());
+    }
 }

@@ -131,7 +131,8 @@ fn ports_include(spec: &str, port: u16) -> bool {
 #[derive(Default)]
 struct Profile {
     tcp: Option<String>,
-    udp: bool,
+    udp: Option<String>,
+    rest: Vec<String>,
     l7: Option<String>,
     desync: bool,
     hostlists: Vec<PathBuf>,
@@ -153,29 +154,39 @@ fn profiles(args: &str) -> Vec<Profile> {
         let (k, v) = t.split_once('=').unwrap_or((t.as_str(), ""));
         match k {
             "--filter-tcp" => p.tcp = Some(v.to_string()),
-            "--filter-udp" => p.udp = true,
+            "--filter-udp" => p.udp = Some(v.to_string()),
             "--filter-l7" => p.l7 = Some(v.to_lowercase()),
-            "--dpi-desync" => p.desync = true,
+            "--dpi-desync" => {
+                p.desync = true;
+                p.rest.push(t.clone());
+            }
             "--hostlist" => p.hostlists.push(PathBuf::from(v)),
             "--hostlist-domains" => p.domains.extend(v.split(',').map(|d| d.trim().to_lowercase())),
             "--hostlist-exclude" => p.host_excludes.push(PathBuf::from(v)),
             "--ipset" => p.ipsets.push(PathBuf::from(v)),
             "--ipset-ip" => p.ips.extend(v.split(',').filter_map(Net::parse)),
             "--ipset-exclude" => p.ip_excludes.push(PathBuf::from(v)),
-            _ => {}
+            _ if k.starts_with("--filter-") || k.starts_with("--hostlist") || k.starts_with("--ipset") || k.starts_with("--wf-") => {}
+            "--comment" | "--port" | "--no-gui" | "--debug" => {}
+            _ => p.rest.push(t.clone()),
         }
     }
     out
 }
 
-pub fn touches(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> bool {
+fn first(list: Vec<Profile>, host: &str, ips: &[IpAddr], udp: bool, cache: &mut Cache) -> Option<Profile> {
     let host = host.to_lowercase();
-    for p in profiles(args) {
-        let tcp_ok = match &p.tcp {
-            Some(spec) => ports_include(spec, 443),
-            None => !p.udp,
+    for p in list {
+        let port_ok = if udp {
+            p.udp.as_ref().is_some_and(|spec| ports_include(spec, 443)) && p.tcp.is_none()
+        } else {
+            match &p.tcp {
+                Some(spec) => ports_include(spec, 443),
+                None => p.udp.is_none(),
+            }
         };
-        if !tcp_ok || p.l7.as_ref().is_some_and(|l| !l.split(',').any(|x| x == "tls" || x == "http")) {
+        let l7_ok = p.l7.as_ref().is_none_or(|l| l.split(',').any(|x| if udp { x == "quic" } else { x == "tls" || x == "http" }));
+        if !port_ok || !l7_ok {
             continue;
         }
         let has_hosts = !p.hostlists.is_empty() || !p.domains.is_empty();
@@ -199,14 +210,33 @@ pub fn touches(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> boo
         if p.ip_excludes.iter().any(|f| ips.iter().any(|ip| cache.nets(f).iter().any(|n| n.contains(ip)))) {
             continue;
         }
-        return p.desync;
+        return Some(p);
     }
-    false
+    None
+}
+
+pub fn touches(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> bool {
+    first(profiles(args), host, ips, false, cache).is_some_and(|p| p.desync)
+}
+
+pub fn borrow(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> [Option<Vec<String>>; 2] {
+    let pick = |udp: bool, cache: &mut Cache| first(profiles(args), host, ips, udp, cache).filter(|p| p.desync).map(|p| p.rest);
+    [pick(false, cache), pick(true, cache)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrow_takes_first_matching_profile() {
+        let args = "--wf-tcp=443 --wf-udp=443 --filter-udp=443 --hostlist-domains=a.com --dpi-desync=fake --dpi-desync-repeats=11 --new --filter-tcp=443 --hostlist-domains=a.com --ipset-exclude=\"x\" --dpi-desync=multisplit --dpi-desync-split-pos=1 --comment=test --new --filter-tcp=443 --dpi-desync=fake";
+        let mut c = Cache::default();
+        let v = |s: &[&str]| Some(s.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(borrow(args, "www.a.com", &[], &mut c), [v(&["--dpi-desync=multisplit", "--dpi-desync-split-pos=1"]), v(&["--dpi-desync=fake", "--dpi-desync-repeats=11"])]);
+        assert_eq!(borrow(args, "b.com", &[], &mut c), [v(&["--dpi-desync=fake"]), None]);
+        assert_eq!(borrow("--filter-tcp=443 --hostlist-domains=a.com", "a.com", &[], &mut c), [None, None]);
+    }
 
     #[test]
     fn hosts_and_nets() {

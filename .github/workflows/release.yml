@@ -70,8 +70,11 @@ jobs:
           $version = "${{ steps.ver.outputs.version }}"
           $stage = Join-Path $env:RUNNER_TEMP "Holy-Zapret"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          git archive --format=tar HEAD -o "$env:RUNNER_TEMP/src.tar"
-          tar -xf "$env:RUNNER_TEMP/src.tar" -C $stage
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          git checkout-index -a -f --prefix="$stage/"
+          if ($LASTEXITCODE -ne 0) { throw "git checkout-index завершился с кодом $LASTEXITCODE" }
+          $lost = git -c core.quotepath=off ls-files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $stage $_)) }
+          if ($lost) { throw "В пакет не попали файлы: $($lost -join ', ')" }
           foreach ($p in @("launcher", ".idea", ".github", ".gitignore", "docs", "bin/game_filter.enabled")) {
             $full = Join-Path $stage $p
             if (Test-Path $full) { Remove-Item $full -Recurse -Force }
@@ -83,6 +86,14 @@ jobs:
           7z a -tzip -mcu=on $zip * | Out-Null
           Pop-Location
           if ($LASTEXITCODE -ne 0) { throw "7z завершился с кодом $LASTEXITCODE" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          $broken = $archive.Entries | Where-Object { $_.FullName -match '[─-╿]' } | ForEach-Object { $_.FullName }
+          $named = ($archive.Entries | Where-Object { $_.FullName -match '[Ѐ-ӿ]' }).Count
+          $archive.Dispose()
+          if ($broken) { throw "В архиве испорчены имена файлов: $($broken -join ', ')" }
+          $expected = (git -c core.quotepath=off ls-files | Where-Object { $_ -match '[Ѐ-ӿ]' }).Count
+          if ($named -ne $expected) { throw "Файлов с русскими именами в архиве $named, в репозитории $expected" }
           "zip=$zip" >> $env:GITHUB_OUTPUT
           Get-Item $zip | Select-Object Name, Length
 

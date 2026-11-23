@@ -38,6 +38,29 @@ impl App {
         });
     }
 
+    pub(super) fn warp_proxy_on(&mut self, ctx: &egui::Context) {
+        let mode = self.warp.as_ref().map(|w| w.mode);
+        self.spawn(ctx, move |_, tx| {
+            let r = (|| {
+                if mode != Some(Mode::Proxy) {
+                    warp::set_mode(Mode::Proxy)?;
+                }
+                warp::connect()?;
+                Ok("WARP подключается в режиме прокси: через него пойдёт только Telegram, остальное как обычно через обход".to_string())
+            })();
+            result_msg(tx, r, "WARP");
+            for _ in 0..6 {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let s = warp::query();
+                let done = s.conn == Conn::Connected;
+                let _ = tx.send(Msg::Warp(s));
+                if done {
+                    break;
+                }
+            }
+        });
+    }
+
     fn warp_connect(&mut self, ctx: &egui::Context) {
         let protected = self.trial.is_some() || self.status.as_ref().is_some_and(|s| s.service == ServiceState::Running);
         if protected {

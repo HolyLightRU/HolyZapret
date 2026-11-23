@@ -62,6 +62,7 @@ pub struct Stats {
     pub via_ws: AtomicUsize,
     pub via_cf: AtomicUsize,
     pub via_tcp: AtomicUsize,
+    pub via_warp: AtomicUsize,
     pub failed: AtomicUsize,
     pub bad_secret: AtomicUsize,
     pub up: AtomicU64,
@@ -188,6 +189,7 @@ async fn client(mut s: TcpStream, sh: &Shared) {
             sh.stats.via_cf.fetch_add(1, Ordering::Relaxed)
         }
         Kind::Tcp => sh.stats.via_tcp.fetch_add(1, Ordering::Relaxed),
+        Kind::Warp => sh.stats.via_warp.fetch_add(1, Ordering::Relaxed),
     };
     match up {
         Upstream::Ws(io) => bridge_ws(s, io, ciphers, relay, Splitter::new(hello.proto), &sh.stats).await,

@@ -9,8 +9,26 @@ fn lower(p: &Path) -> String {
     p.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase()
 }
 
+fn archiver_dir(exe: &Path) -> bool {
+    exe.ancestors().skip(1).filter_map(|d| d.file_name()).any(|n| {
+        let n = n.to_string_lossy().to_lowercase();
+        n.starts_with("rar$ex") || n.starts_with("rar$di") || (n.starts_with("7zo") && n.len() > 3) || zip_dir(&n)
+    })
+}
+
+fn zip_dir(n: &str) -> bool {
+    n.strip_prefix("temp")
+        .and_then(|r| r.split_once('_'))
+        .is_some_and(|(d, name)| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) && name.ends_with(".zip"))
+}
+
 pub fn from_archive() -> bool {
-    let (Ok(exe), temp) = (std::env::current_exe(), std::env::temp_dir()) else { return false };
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    if archiver_dir(&exe) {
+        return true;
+    }
+    let temp = std::env::temp_dir();
     let temp = fs::canonicalize(&temp).unwrap_or(temp);
     lower(&exe).starts_with(&lower(&temp))
 }
@@ -79,6 +97,25 @@ pub fn install(zip: Option<&Path>, target: &Path) -> anyhow::Result<(PathBuf, Pa
     r
 }
 
+pub fn copy_from(source: &Path, target: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let exe = std::env::current_exe()?;
+    let r = (|| {
+        super::relocate::copy_ours(source, target, Some(&exe))?;
+        let launcher = target.join(exe.file_name().unwrap_or_default());
+        if !launcher.is_file() {
+            fs::copy(&exe, &launcher)?;
+        }
+        if !target.join("bin").join("HolyZapret.exe").is_file() {
+            anyhow::bail!("в {} не оказалось bin\\HolyZapret.exe", target.display());
+        }
+        Ok((target.to_path_buf(), launcher))
+    })();
+    if r.is_err() {
+        let _ = fs::remove_dir_all(target);
+    }
+    r
+}
+
 pub fn unpack_to(bytes: &[u8], target: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     super::selfupdate::extract(bytes, target)?;
     let root = super::selfupdate::release_root(target)?;
@@ -97,6 +134,38 @@ pub fn recycle(zip: &Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn copies_extracted_archive() {
+        let base = std::env::temp_dir().join(format!("hz-copy-{}", std::process::id()));
+        let (src, dst) = (base.join("Rar$EXa1.2"), base.join("HolyZapret"));
+        fs::create_dir_all(src.join("bin")).unwrap();
+        fs::write(src.join("bin").join("HolyZapret.exe"), "e").unwrap();
+        fs::write(src.join("general.bat"), "\"%BIN%HolyZapret.exe\"").unwrap();
+        let (root, exe) = copy_from(&src, &dst).unwrap();
+        assert_eq!(root, dst);
+        assert!(exe.is_file() && dst.join("general.bat").is_file() && dst.join("bin").join("HolyZapret.exe").is_file());
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(copy_from(&empty, &base.join("HolyZapret2")).is_err());
+        assert!(!base.join("HolyZapret2").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn archiver_temp_folders() {
+        for p in [
+            r"C:\Users\D0F8~1\AppData\Local\Temp\Rar$EXa12345.6789\HolyZapret Launcher.exe",
+            r"D:\tmp\Rar$EXa1.2\Holy-Zapret-3.1.0\HolyZapret Launcher.exe",
+            r"C:\Temp\7zO4A1B2C3\HolyZapret Launcher.exe",
+            r"C:\x\Temp1_Holy-Zapret-3.1.0.zip\HolyZapret Launcher.exe",
+        ] {
+            assert!(archiver_dir(Path::new(p)), "{p}");
+        }
+        for p in [r"C:\HolyZapret\HolyZapret Launcher.exe", r"C:\Users\u\Downloads\Temp\HolyZapret Launcher.exe", r"C:\7zip\HolyZapret Launcher.exe"] {
+            assert!(!archiver_dir(Path::new(p)), "{p}");
+        }
+    }
 
     #[test]
     fn explorer_temp_names_and_pick() {

@@ -17,6 +17,7 @@ pub enum Confirm {
     DeleteOld,
     StopSharing,
     QuitSharing,
+    WarpBlocksCheck,
 }
 
 impl App {
@@ -47,6 +48,11 @@ impl App {
                 "Сбросить настройки и списки?",
                 "Вернутся настройки по умолчанию, очистятся «Мои домены», «Мои IP», исключения, мои сайты, правила для сайтов, игровой фильтр, результаты подбора и настройки Telegram-прокси. Стратегии, установленная служба и автозапуск останутся, служба перезапустится с чистыми списками.",
                 "Сбросить",
+            ),
+            Confirm::WarpBlocksCheck => (
+                "Сначала отключите WARP",
+                "Пока WARP пропускает весь трафик через Cloudflare, сайты открываются при любой стратегии, и подбор с проверками покажут, что подходит всё. Отключите WARP, запустите подбор, а после него включите WARP обратно.",
+                "Отключить WARP",
             ),
             Confirm::StopSharing => ("Выключить раздачу на телефон?", "SHARE", "Выключить"),
             Confirm::QuitSharing => ("Выйти из HolyZapret?", "SHARE", "Выйти"),
@@ -128,6 +134,7 @@ impl App {
                         Err(e) => self.toast(ctx, Lvl::Err, e.to_string()),
                     },
                     Confirm::QuitSharing => crate::tray::exit(),
+                    Confirm::WarpBlocksCheck => self.warp_do(ctx, WarpAction::Disconnect),
                 }
             }
             Some(false) => {

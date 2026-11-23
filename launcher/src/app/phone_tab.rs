@@ -2,7 +2,7 @@ use super::App;
 use crate::core::lanproxy::{control, page};
 use crate::core::tgproxy::control::human;
 use crate::log::Lvl;
-use crate::theme::{self, CYAN, GREEN, YELLOW};
+use crate::theme::{self, CYAN, GREEN, RED, YELLOW};
 use eframe::egui::{self, Color32, CornerRadius, RichText, Sense, Vec2};
 
 #[derive(Default)]
@@ -10,6 +10,26 @@ pub struct PhoneState {
     port: String,
     loaded: bool,
     qr_mode: usize,
+    net: std::sync::Arc<std::sync::Mutex<Option<control::NetProfile>>>,
+    net_at: Option<std::time::Instant>,
+}
+
+fn alert(ui: &mut egui::Ui, color: Color32, text: &str, button: Option<&str>) -> bool {
+    let mut clicked = false;
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(text).color(color).size(13.0)).wrap());
+            if let Some(b) = button {
+                ui.add_space(4.0);
+                clicked = ui.button(b).clicked();
+            }
+        });
+    clicked
 }
 
 fn muted(text: impl Into<String>) -> RichText {
@@ -48,6 +68,7 @@ enum Act {
     Toggle(bool),
     Copy(String, &'static str),
     Port,
+    MakePrivate(u32),
 }
 
 impl App {
@@ -61,6 +82,16 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         let addr = control::address();
+        if snap.is_some() && self.phone.net_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30)) {
+            self.phone.net_at = Some(std::time::Instant::now());
+            let net = self.phone.net.clone();
+            std::thread::spawn(move || {
+                let p = control::net_profile();
+                *net.lock().unwrap() = p;
+            });
+        }
+        let public = self.phone.net.lock().unwrap().clone().filter(|p| p.public && snap.is_some());
+        let fw_error = control::firewall_error().filter(|_| snap.is_some());
         let protected = self.status.as_ref().is_some_and(|s| s.engine_running);
         let mut act = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -89,6 +120,20 @@ impl App {
                 if snap.is_some() && !protected {
                     ui.add_space(2.0);
                     ui.label(RichText::new("Защита сейчас выключена: телефон получит интернет через компьютер, но без обхода").color(YELLOW).size(12.5));
+                }
+                if let Some(p) = &public {
+                    ui.add_space(6.0);
+                    let name = if p.name.is_empty() { String::new() } else { format!(" «{}»", p.name) };
+                    let text = format!(
+                        "Windows считает сеть{name} общественной и не пускает к компьютеру другие устройства, поэтому телефон может не подключиться. Если это ваша домашняя сеть, сделайте её частной. В кафе и гостиницах так делать не стоит."
+                    );
+                    if alert(ui, RED, &text, Some("Сделать сеть частной")) {
+                        act = Some(Act::MakePrivate(p.index));
+                    }
+                }
+                if let Some(e) = &fw_error {
+                    ui.add_space(6.0);
+                    alert(ui, RED, &format!("Windows не дал открыть порт раздачи в брандмауэре, телефон может не подключиться. Ответ Windows: {e}"), None);
                 }
                 if snap.is_some() {
                     ui.add_space(6.0);
@@ -209,6 +254,18 @@ impl App {
                 },
                 None => self.toast(ctx, Lvl::Err, "Порт должен быть числом от 1024 до 65535"),
             },
+            Some(Act::MakePrivate(index)) => {
+                let net = self.phone.net.clone();
+                self.spawn(ctx, move |_, tx| match control::make_private(index) {
+                    Ok(()) => {
+                        if let Some(p) = net.lock().unwrap().as_mut() {
+                            p.public = false;
+                        }
+                        super::notify(tx, Lvl::Ok, "Сеть стала частной, телефон теперь может подключиться к компьютеру");
+                    }
+                    Err(e) => super::notify(tx, Lvl::Err, format!("Не удалось сделать сеть частной: {e}")),
+                });
+            }
             None => {}
         }
     }

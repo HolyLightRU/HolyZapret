@@ -10,6 +10,7 @@ pub mod hosts;
 pub mod known;
 pub mod lanproxy;
 pub mod lists;
+pub mod names;
 pub mod net;
 pub mod paths;
 pub mod picker;
@@ -24,6 +25,7 @@ pub mod service;
 pub mod settings;
 pub mod share;
 pub mod tgproxy;
+pub mod tgwarp;
 pub mod strategy;
 pub mod unpack;
 pub mod update;
@@ -41,8 +43,8 @@ pub const EXPERIMENTAL: &str = "experimental";
 pub fn run_hidden(program: &str, args: &[&str]) -> (bool, String) {
     match Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW).output() {
         Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            let mut s = names::oem(&o.stdout);
+            s.push_str(&names::oem(&o.stderr));
             (o.status.success(), s)
         }
         Err(e) => (false, e.to_string()),
