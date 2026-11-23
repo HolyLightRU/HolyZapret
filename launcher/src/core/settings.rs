@@ -10,11 +10,12 @@ pub struct Settings {
     pub sidebar_open: bool,
     pub wizard_done: bool,
     pub flow: bool,
+    pub watch: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { advanced: true, close_to_tray: true, sidebar_open: true, wizard_done: false, flow: true }
+        Self { advanced: true, close_to_tray: true, sidebar_open: false, wizard_done: false, flow: true, watch: true }
     }
 }
 
@@ -31,6 +32,7 @@ pub fn load() -> Settings {
             sidebar_open: read(&k, "SidebarOpen", d.sidebar_open),
             wizard_done: read(&k, "WizardDone", d.wizard_done),
             flow: read(&k, "Flow", d.flow),
+            watch: read(&k, "Watch", d.watch),
         },
         Err(_) => d,
     }
@@ -57,6 +59,20 @@ pub fn set_report_place(isp: &str, city: &str) {
     }
 }
 
+pub fn seen_version() -> Option<String> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("SeenVersion").ok())
+        .filter(|v| !v.is_empty())
+}
+
+pub fn set_seen_version(v: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("SeenVersion", &v);
+    }
+}
+
 pub fn set_last_strategy(id: &str) {
     if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
         let _ = k.set_value("LastStrategy", &id);
@@ -70,5 +86,6 @@ pub fn save(s: &Settings) {
         let _ = k.set_value("SidebarOpen", &(s.sidebar_open as u32));
         let _ = k.set_value("WizardDone", &(s.wizard_done as u32));
         let _ = k.set_value("Flow", &(s.flow as u32));
+        let _ = k.set_value("Watch", &(s.watch as u32));
     }
 }

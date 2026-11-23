@@ -14,6 +14,10 @@ pub struct TgState {
 }
 
 impl TgState {
+    pub fn forget(&mut self) {
+        self.saved = None;
+    }
+
     pub fn detect() -> TgState {
         TgState { client: control::desktop_client(), ..Default::default() }
     }

@@ -61,6 +61,12 @@ pub fn load() -> Option<LastPick> {
     (!p.scores.is_empty()).then_some(p)
 }
 
+pub fn clear() {
+    if let Some(f) = file() {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 pub fn save(p: &LastPick) -> anyhow::Result<()> {
     let f = file().ok_or_else(|| anyhow::anyhow!("нет LOCALAPPDATA"))?;
     if let Some(d) = f.parent() {

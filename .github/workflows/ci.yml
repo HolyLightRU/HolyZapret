@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Сверить версии
+        run: |
+          $manager = (Get-Content manager.bat -Raw) -match 'set "LOCAL_VERSION=([^"]+)"'
+          if (-not $manager) { throw "В manager.bat не найден LOCAL_VERSION" }
+          $managerVersion = $Matches[1]
+          $cargo = (Get-Content launcher/Cargo.toml -Raw) -match '(?m)^version\s*=\s*"([^"]+)"'
+          if (-not $cargo) { throw "В launcher/Cargo.toml не найдена version" }
+          $cargoVersion = $Matches[1]
+          if ($managerVersion -ne $cargoVersion) { throw "Версии расходятся: manager.bat $managerVersion, launcher/Cargo.toml $cargoVersion" }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+
+      - name: Тесты
+        working-directory: launcher
+        env:
+          HZ_TEST: "1"
+        run: cargo test
+
+      - name: Сборка лаунчера
+        working-directory: launcher
+        run: cargo build --release
+
+      - name: Проверить пакет
+        run: |
+          if (-not (Test-Path "bin/HolyZapret.exe")) { throw "В репозитории нет bin/HolyZapret.exe" }
+          if (-not (Test-Path "launcher/target/release/holyzapret-launcher.exe")) { throw "Лаунчер не собрался" }

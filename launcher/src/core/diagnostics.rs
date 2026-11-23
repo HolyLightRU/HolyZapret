@@ -18,6 +18,8 @@ pub enum Fix {
     RemoveServices(Vec<String>),
     RemoveZapret,
     StopEngines,
+    RemoveKnown(Vec<super::known::Found>),
+    MoveFolder,
 }
 
 impl Fix {
@@ -28,6 +30,8 @@ impl Fix {
             Fix::RemoveServices(_) => "Удалить",
             Fix::RemoveZapret => "Удалить службу",
             Fix::StopEngines => "Остановить",
+            Fix::RemoveKnown(_) => "Убрать",
+            Fix::MoveFolder => "Перенести",
         }
     }
 }
@@ -96,10 +100,12 @@ pub fn parse_probe(text: &str) -> (Option<bool>, usize) {
 }
 
 pub fn netsh_timestamps(text: &str) -> Option<bool> {
-    text.lines()
-        .find(|l| l.to_lowercase().contains("timestamps"))
-        .and_then(|l| l.rsplit(':').next())
-        .map(|v| v.trim().eq_ignore_ascii_case("enabled"))
+    let line = text.lines().find(|l| l.contains("1323") || l.to_lowercase().contains("timestamps"))?;
+    match line.rsplit(':').next()?.trim().to_lowercase().as_str() {
+        "enabled" => Some(true),
+        "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn hosts_mention_youtube(text: &str) -> bool {
@@ -125,16 +131,27 @@ pub fn in_folder(p: &Path, folder: &Path) -> bool {
     format!("{a}\\").starts_with(&b)
 }
 
-fn probe() -> (Option<bool>, usize) {
-    let script = "$t=(Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue).Timestamps; \"TS=$t\"; \
-        $d=(Get-ChildItem -Recurse -Path 'HKLM:System\\CurrentControlSet\\Services\\Dnscache\\InterfaceSpecificParameters\\' -ErrorAction SilentlyContinue | \
-        Get-ItemProperty | Where-Object { $_.DohFlags -gt 0 } | Measure-Object).Count; \"DOH=$d\"";
-    let (_, out) = run_hidden("powershell", &["-NoProfile", "-Command", script]);
-    let (mut ts, doh) = parse_probe(&out);
-    if ts.is_none() {
-        ts = netsh_timestamps(&run_hidden("netsh", &["interface", "tcp", "show", "global"]).1);
+fn timestamps() -> Option<bool> {
+    netsh_timestamps(&run_hidden("netsh", &["interface", "tcp", "show", "global"]).1).or_else(|| {
+        let script = "$t=(Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue).Timestamps; \"TS=$t\"";
+        parse_probe(&run_hidden("powershell", &["-NoProfile", "-Command", script]).1).0
+    })
+}
+
+fn doh_count(key: &winreg::RegKey, depth: u32) -> usize {
+    let flags = key.get_value::<u64, _>("DohFlags").ok().or_else(|| key.get_value::<u32, _>("DohFlags").ok().map(u64::from));
+    let here = usize::from(flags.is_some_and(|f| f > 0));
+    if depth == 0 {
+        return here;
     }
-    (ts, doh)
+    here + key.enum_keys().flatten().filter_map(|n| key.open_subkey(n).ok()).map(|k| doh_count(&k, depth - 1)).sum::<usize>()
+}
+
+fn doh_servers() -> usize {
+    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"System\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters")
+        .map(|k| doh_count(&k, 6))
+        .unwrap_or(0)
 }
 
 fn onedrive_folders() -> Vec<PathBuf> {
@@ -147,14 +164,32 @@ fn onedrive_folders() -> Vec<PathBuf> {
 
 pub fn run(paths: &Paths) -> Vec<Finding> {
     let mut v = Vec::new();
-    let (ts, doh) = probe();
-    let active = parse_services(&run_hidden("sc", &["query"]).1);
+    let (ts, doh, services, bfe, conflicts, st) = std::thread::scope(|s| {
+        let ts = s.spawn(timestamps);
+        let doh = s.spawn(doh_servers);
+        let services = s.spawn(|| run_hidden("sc", &["query"]).1);
+        let bfe = s.spawn(|| run_hidden("sc", &["query", "BFE"]).1);
+        let conflicts = s.spawn(|| {
+            CONFLICTING.iter().filter(|x| run_hidden("sc", &["query", x]).0).map(|x| x.to_string()).collect::<Vec<String>>()
+        });
+        let st = s.spawn(|| service::status(paths));
+        (
+            ts.join().ok().flatten(),
+            doh.join().unwrap_or(0),
+            services.join().unwrap_or_default(),
+            bfe.join().unwrap_or_default(),
+            conflicts.join().unwrap_or_default(),
+            st.join().ok(),
+        )
+    });
+    let st = st.unwrap_or_else(|| service::status(paths));
+    let active = parse_services(&services);
     let has = |needle: &str| {
         let n = needle.to_lowercase();
         active.iter().any(|(s, d)| s.to_lowercase().contains(&n) || d.to_lowercase().contains(&n))
     };
 
-    v.push(if run_hidden("sc", &["query", "BFE"]).1.contains("RUNNING") {
+    v.push(if bfe.contains("RUNNING") {
         ok("Base Filtering Engine работает")
     } else {
         issue(Level::Bad, "Base Filtering Engine не запущена", "Без этой службы Windows движок не работает. Включите её в services.msc")
@@ -201,8 +236,9 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
     v.push(if has_cyrillic(&paths.root) {
         issue(Level::Warn,
             "В пути к HolyZapret есть кириллица",
-            "Если обход не работает, перенесите папку, например в C:\\zapret",
+            "Движок может не найти свои файлы. Лаунчер перенесёт папку сам: скопирует её, переустановит службу и автозапуск и перезапустится из новой папки",
         )
+        .fix(Fix::MoveFolder)
     } else {
         ok("Путь без кириллицы")
     });
@@ -275,7 +311,6 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
         issue(Level::Warn, format!("Запущены VPN-службы: {}", vpn.join(", ")), "Часть VPN конфликтует с zapret, выключите их")
     });
 
-    let conflicts: Vec<String> = CONFLICTING.iter().filter(|s| run_hidden("sc", &["query", s]).0).map(|s| s.to_string()).collect();
     v.push(if conflicts.is_empty() {
         ok("Других обходов не найдено")
     } else {
@@ -286,7 +321,6 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
         .fix(Fix::RemoveServices(conflicts))
     });
 
-    let st = service::status(paths);
     if let Some(d) = st.foreign_dir() {
         v.push(
             issue(
@@ -325,6 +359,18 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
     } else {
         ok("WinDivert в порядке")
     });
+    let known = super::known::in_user_lists(paths);
+    if !known.is_empty() {
+        let all: Vec<String> = known.iter().flat_map(|f| f.domains.clone()).collect();
+        v.push(
+            issue(
+                Level::Warn,
+                format!("В «Моих доменах» есть {}", super::known::names(&all).join(", ")),
+                "Эти сервисы обычно работают без обхода, и стратегия может их сломать. Если какой-то из них не открывается, проверьте его в «Правилах для сайтов» на вкладке «Сайты»",
+            )
+            .fix(Fix::RemoveKnown(known)),
+        );
+    }
     v
 }
 
@@ -342,6 +388,18 @@ pub fn apply(fix: &Fix) -> anyhow::Result<String> {
         Fix::StopEngines => {
             service::stop_engines();
             Ok("Движки остановлены".into())
+        }
+        Fix::MoveFolder => anyhow::bail!("перенос папки запускается из лаунчера"),
+        Fix::RemoveKnown(found) => {
+            let n = super::known::remove(found)?;
+            let mut msg = format!("Убрано из «Моих доменов»: {n}");
+            if service::query(service::SERVICE) == ServiceState::Running {
+                match service::restart() {
+                    Ok(()) => msg.push_str(", служба перезапущена"),
+                    Err(e) => msg.push_str(&format!(", но службу не удалось перезапустить: {e}")),
+                }
+            }
+            Ok(msg)
         }
         Fix::RemoveServices(names) => {
             let mut failed = Vec::new();
@@ -420,6 +478,9 @@ mod tests {
         assert_eq!(parse_probe("TS=\nDOH=\n"), (None, 0));
         assert_eq!(netsh_timestamps("RFC 1323 Timestamps                 : disabled \r\n"), Some(false));
         assert_eq!(netsh_timestamps("RFC 1323 Timestamps : enabled"), Some(true));
+        assert_eq!(netsh_timestamps("Метки времени RFC 1323           : disabled\r\n"), Some(false));
+        assert_eq!(netsh_timestamps("Метки времени RFC 1323 : включено"), None);
+        assert_eq!(netsh_timestamps("Receive-Side Scaling State : enabled"), None);
     }
 
     #[test]

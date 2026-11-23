@@ -61,6 +61,10 @@ pub fn enabled() -> bool {
 }
 
 pub fn set(on: bool) -> anyhow::Result<()> {
+    set_exe(on, &std::env::current_exe()?)
+}
+
+pub fn set_exe(on: bool, exe: &Path) -> anyhow::Result<()> {
     if !on {
         let (ok, out) = run_hidden("schtasks", &["/Delete", "/TN", TASK, "/F"]);
         if !ok && enabled() {
@@ -68,8 +72,7 @@ pub fn set(on: bool) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
-    let xml = task_xml(&exe, &user());
+    let xml = task_xml(exe, &user());
     let path = std::env::temp_dir().join("holyzapret-autostart.xml");
     let mut bytes = vec![0xFF, 0xFE];
     for u in xml.encode_utf16() {

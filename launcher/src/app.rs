@@ -1,13 +1,17 @@
 mod confirm;
 mod diag_tab;
 mod lists_tab;
+mod phone_tab;
 mod picker_tab;
 mod rules_ui;
+mod share_ui;
 mod sites_tab;
 mod tools_tab;
+mod unpack_ui;
 mod tg_ui;
 mod trial;
 mod warp_ui;
+mod whats_new;
 mod wizard;
 
 use crate::core::checks::SiteResult;
@@ -50,7 +54,69 @@ enum Msg {
     TgClient(Option<crate::core::tgproxy::control::Client>),
     PostInstallCheck,
     TrialStarted(Result<trial::Trial, String>),
+    ResetDone,
+    Shared,
+    WhatsNew(String, String),
+    Health(Vec<String>),
+    Relocated(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf),
+    Unpacked(Result<(std::path::PathBuf, std::path::PathBuf, bool), String>),
     Done,
+}
+
+fn health_loop(
+    p: Paths,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+) {
+    use std::sync::atomic::Ordering;
+    const STEP: u64 = 5;
+    const FIRST: u64 = 300;
+    const EVERY: u64 = 1200;
+    let targets = crate::core::health::targets(&p);
+    let mut watch = crate::core::health::Watch::default();
+    let mut strategy: Option<String> = None;
+    let mut wait = FIRST;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(STEP));
+        let forced = force.swap(false, Ordering::Relaxed);
+        wait = wait.saturating_sub(STEP);
+        if !forced && (wait > 0 || !flag.load(Ordering::Relaxed)) {
+            continue;
+        }
+        let st = service::status(&p);
+        let active = (st.service == ServiceState::Running && st.engine_running).then(|| st.active_strategy().map(String::from)).flatten();
+        if active != strategy {
+            strategy = active.clone();
+            if !watch.current().is_empty() {
+                if tx.send(Msg::Health(Vec::new())).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+            watch = Default::default();
+        }
+        if active.is_none() || tray::busy() {
+            wait = 60;
+            continue;
+        }
+        wait = EVERY;
+        let results = crate::core::health::probe(&targets);
+        let changed = watch.step(&results).or_else(|| forced.then(|| watch.current()));
+        if let Some(failing) = changed {
+            if !failing.is_empty() {
+                tray::notify(
+                    "Обход перестал работать",
+                    &format!("Не открываются {}. Откройте HolyZapret, чтобы подобрать стратегию заново", failing.join(", ")),
+                );
+            }
+            if tx.send(Msg::Health(failing)).is_err() {
+                break;
+            }
+            ctx.request_repaint();
+        }
+    }
 }
 
 fn send(tx: &Sender<Msg>, lvl: Lvl, text: impl Into<String>) {
@@ -112,6 +178,7 @@ enum Tab {
     Diagnostics,
     Tools,
     Telegram,
+    Phone,
     Lists,
     Log,
 }
@@ -156,11 +223,21 @@ pub struct App {
     version_error: Option<String>,
     close_to_tray: bool,
     sidebar_open: bool,
+    sidebar_peek: bool,
     advanced: bool,
     saved: Settings,
     lists: lists_tab::ListsState,
     picker: picker_tab::PickerState,
     rules: rules_ui::RulesState,
+    whats_new: Option<(String, String)>,
+    watch: bool,
+    watch_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    health_force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    health_alert: Vec<String>,
+    old_folder: Option<std::path::PathBuf>,
+    unpack: Option<unpack_ui::UnpackState>,
+    share: share_ui::ShareState,
+    phone: phone_tab::PhoneState,
     flowseal_version: Option<String>,
     flowseal_latest: Option<Release>,
     flowseal_checking: bool,
@@ -221,11 +298,21 @@ impl App {
             version_error: None,
             close_to_tray: saved.close_to_tray && tray,
             sidebar_open: saved.sidebar_open,
+            sidebar_peek: false,
             advanced: saved.advanced,
             saved,
             lists: Default::default(),
             picker: Default::default(),
             rules: Default::default(),
+            whats_new: None,
+            watch: saved.watch,
+            watch_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.watch)),
+            health_force: Default::default(),
+            health_alert: Vec::new(),
+            old_folder: None,
+            unpack: None,
+            share: Default::default(),
+            phone: Default::default(),
             flowseal_version,
             flowseal_latest: None,
             flowseal_checking: false,
@@ -234,8 +321,31 @@ impl App {
             tx,
             rx,
         };
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == crate::core::relocate::MOVED_ARG) {
+            let old = args.get(i + 1).cloned().unwrap_or_default();
+            let root = app.paths.as_ref().map(|p| p.root.display().to_string()).unwrap_or_default();
+            app.log.push(Entry::new(Lvl::Ok, format!("HolyZapret перенесён в {root}. Старую папку {old} можно удалить")));
+            app.toasts.push(crate::log::Toast { lvl: Lvl::Ok, text: format!("HolyZapret перенесён в {root}"), born: 0.0 });
+            let old = std::path::PathBuf::from(&old);
+            if app.paths.as_ref().is_some_and(|p| crate::core::relocate::can_remove_old(&old, &p.root)) {
+                app.old_folder = Some(old);
+                app.confirm = Some(confirm::Confirm::DeleteOld);
+            }
+        }
+        if args.iter().any(|a| a == crate::core::unpack::UNPACKED_ARG) {
+            let root = app.paths.as_ref().map(|p| p.root.display().to_string()).unwrap_or_default();
+            app.log.push(Entry::new(Lvl::Ok, format!("HolyZapret распакован в {root}")));
+            app.toasts.push(crate::log::Toast { lvl: Lvl::Ok, text: format!("HolyZapret распакован в {root}"), born: 0.0 });
+        }
         if app.paths.is_none() {
+            app.unpack = unpack_ui::UnpackState::detect();
             app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\HolyZapret.exe — положите лаунчер внутрь HolyZapret"));
+        }
+        match crate::core::lanproxy::control::autostart() {
+            Some(Ok(m)) => app.log.push(Entry::new(Lvl::Ok, m)),
+            Some(Err(e)) => app.log.push(Entry::new(Lvl::Err, format!("Раздача на телефон не запустилась: {e}"))),
+            None => {}
         }
         match crate::core::tgproxy::control::autostart() {
             Some(Ok(m)) => app.log.push(Entry::new(Lvl::Ok, m)),
@@ -265,6 +375,21 @@ impl App {
         }
         app.refresh(&cc.egui_ctx);
         app.check_version(&cc.egui_ctx);
+        let current = env!("CARGO_PKG_VERSION");
+        match settings::seen_version().or_else(|| app.wizard_done.then(|| "0".to_string())) {
+            _ if crate::core::TEST_BUILD || app.paths.is_none() => {}
+            None => settings::set_seen_version(current),
+            Some(seen) if selfupdate::is_newer(&seen, current) => {
+                let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+                std::thread::spawn(move || {
+                    if let Ok(body) = selfupdate::notes(current) {
+                        let _ = tx.send(Msg::WhatsNew(current.to_string(), body));
+                        ctx.request_repaint();
+                    }
+                });
+            }
+            Some(_) => {}
+        }
         if let Some(p) = app.paths.clone() {
             std::thread::spawn(move || {
                 selfupdate::cleanup_old(&p);
@@ -272,6 +397,11 @@ impl App {
         }
         if !app.wizard_done && app.paths.is_some() {
             app.open_wizard();
+        }
+        if let Some(p) = app.paths.clone() {
+            let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+            let (flag, force) = (app.watch_flag.clone(), app.health_force.clone());
+            std::thread::spawn(move || health_loop(p, flag, force, tx, ctx));
         }
         if let Some(p) = app.paths.clone() {
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
@@ -456,6 +586,57 @@ impl App {
                     self.rescan();
                 }
                 Msg::Done => self.busy = false,
+                Msg::WhatsNew(v, body) => self.whats_new = Some((v, body)),
+                Msg::Relocated(root, exe, old) => {
+                    let spawned = std::process::Command::new(&exe)
+                        .arg(crate::core::relocate::MOVED_ARG)
+                        .arg(&old)
+                        .current_dir(&root)
+                        .spawn();
+                    match spawned {
+                        Ok(_) => tray::exit(),
+                        Err(e) => self.toast(ctx, Lvl::Err, format!("Папка перенесена в {}, но новый лаунчер не запустился: {e}", root.display())),
+                    }
+                }
+                Msg::Unpacked(r) => self.on_unpacked(ctx, r),
+                Msg::Health(failing) => {
+                    if failing.is_empty() {
+                        if !self.health_alert.is_empty() {
+                            self.toast(ctx, Lvl::Ok, "Обход снова работает");
+                        }
+                    } else if failing == self.health_alert {
+                        self.toast(ctx, Lvl::Err, format!("Обход всё ещё не работает: не открываются {}", failing.join(", ")));
+                    } else {
+                        self.note(Lvl::Err, format!("Обход перестал работать: не открываются {}", failing.join(", ")));
+                    }
+                    self.health_alert = failing;
+                }
+                Msg::Shared => {
+                    self.game_edit = None;
+                    self.lists = Default::default();
+                    self.rules = Default::default();
+                    self.rescan();
+                    self.refresh(ctx);
+                }
+                Msg::ResetDone => {
+                    let d = Settings::default();
+                    self.advanced = d.advanced;
+                    self.close_to_tray = d.close_to_tray && self.tray;
+                    self.sidebar_open = d.sidebar_open;
+                    self.flow = d.flow;
+                    self.watch = d.watch;
+                    self.health_alert.clear();
+                    self.last_pick = None;
+                    self.game_edit = None;
+                    self.lists = Default::default();
+                    self.rules = Default::default();
+                    self.tg.forget();
+                    self.sites.clear();
+                    self.sites_total = 0;
+                    self.rescan();
+                    self.refresh(ctx);
+                    self.open_wizard();
+                }
                 Msg::Version(Ok(v)) => {
                     self.version_error = None;
                     self.remote_version = Some(v.version.clone());
@@ -525,7 +706,7 @@ impl App {
                         notify(
                             tx,
                             Lvl::Info,
-                            format!("Часть правил для сайтов подобрана под «{}»: проверьте эти сайты на новой стратегии на вкладке «Сайты»", others.join("», «")),
+                            format!("Часть правил для сайтов подобрана под «{}»: перепроверьте их кнопкой «Перепроверить» на вкладке «Сайты»", others.join("», «")),
                         );
                     }
                     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -569,6 +750,7 @@ impl App {
         if self.tg.client.is_some() {
             items.push((Tab::Telegram, theme::icon::TELEGRAM, "Telegram"));
         }
+        items.push((Tab::Phone, theme::icon::PHONE, "Телефон"));
         items.extend([
             (Tab::Sites, theme::icon::GLOBE, "Сайты"),
             (Tab::Diagnostics, theme::icon::DIAGNOSTIC, "Диагностика"),
@@ -588,7 +770,7 @@ impl App {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(6.0);
-            if let Some(r) = self.update_available() {
+            if let Some(r) = self.update_available().filter(|_| self.paths.is_some()) {
                 theme::chip(ui, &format!("Доступна {r}"), YELLOW);
             }
         });
@@ -693,6 +875,7 @@ impl App {
     }
 
     fn main_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.health_card(ui, ctx);
         self.trial_card(ui, ctx);
         self.hero(ui, ctx);
         self.warp_row(ui, ctx);
@@ -1045,6 +1228,7 @@ fn resize_edges(ctx: &egui::Context) {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        tray::clear_notice();
         self.stop_trial_now();
     }
 
@@ -1056,6 +1240,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.setup_window(frame);
         self.poll(&ctx);
+        if tray::take_phone() && self.paths.is_some() {
+            self.tab = Tab::Phone;
+        }
+        if tray::take_quit() {
+            self.confirm = Some(confirm::Confirm::QuitSharing);
+        }
         let tray_events = tray::take_events();
         if !tray_events.is_empty() {
             for (ok, text) in tray_events {
@@ -1079,7 +1269,12 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.close_to_tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                if !tray::hide_window() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+            } else if crate::core::lanproxy::control::running() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm = Some(confirm::Confirm::QuitSharing);
             } else if self.picker.running() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.toast(
@@ -1104,11 +1299,34 @@ impl eframe::App for App {
             });
 
         let expand = ctx.animate_bool_responsive(ui.make_persistent_id("sidebar_anim"), self.sidebar_open);
-        egui::Panel::left("nav")
+        let panel = egui::Panel::left("nav")
             .exact_size(64.0 + 136.0 * expand)
             .resizable(false)
             .frame(Frame::new().fill(Color32::from_black_alpha(70)).inner_margin(Margin::same(12)))
             .show(ui, |ui| self.sidebar(ui, expand));
+        if !self.sidebar_open && self.confirm.is_none() {
+            let base = panel.response.rect;
+            let peek = ctx.animate_bool_with_time(ui.make_persistent_id("sidebar_peek"), self.sidebar_peek, 0.16);
+            let width = 64.0 + 136.0 * peek;
+            let zone = egui::Rect::from_min_size(base.min, egui::vec2(width, base.height()));
+            self.sidebar_peek = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| zone.contains(p));
+            if peek > 0.01 {
+                egui::Area::new(egui::Id::NULL.with("nav_peek")).order(egui::Order::Middle).fixed_pos(base.min).show(&ctx, |ui| {
+                    Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(20, 16, 26, 246))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18 + (10.0 * peek) as u8)))
+                        .shadow(egui::epaint::Shadow { offset: [6, 0], blur: 18, spread: 0, color: Color32::from_black_alpha((90.0 * peek) as u8) })
+                        .inner_margin(Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_width(width - 24.0);
+                            ui.set_height(base.height() - 24.0);
+                            self.sidebar(ui, peek);
+                        });
+                });
+            }
+        } else {
+            self.sidebar_peek = false;
+        }
 
         resize_edges(&ctx);
 
@@ -1122,21 +1340,32 @@ impl eframe::App for App {
                 Tab::Diagnostics => self.diag_tab(ui, &ctx),
                 Tab::Tools => self.tools_tab(ui, &ctx),
                 Tab::Telegram => self.tg_tab(ui, &ctx),
+                Tab::Phone => self.phone_tab(ui, &ctx),
                 Tab::Lists => self.lists_tab(ui, &ctx),
                 Tab::Log => self.log_tab(ui, &ctx),
             });
         self.draw_toasts(&ctx);
         self.draw_confirm(&ctx);
+        self.draw_unpack(&ctx);
+        self.draw_share(&ctx);
+        if self.confirm.is_none() && self.tab != Tab::Wizard && self.unpack.is_none() {
+            self.draw_whats_new(&ctx);
+        }
         let now = Settings {
             advanced: self.advanced,
             close_to_tray: self.close_to_tray,
             sidebar_open: self.sidebar_open,
             wizard_done: self.wizard_done,
             flow: self.flow,
+            watch: self.watch,
         };
         if now != self.saved {
             settings::save(&now);
             self.saved = now;
+            self.watch_flag.store(self.watch, std::sync::atomic::Ordering::Relaxed);
+            if !self.watch {
+                self.health_alert.clear();
+            }
         }
     }
 }

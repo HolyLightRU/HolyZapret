@@ -79,6 +79,7 @@ pub mod icon {
     pub const ERROR: &str = "\u{E783}";
     pub const INFO: &str = "\u{E946}";
     pub const TELEGRAM: &str = "tg-plane";
+    pub const PHONE: &str = "\u{E8EA}";
 }
 
 pub fn paint_icon(painter: &egui::Painter, center: egui::Pos2, glyph: &str, size: f32, color: Color32) {
@@ -136,7 +137,8 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, PINK.gamma_multiply(0.6));
     v.widgets.active.bg_fill = PINK.gamma_multiply(0.45);
     v.widgets.active.weak_bg_fill = PINK.gamma_multiply(0.45);
-    ctx.set_visuals(v);
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_visuals_of(egui::Theme::Dark, v);
 
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(10.0, 10.0);

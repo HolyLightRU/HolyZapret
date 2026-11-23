@@ -65,15 +65,26 @@ pub struct Check {
     pub ms: u32,
     pub code: u32,
     pub exit: i32,
+    pub skipped: bool,
 }
 
 impl Check {
     pub fn failed() -> Check {
-        Check { ok: false, frozen: false, ms: 0, code: 0, exit: -1 }
+        Check { ok: false, frozen: false, ms: 0, code: 0, exit: -1, skipped: false }
+    }
+
+    pub fn skipped_from(base: &Check) -> Check {
+        Check { skipped: true, ..base.clone() }
+    }
+
+    pub fn counted(&self) -> bool {
+        !self.skipped || self.ok
     }
 
     pub fn detail(&self) -> String {
-        if self.frozen {
+        if self.skipped {
+            "стратегия не обходит этот сайт".into()
+        } else if self.frozen {
             "заморозка 16-20 КБ".into()
         } else if self.code > 0 && !self.ok {
             format!("HTTP {}, обрыв при загрузке", self.code)
@@ -110,14 +121,15 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn score(&self) -> (usize, usize) {
-        (self.checks.iter().filter(|c| c.ok).count(), self.checks.len())
+        let run = self.checks.iter().filter(|c| c.counted());
+        (run.clone().filter(|c| c.ok).count(), run.count())
     }
 
     pub fn category(&self, targets: &[Target], cat: &str) -> (usize, usize) {
         let mut ok = 0;
         let mut total = 0;
         for (t, c) in targets.iter().zip(&self.checks) {
-            if t.category == cat {
+            if t.category == cat && c.counted() {
                 total += 1;
                 ok += c.ok as usize;
             }
@@ -130,7 +142,7 @@ impl Outcome {
     }
 
     pub fn score_without(&self, noisy: &[bool]) -> (usize, usize) {
-        let kept = self.checks.iter().enumerate().filter(|(i, _)| !noisy.get(*i).copied().unwrap_or(false));
+        let kept = self.checks.iter().enumerate().filter(|(i, c)| c.counted() && !noisy.get(*i).copied().unwrap_or(false));
         kept.fold((0, 0), |(ok, total), (_, c)| (ok + c.ok as usize, total + 1))
     }
 
@@ -138,7 +150,7 @@ impl Outcome {
         let mut ok = 0;
         let mut total = 0;
         for (i, (t, c)) in targets.iter().zip(&self.checks).enumerate() {
-            if t.category == cat && !noisy.get(i).copied().unwrap_or(false) {
+            if t.category == cat && c.counted() && !noisy.get(i).copied().unwrap_or(false) {
                 total += 1;
                 ok += c.ok as usize;
             }
@@ -183,8 +195,9 @@ pub fn noisy_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> {
             if t.kind != CheckKind::Freeze || b.ok || b.frozen || runs.iter().any(|o| o.checks[i].frozen) {
                 return false;
             }
-            let pass = runs.iter().filter(|o| o.checks[i].ok).count();
-            pass > 0 && pass * 3 < runs.len()
+            let tried: Vec<&&Outcome> = runs.iter().filter(|o| !o.checks[i].skipped).collect();
+            let pass = tried.iter().filter(|o| o.checks[i].ok).count();
+            tried.len() >= 4 && pass > 0 && pass * 3 < tried.len()
         })
         .collect()
 }
@@ -198,7 +211,12 @@ pub fn unreachable_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> 
         return none;
     }
     let dead = |c: &Check| !c.ok && !c.frozen;
-    (0..targets.len()).map(|i| dead(&base.checks[i]) && runs.iter().all(|o| dead(&o.checks[i]))).collect()
+    (0..targets.len())
+        .map(|i| {
+            let tried: Vec<&&Outcome> = runs.iter().filter(|o| !o.checks[i].skipped).collect();
+            dead(&base.checks[i]) && !tried.is_empty() && tried.iter().all(|o| dead(&o.checks[i]))
+        })
+        .collect()
 }
 
 pub fn either(a: &[bool], b: &[bool]) -> Vec<bool> {
@@ -260,6 +278,14 @@ pub fn load_targets(paths: &Paths) -> Vec<Target> {
     }
     for (name, category, url) in HEAVY {
         t.push(Target { name: name.to_string(), category: category.to_string(), url: url.to_string(), kind: CheckKind::Freeze });
+    }
+    for (host, port) in super::voice::hosts() {
+        t.push(Target {
+            name: super::voice::label(&host, port),
+            category: super::voice::CATEGORY.to_string(),
+            url: format!("https://{host}:{port}/"),
+            kind: CheckKind::Tls12,
+        });
     }
     for url in super::checks::load_my_sites(paths) {
         let name = url.split_once("://").map(|x| x.1).unwrap_or(&url).split('/').next().unwrap_or(&url).to_string();
@@ -383,17 +409,20 @@ pub fn judge(kind: CheckKind, exit: i32, w: &str) -> Check {
     let (code, size, time) = parse_w(w);
     let ms = (time * 1000.0) as u32;
     match kind {
-        CheckKind::Tls12 | CheckKind::Tls13 => Check { ok: exit_ok && code > 0, frozen: false, ms, code, exit },
+        CheckKind::Tls12 | CheckKind::Tls13 => Check { ok: exit_ok && code > 0, frozen: false, ms, code, exit, skipped: false },
         CheckKind::Freeze => {
             let kb = size as f64 / 1024.0;
             let frozen = !exit_ok && (14.0..=22.0).contains(&kb);
-            Check { ok: code > 0 && (exit_ok || kb > 22.0), frozen, ms, code, exit }
+            Check { ok: code > 0 && (exit_ok || kb > 22.0), frozen, ms, code, exit, skipped: false }
         }
     }
 }
 
 pub(crate) fn run_check(t: &Target) -> Check {
     let c = curl_check(t);
+    if t.category == super::voice::CATEGORY && c.exit == 6 {
+        return Check::skipped_from(&Check::failed());
+    }
     if t.kind == CheckKind::Freeze && !c.ok && !c.frozen { curl_check(t) } else { c }
 }
 
@@ -420,7 +449,43 @@ fn curl_check(t: &Target) -> Check {
     }
 }
 
+fn coverage_skips(targets: &[Target], ips: &[Vec<std::net::IpAddr>], args: &str, cache: &mut super::coverage::Cache) -> Vec<bool> {
+    targets
+        .iter()
+        .zip(ips)
+        .map(|(t, ips)| t.category == HOSTING && !super::coverage::touches(args, &host_of(&t.url), ips, cache))
+        .collect()
+}
+
+fn resolve_hosting(targets: &[Target]) -> Vec<Vec<std::net::IpAddr>> {
+    use std::net::ToSocketAddrs;
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = targets
+            .iter()
+            .map(|t| {
+                s.spawn(move || {
+                    if t.category != HOSTING {
+                        return Vec::new();
+                    }
+                    (host_of(&t.url).as_str(), 443).to_socket_addrs().map(|a| a.map(|x| x.ip()).collect()).unwrap_or_default()
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap_or_default()).collect()
+    })
+}
+
 fn run_suite(targets: &Arc<Vec<Target>>, cancel: &Arc<AtomicBool>, emit: &(impl Fn(Event) + Sync)) -> Vec<Check> {
+    run_suite_skipping(targets, &vec![false; targets.len()], &[], cancel, emit)
+}
+
+fn run_suite_skipping(
+    targets: &Arc<Vec<Target>>,
+    skip: &[bool],
+    base: &[Check],
+    cancel: &Arc<AtomicBool>,
+    emit: &(impl Fn(Event) + Sync),
+) -> Vec<Check> {
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let results: Mutex<Vec<Option<Check>>> = Mutex::new(vec![None; targets.len()]);
@@ -433,7 +498,10 @@ fn run_suite(targets: &Arc<Vec<Target>>, cancel: &Arc<AtomicBool>, emit: &(impl 
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(t) = targets.get(i) else { break };
-                    let c = run_check(t);
+                    let c = match (skip.get(i).copied().unwrap_or(false), base.get(i)) {
+                        (true, Some(b)) => Check::skipped_from(b),
+                        _ => run_check(t),
+                    };
                     results.lock().unwrap()[i] = Some(c);
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     emit(Event::Progress { done: d });
@@ -578,6 +646,8 @@ pub fn run(
 
     emit(Event::Phase { index: 0, name: "Без обхода".into() });
     let base = run_suite(&targets, &cancel, &emit);
+    let hosting_ips = resolve_hosting(&targets);
+    let mut cover = super::coverage::Cache::default();
     if !cancel.load(Ordering::Relaxed) {
         emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone() }));
         if !add_to.is_empty() {
@@ -594,10 +664,13 @@ pub fn run(
         }
         emit(Event::Phase { index: i + 1, name: s.name.clone() });
         let mut outcome = Outcome { name: s.name.clone(), path: Some(s.path.clone()), error: None, checks: Vec::new() };
+        let skip = strategy::extract_args(s, &paths, &game_filter)
+            .map(|a| coverage_skips(&targets, &hosting_ips, &a, &mut cover))
+            .unwrap_or_else(|_| vec![false; targets.len()]);
         match start_engine(&paths, s, &game_filter, false) {
             Ok(mut child) => match warm_up(&mut child, &s.name, &cancel) {
                 Ok(()) => {
-                    outcome.checks = run_suite(&targets, &cancel, &emit);
+                    outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit);
                     recheck(&targets, &base, &mut outcome.checks, &cancel);
                     if blackout(&base, &outcome.checks) && !cancel.load(Ordering::Relaxed) {
                         stop_engine(Some(child));
@@ -610,7 +683,7 @@ pub fn run(
                             }
                         };
                         if warm_up(&mut child, &s.name, &cancel).is_ok() {
-                            outcome.checks = run_suite(&targets, &cancel, &emit);
+                            outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit);
                             recheck(&targets, &base, &mut outcome.checks, &cancel);
                         }
                     }
@@ -639,11 +712,12 @@ pub fn run(
 }
 
 fn regressions(base: &[Check], checks: &[Check]) -> Vec<usize> {
-    (0..checks.len().min(base.len())).filter(|&i| base[i].ok && !checks[i].ok).collect()
+    (0..checks.len().min(base.len())).filter(|&i| base[i].ok && !checks[i].ok && !checks[i].skipped).collect()
 }
 
 fn blackout(base: &[Check], checks: &[Check]) -> bool {
-    base.iter().any(|c| c.ok) && !checks.is_empty() && checks.iter().all(|c| !c.ok)
+    let tried: Vec<&Check> = checks.iter().filter(|c| !c.skipped).collect();
+    base.iter().any(|c| c.ok) && !tried.is_empty() && tried.iter().all(|c| !c.ok)
 }
 
 fn recheck(targets: &[Target], base: &[Check], checks: &mut [Check], cancel: &AtomicBool) {
@@ -676,7 +750,7 @@ mod tests {
             t("https://store.steampowered.com", CheckKind::Tls12),
             t("https://store.steampowered.com", CheckKind::Tls13),
         ];
-        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 }, skipped: false };
         let (blocked, open) = blocked_sites(&targets, &[c(true), c(false), c(true), c(true)]);
         assert_eq!(blocked, vec!["https://soundcloud.com".to_string()]);
         assert_eq!(open, vec!["https://store.steampowered.com".to_string()]);
@@ -684,8 +758,45 @@ mod tests {
     }
 
     #[test]
+    fn skipped_checks_do_not_count() {
+        let t = |name: &str| Target { name: name.into(), category: HOSTING.into(), url: format!("https://{name}/"), kind: CheckKind::Freeze };
+        let targets = vec![t("a.com"), t("b.com")];
+        let ok = Check { ok: true, frozen: false, ms: 10, code: 200, exit: 0, skipped: false };
+        let dead = Check::failed();
+        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks };
+        let general = out(Some("g"), vec![Check::skipped_from(&ok), Check::skipped_from(&dead)]);
+        assert_eq!(general.score(), (1, 1));
+        assert_eq!(general.category(&targets, HOSTING), (1, 1));
+        assert_eq!(general.score_without(&[false, false]), (1, 1));
+        let broad = out(Some("b"), vec![ok.clone(), ok.clone()]);
+        assert_eq!(broad.score(), (2, 2));
+        let base = out(None, vec![ok.clone(), dead.clone()]);
+        let results = vec![base, general.clone(), out(Some("h"), vec![Check::skipped_from(&ok), Check::skipped_from(&dead)])];
+        assert_eq!(unreachable_checks(&targets, &results), vec![false, false]);
+        assert!(regressions(&[ok.clone(), ok.clone()], &general.checks).is_empty());
+        assert!(!blackout(&[ok.clone(), ok.clone()], &[Check::skipped_from(&ok), Check::skipped_from(&dead)]));
+        assert_eq!(Check::skipped_from(&dead).detail(), "стратегия не обходит этот сайт");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_strategies_hosting_coverage() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let paths = Paths { root };
+        let targets: Vec<Target> = load_targets(&paths).into_iter().filter(|t| t.category == HOSTING).collect();
+        let ips = resolve_hosting(&targets);
+        let mut cache = super::super::coverage::Cache::default();
+        for s in strategy::discover(&paths) {
+            let Ok(args) = strategy::extract_args(&s, &paths, &GameFilter::default()) else { continue };
+            let skip = coverage_skips(&targets, &ips, &args, &mut cache);
+            let touched: Vec<&str> = targets.iter().zip(&skip).filter(|(_, s)| !**s).map(|(t, _)| t.name.as_str()).collect();
+            println!("{:<45} {}", s.name, touched.join(", "));
+        }
+    }
+
+    #[test]
     fn regressions_and_blackouts() {
-        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let c = |ok: bool| Check { ok, frozen: false, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 }, skipped: false };
         let base = vec![c(true), c(false), c(true)];
         assert_eq!(regressions(&base, &[c(false), c(false), c(true)]), vec![0]);
         assert!(blackout(&base, &[c(false), c(false), c(false)]));
@@ -697,7 +808,7 @@ mod tests {
     fn lucky_timeouts_are_noise() {
         let t = |name: &str, kind| Target { name: name.into(), category: "x".into(), url: String::new(), kind };
         let targets = vec![t("yt", CheckKind::Tls12), t("cdn77", CheckKind::Freeze), t("hetzner", CheckKind::Freeze)];
-        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 }, skipped: false };
         let run = |name: &str, yt, cdn, het| Outcome {
             name: name.into(),
             path: Some(PathBuf::from(name)),
@@ -720,7 +831,7 @@ mod tests {
     fn blocked_everywhere_is_marked() {
         let t = |name: &str| Target { name: name.into(), category: "x".into(), url: String::new(), kind: CheckKind::Freeze };
         let targets = vec![t("yt"), t("cdn77"), t("frozen"), t("ok")];
-        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 } };
+        let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 }, skipped: false };
         let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks };
         let base = out(None, vec![c(false, false), c(false, false), c(false, true), c(true, false)]);
         let a = out(Some("a"), vec![c(true, false), c(false, false), c(false, true), c(true, false)]);
@@ -782,7 +893,7 @@ mod tests {
     #[test]
     fn outcome_scores() {
         let targets = parse_targets("### A\nA = \"https://a.com\"\n### B\nB = \"https://b.com\"\n");
-        let c = |ok, ms| Check { ok, frozen: false, ms, code: 0, exit: 0 };
+        let c = |ok, ms| Check { ok, frozen: false, ms, code: 0, exit: 0, skipped: false };
         let o = Outcome { name: "x".into(), path: None, error: None, checks: vec![c(true, 100), c(true, 300), c(false, 0), c(true, 200)] };
         assert_eq!(o.score(), (3, 4));
         assert_eq!(o.category(&targets, "B"), (1, 2));

@@ -9,7 +9,16 @@ mod tray;
 mod window;
 
 fn main() -> eframe::Result {
-    if !instance::acquire() {
+    let moved = std::env::args().any(|a| a == core::relocate::MOVED_ARG || a == core::unpack::UNPACKED_ARG || a == core::unpack::REOPEN_ARG);
+    let mut owned = instance::acquire();
+    for _ in 0..if moved { 50 } else { 0 } {
+        if owned {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        owned = instance::acquire();
+    }
+    if !owned {
         instance::activate_existing();
         return Ok(());
     }

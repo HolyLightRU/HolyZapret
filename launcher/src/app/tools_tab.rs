@@ -131,6 +131,61 @@ impl App {
         }
     }
 
+    pub(super) fn delete_old_folder(&mut self, ctx: &egui::Context) {
+        let Some(old) = self.old_folder.take() else { return };
+        self.spawn(ctx, move |p, tx| match crate::core::relocate::remove_old(&old, &p.root) {
+            Ok((_, true)) => notify(tx, Lvl::Ok, format!("Старая папка {} удалена в корзину", old.display())),
+            Ok((_, false)) => notify(
+                tx,
+                Lvl::Ok,
+                format!("Файлы HolyZapret из {} отправлены в корзину, ваши остальные файлы остались на месте", old.display()),
+            ),
+            Err(e) => notify(tx, Lvl::Err, format!("Старую папку удалить не удалось: {e}")),
+        });
+    }
+
+    pub(super) fn move_folder(&mut self, ctx: &egui::Context) {
+        if self.trial.is_some() || self.picker.running() {
+            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+            return;
+        }
+        let target = crate::core::relocate::target_dir();
+        self.spawn(ctx, move |p, tx| {
+            send(tx, Lvl::Info, format!("Переношу HolyZapret в {}…", target.display()));
+            match crate::core::relocate::run(p, target) {
+                Ok((root, exe)) => {
+                    let _ = tx.send(Msg::Relocated(root, exe, p.root.clone()));
+                }
+                Err(e) => notify(tx, Lvl::Err, format!("Перенести не удалось: {e}")),
+            }
+        });
+    }
+
+    pub(super) fn reset_all(&mut self, ctx: &egui::Context) {
+        if self.trial.is_some() || self.picker.running() {
+            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+            return;
+        }
+        let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
+        let strategy = installed.and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
+        self.spawn(ctx, move |p, tx| {
+            match crate::core::reset::run(p) {
+                Ok(n) => {
+                    let mut msg = format!("Настройки и списки сброшены, очищено записей: {n}");
+                    if let Some(s) = strategy {
+                        match crate::core::service::install(p, &s) {
+                            Ok(_) => msg.push_str(". Служба перезапущена с чистыми списками"),
+                            Err(e) => msg.push_str(&format!(", но службу не удалось перезапустить: {e}")),
+                        }
+                    }
+                    notify(tx, Lvl::Ok, msg);
+                }
+                Err(e) => notify(tx, Lvl::Err, format!("Сброс не удался: {e}")),
+            }
+            let _ = tx.send(Msg::ResetDone);
+        });
+    }
+
     pub(super) fn run_update(&mut self, ctx: &egui::Context) {
         let Some(rel) = self.remote_release.clone() else {
             self.check_version(ctx);
@@ -309,6 +364,10 @@ impl App {
                 self.close_to_tray = tray;
             }
             self.autostart_row(ui, ctx);
+            let mut watch = self.watch;
+            if setting_row(ui, &mut watch, true, "Следить за работой обхода", "Раз в 20 минут проверяет YouTube и Discord и сообщает, если обход перестал работать") {
+                self.watch = watch;
+            }
             let mut flow = self.flow;
             if setting_row(ui, &mut flow, true, "Живые градиенты", "Цвета акцентов медленно перетекают, пока окно лаунчера активно") {
                 self.flow = flow;
@@ -320,6 +379,31 @@ impl App {
                     self.tab = Tab::Main;
                 }
             }
+            theme::row(ui, 44.0, |ui| {
+                ui.vertical(|ui| {
+                    ui.label("Поделиться настройкой");
+                    ui.label(RichText::new("Стратегия, свои домены и IP, правила для сайтов и игровой фильтр одним кодом").weak().size(12.5));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!self.busy, egui::Button::new("Код от друга")).clicked() {
+                        self.share.open = true;
+                    }
+                    if ui.add_enabled(self.paths.is_some(), egui::Button::new("Скопировать мой код")).clicked() {
+                        self.copy_share_code(ctx);
+                    }
+                });
+            });
+            theme::row(ui, 44.0, |ui| {
+                ui.vertical(|ui| {
+                    ui.label("Сбросить мои настройки и списки");
+                    ui.label(RichText::new("Если что-то натыкали и сломали: свои домены, IP, правила и настройки вернутся к исходным").weak().size(12.5));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!self.busy, egui::Button::new("Сбросить")).clicked() {
+                        self.confirm = Some(super::confirm::Confirm::ResetAll);
+                    }
+                });
+            });
             theme::row(ui, 44.0, |ui| {
                 ui.vertical(|ui| {
                     ui.label("Мастер настройки");

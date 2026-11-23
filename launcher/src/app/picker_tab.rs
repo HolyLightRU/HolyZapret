@@ -184,7 +184,7 @@ impl PickerState {
         let mut domains: Vec<String> = Vec::new();
         for (i, t) in self.targets.iter().enumerate() {
             let (Some(b), Some(c)) = (base.checks.get(i), best.checks.get(i)) else { continue };
-            if b.ok && !c.ok {
+            if b.ok && !c.ok && !c.skipped {
                 let d = crate::core::discover::base_domain(&picker::host_of(&t.url));
                 if !domains.contains(&d) {
                     domains.push(d);
@@ -630,6 +630,61 @@ impl App {
         });
     }
 
+    pub(super) fn repick(&mut self, ctx: &egui::Context) {
+        self.picker.mode = 0;
+        self.picker.scope = 0;
+        self.tab = Tab::Picker;
+        if !self.picker.running && !self.busy {
+            self.start_pick(ctx);
+        }
+    }
+
+    pub(super) fn health_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.health_alert.is_empty() {
+            return;
+        }
+        let mut act = 0;
+        egui::Frame::new()
+            .fill(YELLOW.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, YELLOW.gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::row(ui, 34.0, |ui| {
+                    ui.label(RichText::new(theme::icon::WARNING).font(theme::icon_font(16.0)).color(YELLOW));
+                    ui.label(RichText::new(format!("Обход перестал работать: не открываются {}", self.health_alert.join(", "))).color(YELLOW).size(14.5));
+                });
+                ui.label(
+                    RichText::new("Похоже, провайдер изменил блокировку. Подбор найдёт стратегию, которая работает сейчас")
+                        .color(Color32::from_gray(190))
+                        .size(12.5),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.busy, theme::Primary("Подобрать заново".into())).clicked() {
+                        act = 1;
+                    }
+                    if ui.button("Проверить ещё раз").clicked() {
+                        act = 2;
+                    }
+                    if ui.button("Скрыть").clicked() {
+                        act = 3;
+                    }
+                });
+            });
+        ui.add_space(10.0);
+        match act {
+            1 => self.repick(ctx),
+            2 => {
+                self.health_force.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.toast(ctx, Lvl::Info, "Проверяю YouTube и Discord…");
+            }
+            3 => self.health_alert.clear(),
+            _ => {}
+        }
+    }
+
     pub(super) fn start_pick(&mut self, ctx: &egui::Context) {
         let Some(p) = self.paths.clone() else { return };
         let idx: Vec<usize> = match self.picker.mode {
@@ -774,14 +829,15 @@ fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) ->
         .iter()
         .map(|c| {
             let (a, b) = o.category_without(targets, c, noisy);
-            format!("{c}: {a} из {b}")
+            (b > 0).then(|| format!("{c}: {a} из {b}"))
         })
+        .flatten()
         .collect();
     let failed: Vec<String> = targets
         .iter()
         .zip(&o.checks)
         .enumerate()
-        .filter(|(i, (_, c))| !c.ok && !noisy.get(*i).copied().unwrap_or(false))
+        .filter(|(i, (_, c))| !c.ok && !c.skipped && !noisy.get(*i).copied().unwrap_or(false))
         .map(|(_, (t, c))| {
             let kind = match t.kind {
                 picker::CheckKind::Tls12 => "TLS 1.2",
@@ -793,9 +849,20 @@ fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) ->
         .collect();
     if let Some(e) = &o.error {
         lines = vec![format!("Не запустилась: {e}"), format!("Лог: {}", picker::log_path(&o.name).display())];
-    } else if !failed.is_empty() {
-        lines.push("Не прошли:".into());
-        lines.extend(failed.into_iter().take(12));
+    } else {
+        if !failed.is_empty() {
+            lines.push("Не прошли:".into());
+            lines.extend(failed.into_iter().take(12));
+        }
+        let untouched: Vec<&str> = targets
+            .iter()
+            .zip(&o.checks)
+            .filter(|(_, c)| !c.counted())
+            .map(|(t, _)| t.name.as_str())
+            .collect();
+        if !untouched.is_empty() {
+            lines.push(format!("Не обходит (не открываются и без обхода): {}", untouched.join(", ")));
+        }
     }
     lines.join("\n")
 }

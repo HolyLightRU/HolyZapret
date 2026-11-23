@@ -60,16 +60,21 @@ fn outcome_block(out: &mut String, place: Option<usize>, o: &Outcome, input: &In
         .iter()
         .map(|c| {
             let (a, b) = o.category(input.targets, c);
-            format!("{c} {a}/{b}")
+            (b > 0).then(|| format!("{c} {a}/{b}"))
         })
+        .flatten()
         .collect();
     let _ = writeln!(out, "{}", cats.join(" | "));
+    let skipped: Vec<String> = input.targets.iter().zip(&o.checks).filter(|(_, c)| !c.counted()).map(|(t, _)| t.name.clone()).collect();
+    if !skipped.is_empty() {
+        let _ = writeln!(out, "Не обходит (не открываются и без обхода): {}", skipped.join(", "));
+    }
     let failed: Vec<String> = input
         .targets
         .iter()
         .zip(&o.checks)
         .enumerate()
-        .filter(|(_, (_, c))| !c.ok)
+        .filter(|(_, (_, c))| !c.ok && !c.skipped)
         .map(|(i, (t, c))| {
             let mark = if input.unreachable.get(i).copied().unwrap_or(false) { ", недоступно везде" } else { "" };
             format!("  - {} / {} ({}): {}{mark}", t.category, t.name, kind(t.kind), c.detail())
@@ -174,7 +179,7 @@ mod tests {
     #[test]
     fn report_lists_failures_by_target() {
         let targets = parse_targets("### Discord\nDiscordMain = \"https://discord.com\"\n");
-        let c = |ok, exit, code| Check { ok, frozen: false, ms: 100, code, exit };
+        let c = |ok, exit, code| Check { ok, frozen: false, ms: 100, code, exit, skipped: false };
         let base = Outcome { name: "Без обхода".into(), path: None, error: None, checks: vec![c(false, 28, 0), c(false, 35, 0)] };
         let root = PathBuf::from(r"C:\hz");
         let best = Outcome {

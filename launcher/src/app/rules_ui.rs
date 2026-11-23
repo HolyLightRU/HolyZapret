@@ -1,5 +1,5 @@
 use super::{App, Msg};
-use crate::core::rules::{self, Advice, Rule, Trial, Verdict};
+use crate::core::rules::{self, Advice, Rule, RuleState, Trial, Verdict};
 use crate::core::strategy::Strategy;
 use crate::core::{checks, gamefilter};
 use crate::log::Lvl;
@@ -17,6 +17,7 @@ pub struct RulesState {
     cancel: Option<Arc<AtomicBool>>,
     verdict: Option<Verdict>,
     expanded: bool,
+    states: Vec<(Rule, RuleState)>,
 }
 
 impl RulesState {
@@ -56,6 +57,8 @@ enum Act {
     Picker,
     Remove(usize),
     Dismiss,
+    Recheck,
+    CheckSite(String),
 }
 
 impl App {
@@ -105,7 +108,39 @@ impl App {
         }
     }
 
+    fn start_recheck(&mut self, ctx: &egui::Context) {
+        if self.trial.is_some() || self.picker.running {
+            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+            return;
+        }
+        let Some(current) = self.rules_strategy() else {
+            self.toast(ctx, Lvl::Info, "Выберите или установите стратегию, чтобы проверить правила с ней");
+            return;
+        };
+        let Some(p) = self.paths.clone() else { return };
+        let list = rules::load(&p);
+        if list.is_empty() {
+            return;
+        }
+        let gf = gamefilter::load(&p);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.rules.cancel = Some(cancel.clone());
+        self.rules.stage = Some("Подготовка".into());
+        self.rules.states.clear();
+        self.busy = true;
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            rules::recheck(p, list, current, gf, &cancel, |e| {
+                let _ = tx.send(Msg::Rules(e));
+                ctx2.request_repaint();
+            });
+        });
+    }
+
     fn start_rule_check(&mut self, ctx: &egui::Context) {
+        if self.busy || self.rules.running() {
+            return;
+        }
         if self.trial.is_some() || self.picker.running {
             self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
             return;
@@ -142,6 +177,21 @@ impl App {
                 self.rules.cancel = None;
                 self.busy = false;
                 self.rules.verdict = Some(v);
+                self.refresh(ctx);
+            }
+            rules::Event::Rechecked(list, states) => {
+                self.rules.stage = None;
+                self.rules.cancel = None;
+                self.busy = false;
+                self.rules.expanded = true;
+                let broken = states.iter().filter(|s| **s == RuleState::Broken).count();
+                let spare = states.iter().filter(|s| **s == RuleState::NotNeeded).count();
+                self.rules.states = list.into_iter().zip(states).collect();
+                let msg = match (broken, spare) {
+                    (0, 0) => "Все правила работают".to_string(),
+                    _ => format!("Правила перепроверены: не помогают {broken}, больше не нужны {spare}"),
+                };
+                self.toast(ctx, if broken > 0 { Lvl::Err } else { Lvl::Ok }, msg);
                 self.refresh(ctx);
             }
             rules::Event::Failed(e) => {
@@ -287,14 +337,42 @@ impl App {
             }
             if self.rules.expanded && !self.rules.list.is_empty() {
                 ui.add_space(6.0);
+                theme::row(ui, 30.0, |ui| {
+                    ui.label(muted("Проверить с текущей стратегией, какие правила помогают, а какие больше не нужны"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can = !self.busy && !self.rules.running();
+                        if ui.add_enabled(can, egui::Button::new("Перепроверить все")).clicked() {
+                            act = Some(Act::Recheck);
+                        }
+                    });
+                });
                 egui::ScrollArea::vertical().id_salt("rules_list").max_height(132.0).auto_shrink([false, true]).show(ui, |ui| {
                     for (i, r) in self.rules.list.iter().enumerate() {
                         theme::row(ui, 32.0, |ui| {
                             let col = if r.technique == rules::NONE { YELLOW } else { CYAN };
                             theme::chip(ui, &rules::label(&r.technique), col);
+                            let state = self.rules.states.iter().find(|(x, _)| x == r).map(|(_, s)| *s);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if theme::icon_button(ui, theme::icon::DELETE, "Удалить правило").clicked() {
                                     act = Some(Act::Remove(i));
+                                }
+                                match state {
+                                    Some(RuleState::Works) => {
+                                        ui.label(RichText::new("работает").color(GREEN).size(12.5));
+                                    }
+                                    Some(RuleState::NotNeeded) => {
+                                        if ui.small_button("Убрать").on_hover_text("Сайт открывается и без этого правила").clicked() {
+                                            act = Some(Act::Remove(i));
+                                        }
+                                        ui.label(RichText::new("больше не нужно").color(YELLOW).size(12.5));
+                                    }
+                                    Some(RuleState::Broken) => {
+                                        if ui.small_button("Подобрать").on_hover_text("Проверить сайт заново и подобрать другой приём").clicked() {
+                                            act = Some(Act::CheckSite(r.domains.first().cloned().unwrap_or_default()));
+                                        }
+                                        ui.label(RichText::new("не помогает").color(RED).size(12.5));
+                                    }
+                                    None => {}
                                 }
                                 if !r.origin.is_empty() {
                                     ui.label(muted(format!("для {}", theme::ellipsize(&r.origin, 24)))).on_hover_text(&r.origin);
@@ -340,6 +418,11 @@ impl App {
                 }
             }
             Some(Act::Dismiss) => self.rules.verdict = None,
+            Some(Act::Recheck) => self.start_recheck(ctx),
+            Some(Act::CheckSite(site)) => {
+                self.rules.input = format!("https://{site}/");
+                self.start_rule_check(ctx);
+            }
             None => {}
         }
     }

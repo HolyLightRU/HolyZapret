@@ -1906,15 +1906,18 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "holyzapret-launcher"
-version = "3.0.3"
+version = "3.1.0"
 dependencies = [
  "aes",
  "anyhow",
+ "base64",
  "ctr",
  "eframe",
  "embed-manifest",
  "embed-resource",
+ "flate2",
  "getrandom 0.3.4",
+ "qrcodegen",
  "raw-window-handle",
  "rustls",
  "serde_json",
@@ -3260,6 +3263,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "quick-error"

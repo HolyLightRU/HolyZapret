@@ -25,6 +25,10 @@ impl App {
     }
 
     pub(super) fn apply_fix(&mut self, ctx: &egui::Context, fix: diagnostics::Fix) {
+        if fix == diagnostics::Fix::MoveFolder {
+            self.confirm = Some(super::confirm::Confirm::MoveFolder);
+            return;
+        }
         self.diag.running = true;
         self.spawn(ctx, move |p, tx| {
             result_msg(tx, diagnostics::apply(&fix), "Не удалось исправить");

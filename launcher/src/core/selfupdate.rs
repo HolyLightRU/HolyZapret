@@ -99,6 +99,17 @@ pub fn latest() -> anyhow::Result<Release> {
     parse_release(&json)
 }
 
+pub fn notes(version: &str) -> anyhow::Result<String> {
+    let url = format!("https://api.github.com/repos/HolyLightRU/HolyZapret/releases/tags/v{}", strip_v(version));
+    let json = agent(15).get(&url).header("Accept", "application/vnd.github+json").call()?.body_mut().read_to_string()?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let body = v["body"].as_str().unwrap_or("").trim().to_string();
+    if body.is_empty() {
+        anyhow::bail!("у релиза {version} нет описания");
+    }
+    Ok(body)
+}
+
 fn numbers(v: &str) -> Option<Vec<u64>> {
     let v = strip_v(v);
     if v.is_empty() {
@@ -164,7 +175,7 @@ fn safe_rel(name: &str) -> Option<PathBuf> {
     (!p.as_os_str().is_empty()).then_some(p)
 }
 
-fn extract(bytes: &[u8], target: &Path) -> anyhow::Result<usize> {
+pub(crate) fn extract(bytes: &[u8], target: &Path) -> anyhow::Result<usize> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))?;
     let mut written = 0;
     let mut total = 0u64;
@@ -194,7 +205,7 @@ fn is_release_root(dir: &Path) -> bool {
     dir.join("bin").join("HolyZapret.exe").is_file()
 }
 
-fn release_root(tmp: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn release_root(tmp: &Path) -> anyhow::Result<PathBuf> {
     if is_release_root(tmp) {
         return Ok(tmp.to_path_buf());
     }

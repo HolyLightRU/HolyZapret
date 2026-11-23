@@ -282,6 +282,17 @@ impl App {
                 Ok(()) => {
                     self.after_change();
                     self.toast(ctx, Lvl::Ok, format!("Добавлено в «{}»: {n}", f.label));
+                    let known = crate::core::known::names(&ok);
+                    if f.kind == Kind::Domains && !f.path.ends_with("list-exclude-user.txt") && !known.is_empty() {
+                        self.toast(
+                            ctx,
+                            Lvl::Info,
+                            format!(
+                                "{} обычно работает без обхода, и стратегия может его сломать. Если он перестанет открываться, уберите его из списка",
+                                known.join(", ")
+                            ),
+                        );
+                    }
                 }
                 Err(e) => {
                     self.lists.doc_for = None;

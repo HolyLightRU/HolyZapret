@@ -221,10 +221,26 @@ pub struct Verdict {
     pub origin: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleState {
+    Works,
+    NotNeeded,
+    Broken,
+}
+
+pub fn rule_state(with_rule: &Trial, without_rule: &Trial) -> RuleState {
+    match (with_rule.passed(), without_rule.passed()) {
+        (true, true) => RuleState::NotNeeded,
+        (true, false) => RuleState::Works,
+        (false, _) => RuleState::Broken,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Event {
     Stage(String),
     Done(Verdict),
+    Rechecked(Vec<Rule>, Vec<RuleState>),
     Failed(String),
 }
 
@@ -357,6 +373,53 @@ pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter
     emit(Event::Done(Verdict { url, domains, baseline, strategy: strategy_trial, techniques, advice, origin }));
 }
 
+pub fn recheck(paths: Paths, list: Vec<Rule>, current: Strategy, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
+    if !picker::curl_available() {
+        emit(Event::Failed("curl.exe не найден: он входит в Windows 10 1803 и новее".into()));
+        return;
+    }
+    let args = match strategy::extract_args(&current, &paths, &gf) {
+        Ok(a) => a,
+        Err(e) => {
+            emit(Event::Failed(format!("Не удалось прочитать стратегию «{}»: {e}", current.name)));
+            return;
+        }
+    };
+    let was_running = service::query(service::SERVICE) == ServiceState::Running;
+    let had_divert = service::query("WinDivert") != ServiceState::NotInstalled;
+    if was_running {
+        super::run_hidden("net", &["stop", service::SERVICE]);
+    }
+    picker::stop_engine(None);
+    let bin = paths.bin();
+    let mut states = Vec::new();
+    for (i, rule) in list.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let site = rule.domains.first().cloned().unwrap_or_default();
+        emit(Event::Stage(format!("Правило {} из {}: {site}", i + 1, list.len())));
+        let targets = targets(&format!("https://{site}/"));
+        let plain = measure_engine(&current.engine, &current.bin, &args, &current.name, &targets, cancel);
+        let with = inject(&args, std::slice::from_ref(rule), &bin);
+        let ruled = measure_engine(&current.engine, &current.bin, &with, &current.name, &targets, cancel);
+        states.push(rule_state(&Trial::from("с правилом", None, &ruled), &Trial::from("без правила", None, &plain)));
+    }
+    picker::stop_engine(None);
+    let restore = was_running.then(service::start);
+    if !was_running && !had_divert {
+        let _ = service::unload_windivert();
+    }
+    if cancel.load(Ordering::Relaxed) {
+        emit(Event::Failed("Перепроверка правил отменена".into()));
+        return;
+    }
+    if let Some(Err(e)) = restore {
+        emit(Event::Failed(format!("Перепроверка закончилась, но службу не удалось запустить: {e}")));
+    }
+    emit(Event::Rechecked(list, states));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +459,14 @@ mod tests {
         assert!(out.contains("--filter-udp=443 --hostlist-domains=steampowered.com,x.com --new --filter-udp=443 --hostlist=\"x\""));
         assert_eq!(out.matches("--new").count(), args.matches("--new").count() + 3);
         assert_eq!(inject("--wf-tcp=80 --dpi-desync=fake", &rules, bin), "--wf-tcp=80 --dpi-desync=fake");
+    }
+
+    #[test]
+    fn rule_states() {
+        let t = |ok: usize| Trial { label: "s".into(), technique: None, ok, total: 3, ms: 10 };
+        assert_eq!(rule_state(&t(3), &t(0)), RuleState::Works);
+        assert_eq!(rule_state(&t(3), &t(3)), RuleState::NotNeeded);
+        assert_eq!(rule_state(&t(2), &t(3)), RuleState::Broken);
     }
 
     #[test]

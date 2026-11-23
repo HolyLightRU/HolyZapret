@@ -2,12 +2,12 @@ use crate::core::paths::Paths;
 use crate::core::service::{self, ServiceState, Status};
 use crate::core::{settings, strategy};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow};
+use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow};
 
 static HWND: AtomicIsize = AtomicIsize::new(0);
 static STATE: Mutex<Option<View>> = Mutex::new(None);
@@ -15,6 +15,18 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static EVENTS: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
 static LAST_ACTION: Mutex<Option<Instant>> = Mutex::new(None);
 static CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
+static QUIT: AtomicBool = AtomicBool::new(false);
+static PHONE: AtomicBool = AtomicBool::new(false);
+static NOTICE: AtomicU64 = AtomicU64::new(0);
+const NOTICE_ID: u32 = 0x485A;
+
+pub fn take_phone() -> bool {
+    PHONE.swap(false, Ordering::Relaxed)
+}
+
+pub fn take_quit() -> bool {
+    QUIT.swap(false, Ordering::Relaxed)
+}
 
 pub fn set_ctx(ctx: &eframe::egui::Context) {
     let _ = CTX.set(ctx.clone());
@@ -87,6 +99,72 @@ pub fn set_hwnd(h: isize) {
 pub fn window_visible() -> bool {
     let h = HWND.load(Ordering::Relaxed);
     h == 0 || unsafe { IsWindowVisible(h as _) != 0 && IsIconic(h as _) == 0 }
+}
+
+pub fn notify(title: &str, text: &str) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::LoadIconW;
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    fn fill(dst: &mut [u16], s: &str) {
+        let max = dst.len() - 1;
+        for (d, c) in dst.iter_mut().zip(s.encode_utf16().take(max)) {
+            *d = c;
+        }
+    }
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = h as _;
+        nid.uID = NOTICE_ID;
+        nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
+        nid.hIcon = LoadIconW(GetModuleHandleW(std::ptr::null()), 1usize as _);
+        nid.dwInfoFlags = NIIF_WARNING;
+        fill(&mut nid.szTip, "HolyZapret");
+        fill(&mut nid.szInfoTitle, title);
+        fill(&mut nid.szInfo, text);
+        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 && Shell_NotifyIconW(NIM_MODIFY, &nid) == 0 {
+            return;
+        }
+        let seq = NOTICE.fetch_add(1, Ordering::Relaxed) + 1;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            if NOTICE.load(Ordering::Relaxed) == seq {
+                clear_notice();
+            }
+        });
+    }
+}
+
+pub fn clear_notice() {
+    use windows_sys::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    unsafe {
+        let mut del: NOTIFYICONDATAW = std::mem::zeroed();
+        del.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        del.hWnd = h as _;
+        del.uID = NOTICE_ID;
+        Shell_NotifyIconW(NIM_DELETE, &del);
+    }
+}
+
+pub fn exit() -> ! {
+    clear_notice();
+    std::process::exit(0)
+}
+
+pub fn hide_window() -> bool {
+    let h = HWND.load(Ordering::Relaxed);
+    h != 0 && unsafe {
+        ShowWindow(h as _, SW_HIDE);
+        true
+    }
 }
 
 pub fn show_window() {
@@ -189,20 +267,32 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
     let status = MenuItem::new("HolyZapret", false, None);
     let toggle_item = MenuItem::new("Включить защиту", paths.is_some(), None);
     let tg_item = MenuItem::new("Включить Telegram-прокси", true, None);
+    let phone = MenuItem::new("Раздача на телефон…", true, None);
     let open = MenuItem::new("Открыть HolyZapret", true, None);
     let quit = MenuItem::new("Выход", true, None);
     let sep = PredefinedMenuItem::separator();
     let sep2 = PredefinedMenuItem::separator();
-    if menu.append_items(&[&status, &sep, &toggle_item, &tg_item, &open, &sep2, &quit]).is_err() {
+    if menu.append_items(&[&status, &sep, &toggle_item, &tg_item, &phone, &open, &sep2, &quit]).is_err() {
         return false;
     }
     let (open_id, quit_id, toggle_id) = (open.id().clone(), quit.id().clone(), toggle_item.id().clone());
     let tg_id = tg_item.id().clone();
+    let phone_id = phone.id().clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == open_id {
             show_window();
+        } else if e.id == phone_id {
+            PHONE.store(true, Ordering::Relaxed);
+            show_window();
+            wake();
         } else if e.id == quit_id {
-            std::process::exit(0);
+            if crate::core::lanproxy::control::running() {
+                QUIT.store(true, Ordering::Relaxed);
+                show_window();
+                wake();
+            } else {
+                exit();
+            }
         } else if e.id == tg_id {
             std::thread::spawn(|| {
                 let on = !crate::core::tgproxy::control::running();
