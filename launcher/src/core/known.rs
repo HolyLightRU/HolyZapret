@@ -5,7 +5,21 @@ use std::path::PathBuf;
 pub const SERVICES: &[(&str, &[&str])] = &[
     (
         "Steam",
-        &["steampowered.com", "steamcommunity.com", "steamstatic.com", "steamcontent.com", "steamserver.net", "steamgames.com", "steam-chat.com", "valvesoftware.com"],
+        &[
+            "steampowered.com",
+            "steamcommunity.com",
+            "steamstatic.com",
+            "steamcontent.com",
+            "steamserver.net",
+            "steamgames.com",
+            "steam-chat.com",
+            "steamusercontent.com",
+            "valvesoftware.com",
+            "steamcdn-a.akamaihd.net",
+            "steamuserimages-a.akamaihd.net",
+            "steamstore-a.akamaihd.net",
+            "steamcommunity-a.akamaihd.net",
+        ],
     ),
     ("Epic Games", &["epicgames.com", "epicgames.dev", "unrealengine.com"]),
     ("Battle.net", &["battle.net", "blizzard.com"]),
@@ -27,6 +41,15 @@ pub fn service_of(domain: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, bases)| bases.iter().any(|b| d == *b || d.ends_with(&format!(".{b}"))))
         .map(|(name, _)| *name)
+}
+
+pub fn service_domains(domain: &str) -> &'static [&'static str] {
+    let d = domain.trim().trim_end_matches('.').to_lowercase();
+    SERVICES
+        .iter()
+        .find(|(_, bases)| bases.iter().any(|b| d == *b || d.ends_with(&format!(".{b}"))))
+        .map(|(_, bases)| *bases)
+        .unwrap_or(&[])
 }
 
 pub fn names(domains: &[String]) -> Vec<&'static str> {

@@ -11,7 +11,7 @@ pub const NONE: &str = "none";
 pub const BORROW: &str = "from:";
 const BORROW_OPTIONS: [&str; 4] = ["--dpi-desync", "--ip-id", "--dup", "--orig"];
 const FILE: &str = "site-rules-user.txt";
-const MAX_DOMAINS: usize = 8;
+const MAX_DOMAINS: usize = 16;
 
 pub struct Technique {
     pub id: &'static str,
@@ -346,6 +346,7 @@ pub fn rule_state(with_rule: &Trial, without_rule: &Trial) -> RuleState {
 pub enum Event {
     Stage(String),
     Done(Verdict),
+    Batch(Vec<Verdict>),
     Rechecked(Vec<Rule>, Vec<RuleState>),
     Failed(String),
 }
@@ -363,17 +364,47 @@ fn run_checks(targets: &[Target]) -> Vec<Check> {
     })
 }
 
-fn related_domains(url: &str) -> Vec<String> {
+fn kin(brand: &str, label: &str) -> bool {
+    let shared = brand.chars().zip(label.chars()).take_while(|(a, b)| a == b).count();
+    shared >= 5 || (brand.len() >= 4 && label.len() >= 4 && (label.contains(brand) || brand.contains(label)))
+}
+
+fn add_domain(out: &mut Vec<String>, d: &str) {
+    let d = d.trim().trim_end_matches('.').to_lowercase();
+    if d.is_empty() || out.len() >= MAX_DOMAINS || out.iter().any(|x| d == *x || d.ends_with(&format!(".{x}"))) {
+        return;
+    }
+    out.retain(|x| !x.ends_with(&format!(".{d}")));
+    out.push(d);
+}
+
+pub fn pick_domains(url: &str, found: Option<&super::discover::Found>) -> Vec<String> {
     let main = super::discover::base_domain(&picker::host_of(url));
-    let mut out = vec![main.clone()];
-    if let Ok(found) = super::discover::run(url) {
-        for g in found.groups.iter().filter(|g| (g.main || g.related) && !g.third_party && !g.cloudflare) {
-            if !out.contains(&g.base) && out.len() < MAX_DOMAINS {
-                out.push(g.base.clone());
+    let brand = main.split('.').next().unwrap_or("").to_string();
+    let mut out = Vec::new();
+    add_domain(&mut out, &main);
+    for d in super::known::service_domains(&main) {
+        add_domain(&mut out, d);
+    }
+    if let Some(found) = found {
+        for g in &found.groups {
+            let label = g.base.split('.').next().unwrap_or("");
+            if g.main || g.related || (!g.third_party && kin(&brand, label)) {
+                add_domain(&mut out, &g.base);
+                continue;
+            }
+            for h in &g.hosts {
+                if h.split('.').any(|l| kin(&brand, l)) {
+                    add_domain(&mut out, h);
+                }
             }
         }
     }
     out
+}
+
+pub fn site_domains(url: &str) -> Vec<String> {
+    pick_domains(url, super::discover::run(url).ok().as_ref())
 }
 
 pub fn advise(baseline: &Trial, strategy: Option<&Trial>, techniques: &[Trial]) -> Advice {
@@ -407,34 +438,45 @@ fn measure_engine(engine: &Path, bin: &Path, args: &str, log: &str, targets: &[T
     checks
 }
 
-pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
-    if !picker::curl_available() {
-        emit(Event::Failed("curl.exe не найден: он входит в Windows 10 1803 и новее".into()));
-        return;
-    }
+struct Pause {
+    was_running: bool,
+    had_divert: bool,
+}
+
+fn pause() -> Pause {
     let was_running = service::query(service::SERVICE) == ServiceState::Running;
     let had_divert = service::query("WinDivert") != ServiceState::NotInstalled;
     if was_running {
         super::run_hidden("net", &["stop", service::SERVICE]);
     }
     picker::stop_engine(None);
+    Pause { was_running, had_divert }
+}
+
+fn resume(p: Pause) -> Option<String> {
+    picker::stop_engine(None);
+    let restore = p.was_running.then(service::start);
+    if !p.was_running && !p.had_divert {
+        let _ = service::unload_windivert();
+    }
+    match restore {
+        Some(Err(e)) => Some(e.to_string()),
+        _ => None,
+    }
+}
+
+fn inspect(paths: &Paths, url: String, domains: Vec<String>, current: Option<&Strategy>, gf: &GameFilter, cancel: &AtomicBool, emit: &dyn Fn(Event)) -> Verdict {
     let targets = targets(&url);
 
     emit(Event::Stage("Проверяю без обхода".into()));
     let base_checks = run_checks(&targets);
     let baseline = Trial::from("Без обхода", &base_checks);
-    let domains = if baseline.passed() {
-        emit(Event::Stage("Ищу связанные домены".into()));
-        related_domains(&url)
-    } else {
-        vec![super::discover::base_domain(&picker::host_of(&url))]
-    };
 
     let mut strategy_trial = None;
-    if let Some(s) = &current {
+    if let Some(s) = current {
         if !cancel.load(Ordering::Relaxed) {
             emit(Event::Stage(format!("Проверяю со стратегией «{}»", s.name)));
-            let checks = match strategy::extract_args(s, &paths, &gf) {
+            let checks = match strategy::extract_args(s, paths, gf) {
                 Ok(args) => measure_engine(&s.engine, &s.bin, &args, &s.name, &targets, cancel),
                 Err(_) => vec![Check::failed(); targets.len()],
             };
@@ -464,8 +506,8 @@ pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter
             techniques.push(trial);
         }
         if !techniques.iter().any(Trial::passed) {
-            let all = strategy::discover(&paths);
-            let donors: Vec<&Strategy> = picker::optimal(&paths, &all)
+            let all = strategy::discover(paths);
+            let donors: Vec<&Strategy> = picker::optimal(paths, &all)
                 .into_iter()
                 .filter_map(|i| all.get(i))
                 .filter(|s| s.engine == engine && current.as_ref().is_none_or(|c| c.path != s.path))
@@ -475,7 +517,7 @@ pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter
                     break;
                 }
                 emit(Event::Stage(format!("Профиль из стратегии {} из {}: {}", i + 1, donors.len(), s.name)));
-                let Ok(rule) = borrow_rule(&paths, s, domains.clone(), &origin_name) else { continue };
+                let Ok(rule) = borrow_rule(paths, s, domains.clone(), &origin_name) else { continue };
                 let args = format!("--wf-tcp=80,443 --wf-udp=443 {}", profiles(std::slice::from_ref(&rule), &bin));
                 let checks = measure_engine(&engine, &bin, &args, &format!("rule-from-{i}"), &targets, cancel);
                 let mut trial = Trial::from(format!("Как в «{}»", s.name), &checks);
@@ -485,21 +527,64 @@ pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter
         }
     }
 
-    picker::stop_engine(None);
-    let restore = was_running.then(service::start);
-    if !was_running && !had_divert {
-        let _ = service::unload_windivert();
+    let advice = advise(&baseline, strategy_trial.as_ref(), &techniques);
+    Verdict { url, domains, baseline, strategy: strategy_trial, techniques, advice, origin: origin_name }
+}
+
+pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
+    if !picker::curl_available() {
+        emit(Event::Failed("curl.exe не найден: он входит в Windows 10 1803 и новее".into()));
+        return;
     }
+    emit(Event::Stage("Ищу домены, с которых сайт грузит картинки и скрипты".into()));
+    let domains = site_domains(&url);
+    let paused = pause();
+    let v = inspect(&paths, url, domains, current.as_ref(), &gf, cancel, &emit);
+    let restore = resume(paused);
     if cancel.load(Ordering::Relaxed) {
         emit(Event::Failed("Проверка сайта отменена".into()));
         return;
     }
-    if let Some(Err(e)) = restore {
+    if let Some(e) = restore {
         emit(Event::Failed(format!("Проверка закончилась, но службу не удалось запустить: {e}")));
     }
-    let advice = advise(&baseline, strategy_trial.as_ref(), &techniques);
-    let origin = current.map(|s| s.name).unwrap_or_default();
-    emit(Event::Done(Verdict { url, domains, baseline, strategy: strategy_trial, techniques, advice, origin }));
+    emit(Event::Done(v));
+}
+
+pub fn find_many(paths: Paths, urls: Vec<String>, current: Option<Strategy>, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
+    if !picker::curl_available() {
+        emit(Event::Failed("curl.exe не найден: он входит в Windows 10 1803 и новее".into()));
+        return;
+    }
+    emit(Event::Stage("Ищу домены, с которых сайты грузят картинки и скрипты".into()));
+    let found: Vec<Vec<String>> = std::thread::scope(|s| {
+        let jobs: Vec<_> = urls.iter().map(|u| s.spawn(move || site_domains(u))).collect();
+        jobs.into_iter().zip(&urls).map(|(j, u)| j.join().unwrap_or_else(|_| vec![super::discover::base_domain(&picker::host_of(u))])).collect()
+    });
+    let paused = pause();
+    let n = urls.len();
+    let mut out = Vec::new();
+    for ((i, url), domains) in urls.into_iter().enumerate().zip(found) {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let host = picker::host_of(&url);
+        let tag = format!("Сайт {} из {n}, {host}", i + 1);
+        let relay = |e: Event| match e {
+            Event::Stage(s) => emit(Event::Stage(format!("{tag}: {s}"))),
+            other => emit(other),
+        };
+        out.push(inspect(&paths, url, domains, current.as_ref(), &gf, cancel, &relay));
+    }
+    let restore = resume(paused);
+    if cancel.load(Ordering::Relaxed) {
+        emit(Event::Failed("Подбор для сайтов отменён".into()));
+        return;
+    }
+    if let Some(e) = restore {
+        emit(Event::Failed(format!("Подбор закончился, но службу не удалось запустить: {e}")));
+    }
+    emit(Event::Batch(out));
 }
 
 pub fn recheck(paths: Paths, list: Vec<Rule>, current: Strategy, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
@@ -555,6 +640,47 @@ mod tests {
 
     fn rule(t: &str, d: &[&str], o: &str) -> Rule {
         Rule { technique: t.into(), domains: d.iter().map(|s| s.to_string()).collect(), origin: o.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn domains_include_cdn_and_known_service() {
+        use super::super::discover::{Found, Group};
+        let g = |base: &str, hosts: &[&str], main: bool, related: bool, third: bool| Group {
+            base: base.into(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            ips: vec![],
+            main,
+            related,
+            third_party: third,
+            cloudflare: true,
+        };
+        let found = Found {
+            final_url: "https://steamcommunity.com/market/".into(),
+            groups: vec![
+                g("steamcommunity.com", &["steamcommunity.com"], true, false, false),
+                g("steamstatic.com", &["community.cloudflare.steamstatic.com"], false, false, false),
+                g("akamaihd.net", &["steamcdn-a.akamaihd.net", "other-a.akamaihd.net"], false, false, true),
+                g("google-analytics.com", &["www.google-analytics.com"], false, false, true),
+            ],
+            assets_scanned: 3,
+        };
+        let d = pick_domains("https://steamcommunity.com/market/", Some(&found));
+        assert_eq!(d[0], "steamcommunity.com");
+        for want in ["steampowered.com", "steamstatic.com", "steamcdn-a.akamaihd.net"] {
+            assert!(d.iter().any(|x| x == want), "{want}: {d:?}");
+        }
+        assert!(!d.iter().any(|x| x.contains("google") || x == "akamaihd.net" || x == "other-a.akamaihd.net"), "{d:?}");
+        let site = Found {
+            final_url: "https://7tv.app/".into(),
+            groups: vec![
+                g("7tv.app", &["7tv.app"], true, false, false),
+                g("7tv.io", &["cdn.7tv.io"], false, true, false),
+                g("cloudflare.com", &["cdnjs.cloudflare.com"], false, false, true),
+            ],
+            assets_scanned: 1,
+        };
+        assert_eq!(pick_domains("https://7tv.app/", Some(&site)), vec!["7tv.app".to_string(), "7tv.io".to_string()]);
+        assert_eq!(pick_domains("https://www.example.org/x", None), vec!["example.org".to_string()]);
     }
 
     #[test]

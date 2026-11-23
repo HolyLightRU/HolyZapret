@@ -18,6 +18,33 @@ pub struct RulesState {
     verdict: Option<Verdict>,
     expanded: bool,
     states: Vec<(Rule, RuleState)>,
+    batch: Vec<(Verdict, bool)>,
+}
+
+fn batch_rule(v: &Verdict) -> Option<Rule> {
+    match &v.advice {
+        Advice::Use(r) => Some(r.clone()),
+        Advice::Exclude => Some(Rule { technique: rules::NONE.into(), domains: v.domains.clone(), origin: v.origin.clone(), ..Default::default() }),
+        _ => None,
+    }
+}
+
+fn batch_line(v: &Verdict) -> (String, Color32) {
+    let host = super::sites_tab::host_of(&v.url);
+    match &v.advice {
+        Advice::Fine => (format!("{host}: открывается и без обхода, правило не нужно"), Color32::from_gray(170)),
+        Advice::Works(s) => (format!("{host}: открывается со стратегией «{s}», правило не нужно"), Color32::from_gray(170)),
+        Advice::Exclude => (format!("{host}: стратегия ломает сайт, не обходить"), YELLOW),
+        Advice::Use(r) => match r.technique.strip_prefix(rules::BORROW) {
+            Some(name) => (format!("{host}: поможет профиль из «{name}»"), GREEN),
+            None => (format!("{host}: поможет приём «{}»", rules::label(&r.technique)), GREEN),
+        },
+        Advice::Nothing if host.contains("telegram") => (
+            format!("{host}: ничего не помогло, похоже на блокировку по IP. Включите «Telegram через WARP» на вкладке Telegram"),
+            RED,
+        ),
+        Advice::Nothing => (format!("{host}: ничего не помогло, похоже на блокировку по IP"), RED),
+    }
 }
 
 impl RulesState {
@@ -59,6 +86,8 @@ enum Act {
     Dismiss,
     Recheck,
     CheckSite(String),
+    ApplyBatch,
+    DismissBatch,
 }
 
 impl App {
@@ -153,6 +182,37 @@ impl App {
         });
     }
 
+    pub(super) fn check_site_rule(&mut self, ctx: &egui::Context, url: &str) {
+        self.rules.input = url.to_string();
+        self.start_rule_check(ctx);
+    }
+
+    pub(super) fn start_batch(&mut self, ctx: &egui::Context, urls: Vec<String>) {
+        if self.busy || self.rules.running() || self.warp_blocks_checks() || urls.is_empty() {
+            return;
+        }
+        if self.trial.is_some() || self.picker.running {
+            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+            return;
+        }
+        let Some(p) = self.paths.clone() else { return };
+        let current = self.rules_strategy();
+        let gf = gamefilter::load(&p);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.rules.cancel = Some(cancel.clone());
+        self.rules.stage = Some("Подготовка".into());
+        self.rules.verdict = None;
+        self.rules.batch.clear();
+        self.busy = true;
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            rules::find_many(p, urls, current, gf, &cancel, |e| {
+                let _ = tx.send(Msg::Rules(e));
+                ctx2.request_repaint();
+            });
+        });
+    }
+
     fn start_rule_check(&mut self, ctx: &egui::Context) {
         if self.busy || self.rules.running() || self.warp_blocks_checks() {
             return;
@@ -193,6 +253,15 @@ impl App {
                 self.rules.cancel = None;
                 self.busy = false;
                 self.rules.verdict = Some(v);
+                self.refresh(ctx);
+            }
+            rules::Event::Batch(list) => {
+                self.rules.stage = None;
+                self.rules.cancel = None;
+                self.busy = false;
+                let found = list.iter().filter(|v| batch_rule(v).is_some()).count();
+                self.rules.batch = list.into_iter().map(|v| (v.clone(), batch_rule(&v).is_some())).collect();
+                self.toast(ctx, if found > 0 { Lvl::Ok } else { Lvl::Info }, format!("Подбор для сайтов закончен, правил найдено: {found}"));
                 self.refresh(ctx);
             }
             rules::Event::Rechecked(list, states) => {
@@ -353,6 +422,36 @@ impl App {
                     act = Some(a);
                 }
             }
+            if !self.rules.batch.is_empty() {
+                ui.add_space(6.0);
+                let busy = self.busy;
+                egui::Frame::new()
+                    .fill(Color32::from_white_alpha(6))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new("Подбор для недоступных сайтов").strong());
+                        for (v, on) in self.rules.batch.iter_mut() {
+                            let (text, col) = batch_line(v);
+                            if batch_rule(v).is_some() {
+                                ui.checkbox(on, RichText::new(text).color(col).size(12.5));
+                            } else {
+                                ui.add(egui::Label::new(RichText::new(text).color(col).size(12.5)).wrap());
+                            }
+                        }
+                        let picked = self.rules.batch.iter().filter(|(v, on)| *on && batch_rule(v).is_some()).count();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(picked > 0 && !busy, egui::Button::new(format!("Применить отмеченные · {picked}"))).clicked() {
+                                act = Some(Act::ApplyBatch);
+                            }
+                            if ui.button("Скрыть").clicked() {
+                                act = Some(Act::DismissBatch);
+                            }
+                        });
+                    });
+            }
             if self.rules.expanded && !self.rules.list.is_empty() {
                 ui.add_space(6.0);
                 theme::row(ui, 30.0, |ui| {
@@ -441,6 +540,19 @@ impl App {
                 self.rules.input = format!("https://{site}/");
                 self.start_rule_check(ctx);
             }
+            Some(Act::ApplyBatch) => {
+                let picked: Vec<Rule> = self.rules.batch.iter().filter(|(_, on)| *on).filter_map(|(v, _)| batch_rule(v)).collect();
+                self.rules.batch.clear();
+                if let Some(p) = self.paths.clone() {
+                    let mut list = rules::load(&p);
+                    let hosts: Vec<String> = picked.iter().map(|r| r.domains.first().cloned().unwrap_or_default()).collect();
+                    for r in picked {
+                        rules::upsert(&mut list, r);
+                    }
+                    self.store_rules(ctx, &p, list, format!("Правила добавлены: {}", hosts.join(", ")));
+                }
+            }
+            Some(Act::DismissBatch) => self.rules.batch.clear(),
             None => {}
         }
     }

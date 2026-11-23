@@ -69,7 +69,13 @@ fn stat(ui: &mut egui::Ui, value: &str, caption: &str, color: Color32) {
     ui.add_space(18.0);
 }
 
-fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult) -> bool {
+enum TileAct {
+    Remove,
+    Pick,
+    Copy,
+}
+
+fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult, can_pick: bool) -> Option<TileAct> {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, TILE_H), Sense::hover());
     let hovered = ui.rect_contains_pointer(rect);
     let p = ui.painter();
@@ -87,9 +93,12 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult) -> bool {
     }
     p.text(av.center(), egui::Align2::CENTER_CENTER, letter, FontId::proportional(15.0), Color32::from_rgb(30, 18, 36));
     let x = rect.left() + 52.0;
-    let max_w = rect.right() - x - if s.custom { 34.0 } else { 10.0 };
-    let name = p.layout(host.clone(), FontId::proportional(14.0), Color32::WHITE, max_w);
-    p.with_clip_rect(rect.shrink(2.0)).galley(egui::pos2(x, rect.top() + 10.0), name, Color32::WHITE);
+    let pick_btn = !s.ok && hovered && can_pick;
+    let reserve = if pick_btn { 96.0 } else if s.custom { 34.0 } else { 10.0 };
+    let max_w = rect.right() - x - reserve;
+    let clip = egui::Rect::from_min_max(rect.min + Vec2::splat(2.0), egui::pos2(rect.right() - reserve, rect.bottom() - 2.0));
+    let name = if pick_btn { p.layout_no_wrap(host.clone(), FontId::proportional(14.0), Color32::WHITE) } else { p.layout(host.clone(), FontId::proportional(14.0), Color32::WHITE, max_w) };
+    p.with_clip_rect(clip).galley(egui::pos2(x, rect.top() + 10.0), name, Color32::WHITE);
     let (sub, col) = if s.warn() {
         (format!("{} · отказ сервера", s.detail), YELLOW)
     } else if s.ok {
@@ -97,14 +106,25 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult) -> bool {
     } else {
         (short_error(&s.detail), RED)
     };
-    p.with_clip_rect(rect.shrink(2.0)).text(
+    p.with_clip_rect(clip).text(
         egui::pos2(x, rect.bottom() - 15.0),
         egui::Align2::LEFT_CENTER,
         sub,
         FontId::proportional(12.0),
         col,
     );
-    let mut remove = false;
+    let mut act = None;
+    if pick_btn {
+        let right = if s.custom { rect.right() - 36.0 } else { rect.right() - 8.0 };
+        let b = egui::Rect::from_min_max(egui::pos2(right - 84.0, rect.center().y - 13.0), egui::pos2(right, rect.center().y + 13.0));
+        let br = ui.interact(b, ui.make_persistent_id(("site_pick", &s.url)), Sense::click());
+        let fill = if br.hovered() { CYAN.gamma_multiply(0.35) } else { CYAN.gamma_multiply(0.18) };
+        ui.painter().rect_filled(b, CornerRadius::same(7), fill);
+        ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, "Подобрать", FontId::proportional(12.5), Color32::WHITE);
+        if br.on_hover_text("Подобрать правило для этого сайта: лаунчер проверит приёмы обхода и профили других стратегий").clicked() {
+            act = Some(TileAct::Pick);
+        }
+    }
     if s.custom && hovered {
         let b = egui::Rect::from_center_size(egui::pos2(rect.right() - 18.0, rect.top() + 18.0), Vec2::splat(24.0));
         let br = ui.interact(b, ui.make_persistent_id(("site_del", &s.url)), Sense::click());
@@ -112,15 +132,26 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult) -> bool {
             ui.painter().rect_filled(b, CornerRadius::same(6), RED.gamma_multiply(0.25));
         }
         ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, theme::icon::DELETE, theme::icon_font(12.0), Color32::from_gray(210));
-        remove = br.on_hover_text("Убрать из моих сайтов").clicked();
+        if br.on_hover_text("Убрать из моих сайтов").clicked() {
+            act = Some(TileAct::Remove);
+        }
     }
     let tip = if s.warn() {
         format!("{}\n{}: соединение прошло, но сервер отказал. Это не блокировка", s.url, s.detail)
     } else {
         format!("{}\n{}", s.url, s.detail)
     };
-    resp.on_hover_text(tip);
-    remove
+    resp.on_hover_text(tip).context_menu(|ui| {
+        if ui.button("Скопировать домен").clicked() {
+            act = Some(TileAct::Copy);
+            ui.close();
+        }
+        if !s.ok && can_pick && ui.button("Подобрать правило").clicked() {
+            act = Some(TileAct::Pick);
+            ui.close();
+        }
+    });
+    act
 }
 
 impl App {
@@ -159,6 +190,10 @@ impl App {
         let mut start = false;
         let mut add = false;
         let mut remove: Option<String> = None;
+        let mut pick: Option<String> = None;
+        let mut pick_all = false;
+        let can_pick = !self.busy && !self.rules.running() && !self.sites_running && self.paths.is_some();
+        let failed: Vec<String> = self.sites.iter().filter(|s| !s.ok).map(|s| s.url.clone()).collect();
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
                 ui.label(RichText::new("Сайты").size(17.0).strong());
@@ -201,6 +236,16 @@ impl App {
                 if done > 0 {
                     let labels = vec![format!("Все · {done}"), format!("Недоступные · {fail}")];
                     theme::segmented(ui, &labels, &mut self.sites_filter);
+                    if !failed.is_empty() && !self.sites_running {
+                        ui.add_space(8.0);
+                        if ui
+                            .add_enabled(can_pick, egui::Button::new("Подобрать для недоступных"))
+                            .on_hover_text("По очереди подберёт правило для каждого недоступного сайта. Итог появится в карточке «Правила для сайтов»")
+                            .clicked()
+                        {
+                            pick_all = true;
+                        }
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Добавить").clicked() {
@@ -226,8 +271,11 @@ impl App {
                     for chunk in items.chunks(cols) {
                         ui.horizontal(|ui| {
                             for s in chunk {
-                                if tile(ui, tw, s) {
-                                    remove = Some(s.url.clone());
+                                match tile(ui, tw, s, can_pick) {
+                                    Some(TileAct::Remove) => remove = Some(s.url.clone()),
+                                    Some(TileAct::Pick) => pick = Some(s.url.clone()),
+                                    Some(TileAct::Copy) => ui.ctx().copy_text(host_of(&s.url)),
+                                    None => {}
                                 }
                             }
                         });
@@ -241,6 +289,12 @@ impl App {
         });
         if start {
             self.start_site_check(ctx);
+        }
+        if let Some(url) = pick {
+            self.check_site_rule(ctx, &url);
+        }
+        if pick_all {
+            self.start_batch(ctx, failed);
         }
         if add {
             if let Some(p) = &self.paths {
