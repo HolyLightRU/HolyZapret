@@ -94,18 +94,24 @@ jobs:
           if ($broken) { throw "В архиве испорчены имена файлов: $($broken -join ', ')" }
           $expected = (git -c core.quotepath=off ls-files | Where-Object { $_ -match '[Ѐ-ӿ]' }).Count
           if ($named -ne $expected) { throw "Файлов с русскими именами в архиве $named, в репозитории $expected" }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower()
+          $sha = "$zip.sha256"
+          [IO.File]::WriteAllText($sha, "$hash  $(Split-Path $zip -Leaf)`n")
           "zip=$zip" >> $env:GITHUB_OUTPUT
-          Get-Item $zip | Select-Object Name, Length
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Get-Item $zip, $sha | Select-Object Name, Length
+          "SHA-256: $hash"
 
       - name: Публикация релиза
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $zip = "${{ steps.pack.outputs.zip }}"
+          $sha = "${{ steps.pack.outputs.sha }}"
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG $zip --clobber
+            gh release upload $env:TAG $zip $sha --clobber
           } else {
-            gh release create $env:TAG $zip --title "HolyZapret ${{ steps.ver.outputs.version }}" --generate-notes
+            gh release create $env:TAG $zip $sha --title "HolyZapret ${{ steps.ver.outputs.version }}" --generate-notes
           }
           if ($LASTEXITCODE -ne 0) { throw "gh завершился с кодом $LASTEXITCODE" }

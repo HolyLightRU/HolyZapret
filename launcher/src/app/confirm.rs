@@ -107,7 +107,7 @@ impl App {
                 }
             });
         });
-        if answer.is_none() && modal.should_close() {
+        if answer.is_none() && super::modal_close(ctx, &modal) {
             answer = Some(false);
         }
         match answer {

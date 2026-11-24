@@ -40,6 +40,102 @@ fn bar(ui: &mut egui::Ui, frac: f32) {
     }
 }
 
+fn newer(p: &crate::core::paths::Paths, rel: &selfupdate::Release) -> bool {
+    !crate::core::TEST_BUILD && crate::core::update::local_version(p).is_some_and(|l| selfupdate::is_newer(&l, &rel.version))
+}
+
+fn engine_free(p: &crate::core::paths::Paths) -> bool {
+    let s = service::status(p);
+    let only_service = s.active_strategy().is_some() && s.foreign_engines.is_empty();
+    !s.engine_running || only_service
+}
+
+fn install_quietly(p: &crate::core::paths::Paths, rel: &selfupdate::Release, tx: &std::sync::mpsc::Sender<Msg>) -> anyhow::Result<()> {
+    let bytes = selfupdate::download(rel, None)?;
+    let paused = service::pause_ours(p);
+    let r = selfupdate::install(p, rel, &bytes);
+    if let Some(paused) = paused {
+        if let Err(e) = service::resume(p, paused) {
+            notify(tx, Lvl::Err, format!("Служба после автообновления: {e}"));
+        }
+    }
+    let sum = r?;
+    notify(tx, Lvl::Ok, format!("Автообновление: {sum}"));
+    let exe = std::env::current_exe().ok().filter(|_| sum.self_replaced);
+    match exe {
+        Some(exe) => {
+            let dir = exe.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            std::process::Command::new(&exe)
+                .args([crate::core::unpack::REOPEN_ARG, crate::core::unpack::UPDATED_ARG, crate::core::autostart::TRAY_ARG])
+                .current_dir(dir)
+                .spawn()?;
+            crate::tray::exit()
+        }
+        None => {
+            let _ = tx.send(Msg::Updated);
+            crate::tray::inform("HolyZapret обновлён", &format!("Установлена версия {}", rel.version));
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn update_loop(
+    p: crate::core::paths::Paths,
+    auto: Arc<std::sync::atomic::AtomicBool>,
+    ui_busy: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<Msg>,
+    ctx: egui::Context,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    const EVERY: Duration = Duration::from_secs(6 * 3600);
+    const IDLE: u64 = 10 * 60;
+    const RETRY: Duration = Duration::from_secs(3600);
+    let mut checked: Option<Instant> = None;
+    let mut found: Option<selfupdate::Release> = None;
+    let mut wait_until: Option<Instant> = None;
+    loop {
+        if checked.is_none_or(|t| t.elapsed() > EVERY) {
+            checked = Some(Instant::now());
+            let r = selfupdate::latest();
+            if let Ok(rel) = &r {
+                found = Some(rel.clone());
+            }
+            let _ = tx.send(Msg::Version(r.map_err(|e| e.to_string())));
+            ctx.request_repaint();
+        }
+        let fresh = found.as_ref().filter(|r| newer(&p, r));
+        if let Some(rel) = fresh {
+            if !crate::tray::window_visible() && crate::core::settings::notified_version().as_deref() != Some(rel.version.as_str()) {
+                crate::core::settings::set_notified_version(&rel.version);
+                let text = if auto.load(Ordering::Relaxed) {
+                    "Обновлю сам, когда компьютером не будут пользоваться"
+                } else {
+                    "Откройте лаунчер, чтобы обновиться"
+                };
+                crate::tray::inform(&format!("Вышла HolyZapret {}", rel.version), text);
+            }
+        }
+        let ready = fresh.is_some()
+            && auto.load(Ordering::Relaxed)
+            && !crate::tray::window_visible()
+            && !ui_busy.load(Ordering::Relaxed)
+            && wait_until.is_none_or(|t| Instant::now() >= t)
+            && crate::core::health::idle_secs() >= IDLE;
+        if let Some(rel) = fresh.filter(|_| ready).cloned() {
+            if engine_free(&p) && crate::tray::claim() {
+                if let Err(e) = install_quietly(&p, &rel, &tx) {
+                    notify(&tx, Lvl::Err, format!("Автообновление не удалось: {e}"));
+                    wait_until = Some(Instant::now() + RETRY);
+                }
+                crate::tray::release();
+                ctx.request_repaint();
+            }
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
 impl App {
     pub(super) fn open_update(&mut self) {
         self.update.open = true;
@@ -193,7 +289,7 @@ impl App {
                 }
             });
         });
-        if modal.should_close() && !self.update.running {
+        if super::modal_close(ctx, &modal) && !self.update.running {
             later = true;
         }
         if go {

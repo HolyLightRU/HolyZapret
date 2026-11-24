@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 pub const UNPACKED_ARG: &str = "--unpacked";
 pub const REOPEN_ARG: &str = "--reopened";
+pub const UPDATED_ARG: &str = "--updated";
 const LAUNCHER: &str = "HolyZapret Launcher.exe";
 
 fn lower(p: &Path) -> String {

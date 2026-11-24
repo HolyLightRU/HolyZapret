@@ -82,7 +82,7 @@ impl App {
                 }
             });
         });
-        if close || modal.should_close() {
+        if close || super::modal_close(ctx, &modal) {
             crate::core::settings::set_seen_version(&version);
             self.whats_new = None;
         }

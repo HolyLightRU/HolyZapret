@@ -1,5 +1,6 @@
 mod appcheck_ui;
 mod confirm;
+mod crash_ui;
 mod diag_tab;
 mod lists_tab;
 mod phone_tab;
@@ -290,6 +291,8 @@ pub struct App {
     game_err: Option<String>,
     diag: diag_tab::DiagState,
     check: appcheck_ui::CheckState,
+    crash: Option<String>,
+    crash_seen: bool,
     local_version: Option<String>,
     remote_version: Option<String>,
     remote_release: Option<UpdateRelease>,
@@ -307,6 +310,8 @@ pub struct App {
     watch_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     auto_pick: bool,
     auto_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    auto_update: bool,
+    auto_update_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ui_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     health_force: std::sync::Arc<std::sync::atomic::AtomicBool>,
     health_alert: Vec<String>,
@@ -373,6 +378,8 @@ impl App {
             game_err: None,
             diag: Default::default(),
             check: Default::default(),
+            crash: crate::core::crash::take(),
+            crash_seen: false,
             local_version,
             remote_version: None,
             remote_release: None,
@@ -390,6 +397,8 @@ impl App {
             watch_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.watch)),
             auto_pick: saved.auto_pick,
             auto_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.auto_pick)),
+            auto_update: saved.auto_update,
+            auto_update_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.auto_update)),
             ui_busy: Default::default(),
             health_force: Default::default(),
             health_alert: Vec::new(),
@@ -406,6 +415,9 @@ impl App {
             tx,
             rx,
         };
+        if let Some(c) = &app.crash {
+            app.log.push(Entry::new(Lvl::Err, format!("Прошлый запуск лаунчера закрылся с ошибкой: {}", crate::core::crash::headline(c))));
+        }
         if !renamed.is_empty() {
             app.log.push(Entry::new(Lvl::Ok, format!("Исправлены имена файлов, испорченные при распаковке архива: {}", renamed.join(", "))));
         }
@@ -464,7 +476,6 @@ impl App {
             });
         }
         app.refresh(&cc.egui_ctx);
-        app.check_version(&cc.egui_ctx);
         let current = env!("CARGO_PKG_VERSION");
         match settings::seen_version().or_else(|| app.wizard_done.then(|| "0".to_string())) {
             _ if crate::core::TEST_BUILD || app.paths.is_none() => {}
@@ -493,6 +504,19 @@ impl App {
             let (flag, force) = (app.watch_flag.clone(), app.health_force.clone());
             let (auto, ui_busy) = (app.auto_flag.clone(), app.ui_busy.clone());
             std::thread::spawn(move || health_loop(p, flag, force, auto, ui_busy, tx, ctx));
+        }
+        if let Some(p) = app.paths.clone() {
+            let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
+            let (auto, ui_busy) = (app.auto_update_flag.clone(), app.ui_busy.clone());
+            std::thread::spawn(move || update_ui::update_loop(p, auto, ui_busy, tx, ctx));
+        }
+        if std::env::args().any(|a| a == crate::core::unpack::UPDATED_ARG) {
+            let v = env!("CARGO_PKG_VERSION");
+            app.log.push(Entry::new(Lvl::Ok, format!("Лаунчер сам обновился до {v}")));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                crate::tray::inform("HolyZapret обновлён", &format!("Установлена версия {v}. Откройте лаунчер, чтобы посмотреть, что нового"));
+            });
         }
         if let Some(p) = app.paths.clone() {
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
@@ -737,6 +761,7 @@ impl App {
                     self.flow = d.flow;
                     self.watch = d.watch;
                     self.auto_pick = d.auto_pick;
+                    self.auto_update = d.auto_update;
                     self.health_alert.clear();
                     self.last_pick = None;
                     self.game_edit = None;
@@ -1255,6 +1280,17 @@ fn line(p: &egui::Painter, a: egui::Pos2, b: egui::Pos2) {
     p.line_segment([a, b], egui::Stroke::new(1.2, Color32::from_gray(225)));
 }
 
+const TITLE_H: f32 = 36.0;
+
+fn modal_close<T>(ctx: &egui::Context, m: &egui::ModalResponse<T>) -> bool {
+    let in_title = |p: egui::Pos2| p.y <= TITLE_H;
+    if ctx.input(|i| i.pointer.primary_pressed() && i.pointer.interact_pos().is_some_and(in_title)) && !m.response.hovered() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    let title_click = m.backdrop_response.clicked() && m.backdrop_response.interact_pointer_pos().is_some_and(in_title);
+    !title_click && m.should_close()
+}
+
 fn title_bar(ui: &mut egui::Ui, ctx: &egui::Context, sidebar_open: &mut bool, version: &str) {
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     let full = ui.available_rect_before_wrap();
@@ -1426,7 +1462,7 @@ impl eframe::App for App {
         theme::backdrop(&ctx.layer_painter(egui::LayerId::background()), ctx.content_rect());
 
         egui::Panel::top("title")
-            .exact_size(36.0)
+            .exact_size(TITLE_H)
             .frame(Frame::new().fill(Color32::from_black_alpha(30)))
             .show(ui, |ui| {
                 let mut version = self.local_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
@@ -1487,6 +1523,7 @@ impl eframe::App for App {
         self.draw_unpack(&ctx);
         self.draw_share(&ctx);
         self.draw_update(&ctx);
+        self.draw_crash(&ctx);
         self.report_dialog(&ctx);
         if self.confirm.is_none() && self.tab != Tab::Wizard && self.unpack.is_none() {
             self.draw_whats_new(&ctx);
@@ -1500,12 +1537,14 @@ impl eframe::App for App {
             flow: self.flow,
             watch: self.watch,
             auto_pick: self.auto_pick,
+            auto_update: self.auto_update,
         };
         if now != self.saved {
             settings::save(&now);
             self.saved = now;
             self.watch_flag.store(self.watch, std::sync::atomic::Ordering::Relaxed);
             self.auto_flag.store(self.auto_pick, std::sync::atomic::Ordering::Relaxed);
+            self.auto_update_flag.store(self.auto_update, std::sync::atomic::Ordering::Relaxed);
             if !self.watch {
                 self.health_alert.clear();
             }

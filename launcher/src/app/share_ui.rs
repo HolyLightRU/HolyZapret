@@ -232,7 +232,7 @@ impl App {
                 }
             }
         });
-        if modal.should_close() {
+        if super::modal_close(ctx, &modal) {
             close = true;
         }
         if check {

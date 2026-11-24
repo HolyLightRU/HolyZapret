@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(180);
 const SKIP: [&str; 3] = ["HolyZapret.exe", "winws.exe", "holyzapret-launcher.exe"];
+const SYSTEM: [&str; 16] = [
+    "[System Process]", "System", "Registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "svchost.exe",
+    "fontdrvhost.exe", "dwm.exe", "conhost.exe", "Memory Compression", "sihost.exe", "dllhost.exe",
+];
 
 #[derive(Default)]
 pub struct CheckState {
@@ -25,6 +29,9 @@ pub struct CheckState {
     names: HashMap<u32, String>,
     names_at: Option<Instant>,
     picked: Option<String>,
+    running_list: Vec<String>,
+    running_at: Option<Instant>,
+    filter: String,
     target: Option<Target>,
     cache: Cache,
     judged: HashMap<Flow, (Verdict, Verdict)>,
@@ -163,11 +170,22 @@ impl App {
             self.check.names.extend(crate::core::procs::names());
             self.check.names_at = Some(Instant::now());
         }
+        if self.check.running_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            let mut v: Vec<String> = crate::core::procs::names()
+                .into_values()
+                .filter(|n| !SKIP.iter().chain(SYSTEM.iter()).any(|s| s.eq_ignore_ascii_case(n)))
+                .collect();
+            v.sort_by_key(|n| n.to_lowercase());
+            v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            self.check.running_list = v;
+            self.check.running_at = Some(Instant::now());
+        }
         let seen = self.check.seen.lock().unwrap().clone();
         let apps = appcheck::group(&seen, &self.check.names, &SKIP);
-        if self.check.picked.as_ref().is_none_or(|p| !apps.iter().any(|a| a.name.eq_ignore_ascii_case(p))) {
-            self.check.picked = apps.first().map(|a| a.name.clone());
-        }
+        let shown = match &self.check.picked {
+            Some(p) => apps.iter().find(|a| a.name.eq_ignore_ascii_case(p)),
+            None => apps.first(),
+        };
         let error = self.check.error.lock().unwrap().clone();
         let mut act = None;
         theme::card(ui, |ui| {
@@ -191,10 +209,56 @@ impl App {
             });
             ui.add(
                 egui::Label::new(muted(
-                    "Нажмите «Начать», запустите программу и сделайте то, что не работает: зайдите в матч, позвоните, откройте видео. Лаунчер запишет, куда она подключается, и покажет, трогает ли этот трафик обход. Заблокирована ли сама программа, проверка сказать не может.",
+                    "Выберите программу, нажмите «Начать» и сделайте в ней то, что не работает: зайдите в матч, позвоните, откройте видео. Если программа ещё не запущена, оставьте «Любая программа» и запустите её после «Начать». Лаунчер запишет, куда она подключается, и покажет, трогает ли этот трафик обход. Заблокирована ли сама программа, проверка сказать не может.",
                 ))
                 .wrap(),
             );
+            ui.add_space(4.0);
+            theme::row(ui, 34.0, |ui| {
+                ui.label(RichText::new("Программа").color(Color32::from_gray(170)));
+                ui.add_space(6.0);
+                let count = |name: &str| apps.iter().find(|a| a.name.eq_ignore_ascii_case(name)).map(|a| a.flows.len());
+                let label = match &self.check.picked {
+                    Some(p) => match count(p) {
+                        Some(n) => format!("{p} · {n}"),
+                        None => p.clone(),
+                    },
+                    None => "Любая программа".to_string(),
+                };
+                egui::ComboBox::from_id_salt("appcheck_pick").selected_text(label).width(300.0).height(360.0).show_ui(ui, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.check.filter).hint_text("Поиск по имени").desired_width(f32::INFINITY));
+                    let f = self.check.filter.trim().to_lowercase();
+                    let fits = |n: &str| f.is_empty() || n.to_lowercase().contains(&f);
+                    if ui.selectable_label(self.check.picked.is_none(), "Любая программа").clicked() {
+                        self.check.picked = None;
+                    }
+                    let mut pick = None;
+                    let on = |n: &str| self.check.picked.as_ref().is_some_and(|p| p.eq_ignore_ascii_case(n));
+                    let found: Vec<&appcheck::App> = apps.iter().filter(|a| fits(&a.name)).collect();
+                    if !found.is_empty() {
+                        ui.separator();
+                        ui.label(muted("Уже подключались"));
+                        for a in found {
+                            if ui.selectable_label(on(&a.name), format!("{} · {}", a.name, a.flows.len())).clicked() {
+                                pick = Some(a.name.clone());
+                            }
+                        }
+                    }
+                    let rest: Vec<&String> = self.check.running_list.iter().filter(|n| fits(n) && count(n).is_none()).collect();
+                    if !rest.is_empty() {
+                        ui.separator();
+                        ui.label(muted("Запущены"));
+                        for n in rest {
+                            if ui.selectable_label(on(n), n.as_str()).clicked() {
+                                pick = Some(n.clone());
+                            }
+                        }
+                    }
+                    if let Some(p) = pick {
+                        self.check.picked = Some(p);
+                    }
+                });
+            });
             if let Some(e) = &error {
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(RichText::new(format!("Не удалось слушать соединения: {e}")).color(RED).size(13.0)).wrap());
@@ -217,24 +281,23 @@ impl App {
                 _ => {}
             }
         });
-        if !apps.is_empty() {
+        if let (Some(p), None) = (&self.check.picked, shown) {
+            if running || !seen.is_empty() {
+                ui.add_space(10.0);
+                theme::card(ui, |ui| {
+                    let text = if running {
+                        format!("От {p} пока нет соединений. Сделайте в программе то, что не работает, и они появятся здесь")
+                    } else {
+                        format!("От {p} соединений не было. Нажмите «Начать заново» и сделайте в программе то, что не работает")
+                    };
+                    ui.add(egui::Label::new(muted(text)).wrap());
+                });
+            }
+        }
+        if let Some(app) = shown {
             ui.add_space(10.0);
             theme::card(ui, |ui| {
-                theme::row(ui, 34.0, |ui| {
-                    ui.label(RichText::new("Программа").color(Color32::from_gray(170)));
-                    ui.add_space(6.0);
-                    let current = self.check.picked.clone().unwrap_or_default();
-                    let label = apps.iter().find(|a| a.name.eq_ignore_ascii_case(&current)).map(|a| format!("{} · {}", a.name, a.flows.len())).unwrap_or_default();
-                    egui::ComboBox::from_id_salt("appcheck_pick").selected_text(label).width(260.0).show_ui(ui, |ui| {
-                        for a in &apps {
-                            let on = a.name.eq_ignore_ascii_case(&current);
-                            if ui.selectable_label(on, format!("{} · {}", a.name, a.flows.len())).clicked() {
-                                self.check.picked = Some(a.name.clone());
-                            }
-                        }
-                    });
-                });
-                let Some(app) = apps.iter().find(|a| self.check.picked.as_ref().is_some_and(|p| a.name.eq_ignore_ascii_case(p))) else { return };
+                ui.label(RichText::new(&app.name).size(15.5).strong());
                 let judged: Vec<Judged> = match &self.check.target {
                     Some(t) => app
                         .flows

@@ -16,6 +16,7 @@ const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
 pub struct Release {
     pub version: String,
     pub zip_url: String,
+    pub sha_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -78,15 +79,16 @@ pub fn parse_release(json: &str) -> anyhow::Result<Release> {
             let name = a["name"].as_str().unwrap_or(url.rsplit('/').next().unwrap_or(url));
             Some((name.to_lowercase(), url.to_string()))
         })
-        .filter(|(name, _)| name.ends_with(".zip"))
         .collect();
-    let zip_url = assets
+    let zips: Vec<&(String, String)> = assets.iter().filter(|(name, _)| name.ends_with(".zip")).collect();
+    let (zip_name, zip_url) = zips
         .iter()
         .find(|(name, _)| name.starts_with("holy-zapret"))
-        .or_else(|| assets.first())
-        .map(|(_, url)| url.clone())
+        .or_else(|| zips.first())
+        .map(|(n, url)| (n.clone(), url.clone()))
         .ok_or_else(|| anyhow::anyhow!("в релизе {version} нет zip-архива"))?;
-    Ok(Release { version, zip_url })
+    let sha_url = assets.iter().find(|(name, _)| *name == format!("{zip_name}.sha256")).map(|(_, url)| url.clone());
+    Ok(Release { version, zip_url, sha_url })
 }
 
 pub fn latest() -> anyhow::Result<Release> {
@@ -339,8 +341,29 @@ fn ensure_stopped() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn check_sha(bytes: &[u8], listed: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    let want = listed
+        .split_whitespace()
+        .next()
+        .map(|h| h.trim_start_matches('\u{feff}').to_ascii_lowercase())
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("файл с хешем архива испорчен"))?;
+    let got: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    if got != want {
+        anyhow::bail!("архив скачался повреждённым или был подменён: хеш не совпадает. Попробуйте ещё раз позже");
+    }
+    Ok(())
+}
+
 pub fn download(rel: &Release, progress: Option<&super::fetch::Progress>) -> anyhow::Result<Vec<u8>> {
-    super::fetch::download(&rel.zip_url, MAX_DOWNLOAD, progress)
+    let Some(sha_url) = &rel.sha_url else {
+        anyhow::bail!("в релизе {} нет файла с хешем архива, обновитесь вручную с GitHub", rel.version);
+    };
+    let listed = String::from_utf8_lossy(&super::fetch::download(sha_url, 4096, None)?).to_string();
+    let bytes = super::fetch::download(&rel.zip_url, MAX_DOWNLOAD, progress)?;
+    check_sha(&bytes, &listed)?;
+    Ok(bytes)
 }
 
 pub fn install(paths: &Paths, rel: &Release, bytes: &[u8]) -> anyhow::Result<Summary> {
@@ -412,12 +435,19 @@ mod tests {
         let json = r#"{"tag_name":"v2.0.2","assets":[
             {"name":"notes.txt","browser_download_url":"https://x/notes.txt"},
             {"name":"other.zip","browser_download_url":"https://x/other.zip"},
-            {"name":"Holy-Zapret-2.0.2.zip","browser_download_url":"https://x/Holy-Zapret-2.0.2.zip"}]}"#;
+            {"name":"Holy-Zapret-2.0.2.zip","browser_download_url":"https://x/Holy-Zapret-2.0.2.zip"},
+            {"name":"Holy-Zapret-2.0.2.zip.sha256","browser_download_url":"https://x/Holy-Zapret-2.0.2.zip.sha256"}]}"#;
         let r = parse_release(json).unwrap();
         assert_eq!(r.version, "2.0.2");
         assert_eq!(r.zip_url, "https://x/Holy-Zapret-2.0.2.zip");
+        assert_eq!(r.sha_url.as_deref(), Some("https://x/Holy-Zapret-2.0.2.zip.sha256"));
+        let hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(check_sha(b"hello", &format!("{hello}  Holy-Zapret.zip\r\n")).is_ok());
+        assert!(check_sha(b"hello", &format!("\u{feff}{}", hello.to_uppercase())).is_ok());
+        assert!(check_sha(b"hellO", hello).is_err());
+        assert!(check_sha(b"hello", "abc").is_err());
         let r = parse_release(r#"{"tag_name":"2.1","assets":[{"browser_download_url":"https://x/a.zip"}]}"#).unwrap();
-        assert_eq!((r.version.as_str(), r.zip_url.as_str()), ("2.1", "https://x/a.zip"));
+        assert_eq!((r.version.as_str(), r.zip_url.as_str(), r.sha_url.as_deref()), ("2.1", "https://x/a.zip", None));
         assert!(parse_release(r#"{"tag_name":"v1","assets":[]}"#).is_err());
         assert!(parse_release(r#"{"message":"Not Found"}"#).is_err());
         assert!(parse_release("not json").is_err());

@@ -131,6 +131,13 @@ impl App {
         }
     }
 
+    pub(super) fn auto_update_row(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.auto_update;
+        if setting_row(ui, &mut on, true, "Обновлять самому", "Когда лаунчер в трее и 10 минут никто не трогает компьютер, поставит новую версию") {
+            self.auto_update = on;
+        }
+    }
+
     pub(super) fn delete_old_folder(&mut self, ctx: &egui::Context) {
         let Some(old) = self.old_folder.take() else { return };
         self.spawn(ctx, move |p, tx| match crate::core::relocate::remove_old(&old, &p.root) {
@@ -333,6 +340,7 @@ impl App {
                 self.close_to_tray = tray;
             }
             self.autostart_row(ui, ctx);
+            self.auto_update_row(ui);
             let mut watch = self.watch;
             if setting_row(ui, &mut watch, true, "Следить за работой обхода", "Раз в 20 минут проверяет YouTube и Discord и сообщает, если обход перестал работать") {
                 self.watch = watch;

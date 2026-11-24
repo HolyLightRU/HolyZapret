@@ -12,11 +12,12 @@ pub struct Settings {
     pub flow: bool,
     pub watch: bool,
     pub auto_pick: bool,
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { advanced: true, close_to_tray: true, sidebar_open: false, wizard_done: false, flow: true, watch: true, auto_pick: false }
+        Self { advanced: true, close_to_tray: true, sidebar_open: false, wizard_done: false, flow: true, watch: true, auto_pick: false, auto_update: false }
     }
 }
 
@@ -35,6 +36,7 @@ pub fn load() -> Settings {
             flow: read(&k, "Flow", d.flow),
             watch: read(&k, "Watch", d.watch),
             auto_pick: read(&k, "AutoPick", d.auto_pick),
+            auto_update: read(&k, "AutoUpdate", d.auto_update),
         },
         Err(_) => d,
     }
@@ -69,6 +71,20 @@ pub fn seen_version() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+pub fn notified_version() -> Option<String> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("NotifiedVersion").ok())
+        .filter(|v| !v.is_empty())
+}
+
+pub fn set_notified_version(v: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("NotifiedVersion", &v);
+    }
+}
+
 pub fn set_seen_version(v: &str) {
     if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
         let _ = k.set_value("SeenVersion", &v);
@@ -90,5 +106,6 @@ pub fn save(s: &Settings) {
         let _ = k.set_value("Flow", &(s.flow as u32));
         let _ = k.set_value("Watch", &(s.watch as u32));
         let _ = k.set_value("AutoPick", &(s.auto_pick as u32));
+        let _ = k.set_value("AutoUpdate", &(s.auto_update as u32));
     }
 }

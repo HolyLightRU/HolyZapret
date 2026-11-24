@@ -110,8 +110,16 @@ pub fn window_visible() -> bool {
 }
 
 pub fn notify(title: &str, text: &str) {
+    balloon(title, text, windows_sys::Win32::UI::Shell::NIIF_WARNING);
+}
+
+pub fn inform(title: &str, text: &str) {
+    balloon(title, text, windows_sys::Win32::UI::Shell::NIIF_INFO);
+}
+
+fn balloon(title: &str, text: &str, kind: u32) {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
+    use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_INFO, NIF_TIP, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
     use windows_sys::Win32::UI::WindowsAndMessaging::LoadIconW;
     let h = HWND.load(Ordering::Relaxed);
     if h == 0 {
@@ -130,7 +138,7 @@ pub fn notify(title: &str, text: &str) {
         nid.uID = NOTICE_ID;
         nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
         nid.hIcon = LoadIconW(GetModuleHandleW(std::ptr::null()), 1usize as _);
-        nid.dwInfoFlags = NIIF_WARNING;
+        nid.dwInfoFlags = kind;
         fill(&mut nid.szTip, "HolyZapret");
         fill(&mut nid.szInfoTitle, title);
         fill(&mut nid.szInfo, text);

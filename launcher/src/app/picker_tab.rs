@@ -698,7 +698,7 @@ impl App {
                 }
             });
         });
-        if answer.is_none() && modal.should_close() {
+        if answer.is_none() && super::modal_close(ctx, &modal) {
             answer = Some(false);
         }
         match answer {
@@ -819,7 +819,11 @@ impl App {
             .iter()
             .map(|s| if s.ok { format!("{}: открывается, {} мс, {}", s.url, s.ms, s.detail) } else { format!("{}: НЕ открывается, {}", s.url, s.detail) })
             .collect();
-        vec![("Состояние".into(), state), ("Правила для сайтов".into(), rules), ("Проверка сайтов".into(), sites)]
+        let mut out = vec![("Состояние".into(), state), ("Правила для сайтов".into(), rules), ("Проверка сайтов".into(), sites)];
+        if let Some(c) = &self.crash {
+            out.push(("Падение лаунчера в прошлый раз".into(), c.lines().map(String::from).collect()));
+        }
+        out
     }
 
     pub(super) fn repick(&mut self, ctx: &egui::Context) {

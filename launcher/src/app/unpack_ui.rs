@@ -91,7 +91,7 @@ impl App {
             .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(28)))
             .corner_radius(CornerRadius::same(14))
             .inner_margin(egui::Margin::same(20));
-        egui::Modal::new(egui::Id::NULL.with("unpack")).frame(frame).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::NULL.with("unpack")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.label(RichText::new("HolyZapret запущен прямо из архива").size(17.0).strong());
             ui.add_space(4.0);
@@ -165,6 +165,7 @@ impl App {
                 }
             });
         });
+        super::modal_close(ctx, &modal);
         if let Some(exe) = open {
             let dir = exe.parent().map(PathBuf::from).unwrap_or_default();
             match std::process::Command::new(&exe).arg(unpack::REOPEN_ARG).current_dir(dir).spawn() {

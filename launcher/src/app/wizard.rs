@@ -201,6 +201,7 @@ impl App {
             ui.label(RichText::new("Служба запускается вместе с Windows. Лаунчер можно тоже запускать, чтобы видеть статус в трее:").weak());
             ui.add_space(6.0);
             self.autostart_row(ui, ctx);
+            self.auto_update_row(ui);
             return;
         }
         ui.label(RichText::new(format!("Установим службу со стратегией «{}». Она будет запускаться вместе с Windows.", s.name)).color(Color32::from_gray(185)));

@@ -9,6 +9,7 @@ mod tray;
 mod window;
 
 fn main() -> eframe::Result {
+    core::crash::install();
     let moved = std::env::args().any(|a| a == core::relocate::MOVED_ARG || a == core::unpack::UNPACKED_ARG || a == core::unpack::REOPEN_ARG);
     let mut owned = instance::acquire();
     for _ in 0..if moved { 50 } else { 0 } {

@@ -2,6 +2,7 @@ pub mod appcheck;
 pub mod autostart;
 pub mod checks;
 pub mod coverage;
+pub mod crash;
 pub mod diagnostics;
 pub mod discover;
 pub mod fetch;
