@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/bab61ef8-a131-4b42-aae5-5af89f0e8631" width="225" height="125" alt="Лого HolyZapret"/>
+  <img src="docs/logo.png" width="225" height="125" alt="Лого HolyZapret"/>
 </div>
 <h1 align="center">HolyZapret</h1>
 Набор инструментов и экспериментов для обхода интернет-цензуры и ограничений, основанный на оригинальном проекте Zapret. Управляется удобным лаунчером: всё в одном окне, без консоли.
