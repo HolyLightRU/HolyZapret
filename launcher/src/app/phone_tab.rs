@@ -1,4 +1,5 @@
 use super::App;
+use crate::core::lanproxy::diag::{self, Finding, Fix, Level};
 use crate::core::lanproxy::{control, page};
 use crate::core::tgproxy::control::human;
 use crate::log::Lvl;
@@ -12,6 +13,41 @@ pub struct PhoneState {
     qr_mode: usize,
     net: std::sync::Arc<std::sync::Mutex<Option<control::NetProfile>>>,
     net_at: Option<std::time::Instant>,
+    diag: std::sync::Arc<std::sync::Mutex<Option<Vec<Finding>>>>,
+    diag_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn fix_label(f: &Fix) -> &'static str {
+    match f {
+        Fix::MakePrivate(_) => "Сделать частной",
+        Fix::RemoveBlocks(_) => "Удалить правила",
+        Fix::AddRule => "Добавить правило",
+    }
+}
+
+fn finding_row(ui: &mut egui::Ui, f: &Finding, enabled: bool) -> bool {
+    let col = match f.level {
+        Level::Ok => GREEN,
+        Level::Info => Color32::from_gray(160),
+        Level::Warn => YELLOW,
+        Level::Bad => RED,
+    };
+    let mut clicked = false;
+    theme::row(ui, 30.0, |ui| {
+        ui.label(RichText::new("●").color(col).size(13.0));
+        ui.label(RichText::new(&f.title).color(Color32::from_gray(225)));
+        if let Some(fix) = &f.fix {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                clicked = ui.add_enabled(enabled, egui::Button::new(fix_label(fix))).clicked();
+            });
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        ui.add(egui::Label::new(muted(&f.text)).wrap());
+    });
+    ui.add_space(6.0);
+    clicked
 }
 
 fn alert(ui: &mut egui::Ui, color: Color32, text: &str, button: Option<&str>) -> bool {
@@ -69,6 +105,7 @@ enum Act {
     Copy(String, &'static str),
     Port,
     MakePrivate(u32),
+    Diag(Option<Fix>),
 }
 
 impl App {
@@ -212,6 +249,39 @@ impl App {
                     }
                 });
             });
+            if snap.is_some() {
+                ui.add_space(10.0);
+                let running = self.phone.diag_running.load(std::sync::atomic::Ordering::Relaxed);
+                let found = self.phone.diag.lock().unwrap().clone();
+                theme::card(ui, |ui| {
+                    theme::row(ui, 32.0, |ui| {
+                        ui.label(RichText::new(theme::icon::DIAGNOSTIC).font(theme::icon_font(17.0)).color(CYAN));
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("Телефон не подключается?").size(15.5).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if running {
+                                ui.spinner();
+                            } else if ui.add_enabled(!self.busy, egui::Button::new(if found.is_some() { "Проверить ещё раз" } else { "Проверить" })).clicked() {
+                                act = Some(Act::Diag(None));
+                            }
+                        });
+                    });
+                    ui.add(
+                        egui::Label::new(muted(
+                            "Лаунчер проверит, отвечает ли раздача, тип сети, брандмауэр Windows, антивирус и VPN, и подскажет, что мешает телефону. Проверка занимает несколько секунд.",
+                        ))
+                        .wrap(),
+                    );
+                    if let Some(list) = &found {
+                        ui.add_space(6.0);
+                        for item in list {
+                            if finding_row(ui, item, !running && !self.busy) {
+                                act = Some(Act::Diag(item.fix.clone()));
+                            }
+                        }
+                    }
+                });
+            }
             ui.add_space(10.0);
             theme::card(ui, |ui| {
                 theme::row(ui, 32.0, |ui| {
@@ -254,6 +324,28 @@ impl App {
                 },
                 None => self.toast(ctx, Lvl::Err, "Порт должен быть числом от 1024 до 65535"),
             },
+            Some(Act::Diag(fix)) => {
+                let flag = self.phone.diag_running.clone();
+                if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let out = self.phone.diag.clone();
+                    let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+                    if fix.is_some() {
+                        self.phone.net_at = None;
+                    }
+                    std::thread::spawn(move || {
+                        if let Some(f) = fix {
+                            match diag::apply(&f) {
+                                Ok(m) => super::notify(&tx, Lvl::Ok, m),
+                                Err(e) => super::notify(&tx, Lvl::Err, format!("Не получилось: {e}")),
+                            }
+                        }
+                        let r = diag::run();
+                        *out.lock().unwrap() = Some(r);
+                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        ctx2.request_repaint();
+                    });
+                }
+            }
             Some(Act::MakePrivate(index)) => {
                 let net = self.phone.net.clone();
                 self.spawn(ctx, move |_, tx| match control::make_private(index) {

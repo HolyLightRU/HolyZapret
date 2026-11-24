@@ -11,11 +11,12 @@ pub struct Settings {
     pub wizard_done: bool,
     pub flow: bool,
     pub watch: bool,
+    pub auto_pick: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { advanced: true, close_to_tray: true, sidebar_open: false, wizard_done: false, flow: true, watch: true }
+        Self { advanced: true, close_to_tray: true, sidebar_open: false, wizard_done: false, flow: true, watch: true, auto_pick: false }
     }
 }
 
@@ -33,6 +34,7 @@ pub fn load() -> Settings {
             wizard_done: read(&k, "WizardDone", d.wizard_done),
             flow: read(&k, "Flow", d.flow),
             watch: read(&k, "Watch", d.watch),
+            auto_pick: read(&k, "AutoPick", d.auto_pick),
         },
         Err(_) => d,
     }
@@ -87,5 +89,6 @@ pub fn save(s: &Settings) {
         let _ = k.set_value("WizardDone", &(s.wizard_done as u32));
         let _ = k.set_value("Flow", &(s.flow as u32));
         let _ = k.set_value("Watch", &(s.watch as u32));
+        let _ = k.set_value("AutoPick", &(s.auto_pick as u32));
     }
 }

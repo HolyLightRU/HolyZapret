@@ -47,3 +47,4 @@ betterttv.net
 pulsesync.dev
 ru-node-1.pulsesync.dev
 worker.pulsesync.dev
+githubusercontent.com

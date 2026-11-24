@@ -88,7 +88,7 @@ pub fn find_zip(hint: Option<&str>) -> Option<PathBuf> {
 pub fn install(zip: Option<&Path>, target: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let bytes = match zip {
         Some(p) => fs::read(p)?,
-        None => super::selfupdate::download(&super::selfupdate::latest()?)?,
+        None => super::selfupdate::download(&super::selfupdate::latest()?, None)?,
     };
     let r = unpack_to(&bytes, target);
     if r.is_err() {

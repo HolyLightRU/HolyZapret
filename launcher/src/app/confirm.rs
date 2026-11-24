@@ -10,7 +10,6 @@ pub enum Confirm {
     PowerOff,
     RemoveService,
     RemoveFlowseal,
-    Update,
     WarpWithoutZapret,
     ResetAll,
     MoveFolder,
@@ -38,11 +37,6 @@ impl App {
                 "Подключить WARP без защиты?",
                 "Защита HolyZapret выключена. Без неё в России WARP обычно не может подключиться. Лучше сначала включить защиту кнопкой старта.",
                 "Подключить",
-            ),
-            Confirm::Update => (
-                "Обновить HolyZapret?",
-                "Скачаю последний релиз с GitHub и заменю стратегии, списки и бинарники. Свои списки, игровой фильтр, папка flowseal и launcher не трогаются.",
-                "Обновить",
             ),
             Confirm::ResetAll => (
                 "Сбросить настройки и списки?",
@@ -124,7 +118,6 @@ impl App {
                         self.spawn(ctx, |_, tx| notify(tx, Lvl::Ok, service::remove()));
                     }
                     Confirm::RemoveFlowseal => self.flowseal_action(ctx, false),
-                    Confirm::Update => self.run_update(ctx),
                     Confirm::WarpWithoutZapret => self.warp_do(ctx, WarpAction::Connect),
                     Confirm::ResetAll => self.reset_all(ctx),
                     Confirm::MoveFolder => self.move_folder(ctx),

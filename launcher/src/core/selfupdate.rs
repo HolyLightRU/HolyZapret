@@ -36,7 +36,7 @@ impl fmt::Display for Summary {
             self.version, self.updated, self.added, self.unchanged, self.preserved
         )?;
         if self.self_replaced {
-            write!(f, ". Лаунчер обновлён, перезапустите его")?;
+            write!(f, ". Лаунчер обновлён и сейчас перезапустится")?;
         }
         Ok(())
     }
@@ -90,12 +90,9 @@ pub fn parse_release(json: &str) -> anyhow::Result<Release> {
 }
 
 pub fn latest() -> anyhow::Result<Release> {
-    let json = agent(15)
-        .get(API)
-        .header("Accept", "application/vnd.github+json")
-        .call()?
-        .body_mut()
-        .read_to_string()?;
+    let json = super::fetch::with_retry(3, || {
+        Ok(agent(30).get(API).header("Accept", "application/vnd.github+json").call()?.body_mut().read_to_string()?)
+    })?;
     parse_release(&json)
 }
 
@@ -342,8 +339,8 @@ fn ensure_stopped() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn download(rel: &Release) -> anyhow::Result<Vec<u8>> {
-    Ok(agent(300).get(&rel.zip_url).call()?.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec()?)
+pub fn download(rel: &Release, progress: Option<&super::fetch::Progress>) -> anyhow::Result<Vec<u8>> {
+    super::fetch::download(&rel.zip_url, MAX_DOWNLOAD, progress)
 }
 
 pub fn install(paths: &Paths, rel: &Release, bytes: &[u8]) -> anyhow::Result<Summary> {
@@ -425,7 +422,7 @@ mod tests {
         assert!(parse_release(r#"{"message":"Not Found"}"#).is_err());
         assert!(parse_release("not json").is_err());
         let _: fn() -> anyhow::Result<Release> = latest;
-        let _: fn(&Release) -> anyhow::Result<Vec<u8>> = download;
+        let _: fn(&Release, Option<&super::super::fetch::Progress>) -> anyhow::Result<Vec<u8>> = download;
         let _: fn(&Paths, &Release, &[u8]) -> anyhow::Result<Summary> = install;
     }
 

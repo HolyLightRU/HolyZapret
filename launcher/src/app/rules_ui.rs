@@ -91,7 +91,7 @@ enum Act {
 }
 
 impl App {
-    fn rules_strategy(&self) -> Option<Strategy> {
+    pub(super) fn rules_strategy(&self) -> Option<Strategy> {
         let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
         match installed {
             Some(id) => self.strategies.iter().find(|s| s.matches(&id)).cloned(),

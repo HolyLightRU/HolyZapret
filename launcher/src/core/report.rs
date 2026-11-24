@@ -18,6 +18,8 @@ pub struct Input<'a> {
     pub problem: String,
     pub unreachable: Vec<bool>,
     pub diag: &'a [Finding],
+    pub sections: Vec<(String, Vec<String>)>,
+    pub log: Vec<String>,
 }
 
 fn kind(k: CheckKind) -> &'static str {
@@ -92,7 +94,7 @@ fn outcome_block(out: &mut String, place: Option<usize>, o: &Outcome, input: &In
 
 pub fn build(input: &Input) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "Отчёт подбора HolyZapret");
+    let _ = writeln!(out, "Отчёт HolyZapret");
     let _ = writeln!(out, "Дата: {}", input.when);
     let build = if super::TEST_BUILD { ", тестовая сборка" } else { "" };
     let _ = writeln!(out, "HolyZapret: {} (лаунчер {}{build})", input.version, input.launcher);
@@ -103,7 +105,7 @@ pub fn build(input: &Input) -> String {
     let or_blank = |s: &str| if s.trim().is_empty() { "(впишите сами)".to_string() } else { s.trim().to_string() };
     let _ = writeln!(out, "Провайдер: {}", or_blank(&input.isp));
     let _ = writeln!(out, "Город: {}", or_blank(&input.city));
-    let _ = writeln!(out, "Что не работает, хотя подбор зелёный (голос Discord, игры, видео): {}", or_blank(&input.problem.replace(['\r', '\n'], " ")));
+    let _ = writeln!(out, "Что не работает (голос Discord, игры, видео, сайты): {}", or_blank(&input.problem.replace(['\r', '\n'], " ")));
     if !input.noisy.is_empty() {
         let _ = writeln!(out, "Не учитывались при выборе лучшей (случайный успех): {}", input.noisy.join(", "));
     }
@@ -116,6 +118,18 @@ pub fn build(input: &Input) -> String {
         .collect();
     if !dead.is_empty() {
         let _ = writeln!(out, "Недоступны и без обхода, и со всеми стратегиями (похоже на блокировку по IP): {}", dead.join(", "));
+    }
+    for (title, lines) in &input.sections {
+        let _ = writeln!(out, "\n== {title} ==");
+        if lines.is_empty() {
+            let _ = writeln!(out, "нет");
+        }
+        for l in lines {
+            let _ = writeln!(out, "{l}");
+        }
+    }
+    if input.ordered.is_empty() {
+        let _ = writeln!(out, "\n== Подбор ==\nв этом запуске лаунчера не запускался");
     }
     let mut place = 0;
     for o in &input.ordered {
@@ -137,6 +151,12 @@ pub fn build(input: &Input) -> String {
             Level::Bad => "ERR",
         };
         let _ = writeln!(out, "{mark} {}", f.title);
+    }
+    if !input.log.is_empty() {
+        let _ = writeln!(out, "\n== Журнал, последние записи ==");
+        for l in &input.log {
+            let _ = writeln!(out, "{l}");
+        }
     }
     out
 }
@@ -204,12 +224,19 @@ mod tests {
             problem: "голос\nDiscord".into(),
             unreachable: vec![false, true],
             diag: &[],
+            sections: vec![("Состояние".into(), vec!["Служба: работает, стратегия general".into()]), ("Правила для сайтов".into(), vec![])],
+            log: vec!["10:00 [ОК] Служба установлена".into()],
         };
         let r = build(&input);
         assert!(r.contains("== Без обхода: 0/2"));
         assert!(r.contains("(случайный успех): Хостинги / CDN77"));
         assert!(r.contains("Провайдер: Ростелеком\nГород: (впишите сами)\n"));
-        assert!(r.contains("(голос Discord, игры, видео): голос Discord\n"));
+        assert!(r.contains("(голос Discord, игры, видео, сайты): голос Discord\n"));
+        assert!(r.contains("\n== Состояние ==\nСлужба: работает, стратегия general\n"));
+        assert!(r.contains("\n== Правила для сайтов ==\nнет\n"));
+        assert!(r.ends_with("== Журнал, последние записи ==\n10:00 [ОК] Служба установлена\n"));
+        let empty = Input { ordered: vec![], ..input };
+        assert!(build(&empty).contains("== Подбор ==\nв этом запуске лаунчера не запускался"));
         assert!(r.contains("(похоже на блокировку по IP): Discord / DiscordMain (TLS 1.3)"));
         assert!(r.contains("Discord / DiscordMain (TLS 1.3): ошибка TLS, недоступно везде"));
         assert!(r.contains("Discord / DiscordMain (TLS 1.2): таймаут\n"));

@@ -49,12 +49,9 @@ pub fn parse_release(json: &str) -> anyhow::Result<Release> {
 }
 
 pub fn latest() -> anyhow::Result<Release> {
-    let json = agent(15)
-        .get(API)
-        .header("Accept", "application/vnd.github+json")
-        .call()?
-        .body_mut()
-        .read_to_string()?;
+    let json = super::fetch::with_retry(3, || {
+        Ok(agent(30).get(API).header("Accept", "application/vnd.github+json").call()?.body_mut().read_to_string()?)
+    })?;
     parse_release(&json)
 }
 
@@ -123,13 +120,7 @@ pub fn count_strategies(dir: &Path) -> usize {
 }
 
 pub fn install(paths: &Paths, rel: &Release) -> anyhow::Result<usize> {
-    let bytes = agent(120)
-        .get(&rel.zip_url)
-        .call()?
-        .body_mut()
-        .with_config()
-        .limit(100 * 1024 * 1024)
-        .read_to_vec()?;
+    let bytes = super::fetch::download(&rel.zip_url, 100 * 1024 * 1024, None)?;
     let tmp = paths.root.join(TMP_DIR);
     if tmp.exists() {
         fs::remove_dir_all(&tmp)?;

@@ -73,6 +73,56 @@ impl Watch {
     }
 }
 
+pub fn idle_secs() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe {
+        if GetLastInputInfo(&mut li) == 0 {
+            return 0;
+        }
+        (GetTickCount().wrapping_sub(li.dwTime) / 1000) as u64
+    }
+}
+
+pub fn auto_pick(
+    paths: &super::paths::Paths,
+    current: Option<&super::strategy::Strategy>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<super::picker::Choice> {
+    use super::picker::{self, Event};
+    let all = super::strategy::discover(paths);
+    let mut idx = picker::optimal(paths, &all);
+    if let Some(c) = current {
+        if let Some(i) = all.iter().position(|s| s.path == c.path) {
+            if !idx.contains(&i) {
+                idx.push(i);
+            }
+        }
+    }
+    if idx.is_empty() {
+        anyhow::bail!("нет стратегий для подбора");
+    }
+    let list: Vec<_> = idx.into_iter().map(|i| all[i].clone()).collect();
+    let targets = picker::load_targets(paths);
+    let gf = super::gamefilter::load(paths);
+    let results = std::sync::Mutex::new(Vec::new());
+    let end = std::sync::Mutex::new(None);
+    picker::run(paths.clone(), list, targets.clone(), gf, Vec::new(), cancel, |e| match e {
+        Event::Done(o) => results.lock().unwrap().push(o),
+        Event::Finished { cancelled, restore } => *end.lock().unwrap() = Some((cancelled, restore)),
+        Event::Failed(e) => *end.lock().unwrap() = Some((true, Some(Err(e)))),
+        _ => {}
+    });
+    match end.into_inner().unwrap() {
+        Some((false, Some(Err(e)))) => anyhow::bail!("подбор прошёл, но службу не удалось запустить: {e}"),
+        Some((false, _)) => {}
+        Some((true, Some(Err(e)))) => anyhow::bail!("{e}"),
+        _ => anyhow::bail!("подбор отменён: компьютером снова пользуются"),
+    }
+    Ok(picker::choose(&targets, &results.into_inner().unwrap(), current.map(|c| c.path.as_path())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

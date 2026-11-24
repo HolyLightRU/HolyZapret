@@ -48,6 +48,15 @@ pub fn make_private(index: u32) -> anyhow::Result<()> {
     }
 }
 
+pub fn repair_firewall() -> anyhow::Result<()> {
+    let port = PROXY.lock().unwrap().as_ref().map(|h| h.port).ok_or_else(|| anyhow::anyhow!("раздача выключена"))?;
+    firewall(Some(port));
+    match firewall_error() {
+        Some(e) => anyhow::bail!("{e}"),
+        None => Ok(()),
+    }
+}
+
 pub fn firewall_error() -> Option<String> {
     FIREWALL_ERROR.lock().unwrap().clone()
 }

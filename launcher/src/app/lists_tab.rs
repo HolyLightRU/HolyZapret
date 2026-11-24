@@ -57,6 +57,10 @@ impl App {
         v
     }
 
+    pub(super) fn lists_reload(&mut self) {
+        self.lists.doc_for = None;
+    }
+
     fn lists_sync(&mut self) {
         let folders = self.list_folders();
         if folders.is_empty() {

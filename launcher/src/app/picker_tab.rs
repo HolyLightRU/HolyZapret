@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const SECONDS_PER_STRATEGY: usize = 11;
 
+
 #[derive(Default)]
 pub struct PickerState {
+    auto: Option<Option<std::path::PathBuf>>,
     mode: usize,
     priority: usize,
     pub(super) running: bool,
@@ -210,6 +212,10 @@ impl PickerState {
         self.ranked_with(&self.mask())
     }
 
+    fn auto_choice(&self, current: Option<&std::path::Path>) -> picker::Choice {
+        picker::choose(&self.targets, &self.results, current)
+    }
+
     fn constructor(&self, base: &std::path::Path, donor_ok: impl Fn(&std::path::Path) -> bool) -> Option<Vec<(usize, Vec<String>)>> {
         let bi = self.results.iter().position(|o| o.path.as_deref() == Some(base) && o.error.is_none())?;
         let mask = self.mask();
@@ -257,8 +263,12 @@ impl PickerState {
 }
 
 impl App {
+    pub(super) fn open_report(&mut self) {
+        let (isp, city) = crate::core::settings::report_place();
+        self.picker.report_form = Some((isp, city, String::new()));
+    }
+
     pub(super) fn picker_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.report_dialog(ctx);
         if let Some(p) = &self.paths {
             if self.picker.default_targets.is_empty() {
                 self.picker.default_targets = picker::load_targets(p);
@@ -648,7 +658,7 @@ impl App {
         }
     }
 
-    fn report_dialog(&mut self, ctx: &egui::Context) {
+    pub(super) fn report_dialog(&mut self, ctx: &egui::Context) {
         let Some((isp, city, problem)) = self.picker.report_form.as_mut() else { return };
         let mut answer = None;
         let frame = egui::Frame::new()
@@ -658,11 +668,13 @@ impl App {
             .inner_margin(egui::Margin::same(20));
         let modal = egui::Modal::new(egui::Id::NULL.with("report_form")).frame(frame).show(ctx, |ui| {
             ui.set_width(400.0);
-            ui.label(RichText::new("Сохранить отчёт").size(17.0).strong());
+            ui.label(RichText::new("Отчёт для разработчика").size(17.0).strong());
             ui.add_space(2.0);
             ui.add(
                 egui::Label::new(
-                    RichText::new("Провайдер и город сильно влияют на то, какая стратегия работает. Их можно не заполнять").color(Color32::from_gray(170)).size(12.5),
+                    RichText::new("В отчёт попадут версия, стратегия, правила, свои домены, проверка сайтов, подбор, диагностика и журнал. Провайдер и город сильно влияют на то, что работает, их можно не заполнять")
+                        .color(Color32::from_gray(170))
+                        .size(12.5),
                 )
                 .wrap(),
             );
@@ -674,8 +686,8 @@ impl App {
                 });
             }
             ui.add_space(4.0);
-            ui.label(RichText::new("Что не работает, хотя подбор зелёный").color(Color32::from_gray(170)));
-            ui.add(egui::TextEdit::multiline(problem).hint_text("голос Discord, игры, видео…").desired_rows(2).desired_width(f32::INFINITY));
+            ui.label(RichText::new("Что не работает").color(Color32::from_gray(170)));
+            ui.add(egui::TextEdit::multiline(problem).hint_text("голос Discord, игры, видео, какой-то сайт…").desired_rows(2).desired_width(f32::INFINITY));
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(theme::Primary("Сохранить".into())).clicked() {
@@ -711,8 +723,21 @@ impl App {
         let version = self.local_version.clone().unwrap_or_else(|| "?".into());
         let flowseal = self.flowseal_version.clone();
         let game = self.status.as_ref().map(|s| s.game.summary()).unwrap_or_default();
+        let mut sections = self.report_sections();
+        let log: Vec<String> = self.log.iter().rev().take(60).rev().map(|e| format!("{} [{}] {}", e.time, e.lvl.tag(), e.text)).collect();
         self.spawn(ctx, move |p, tx| {
             super::send(tx, Lvl::Info, "Собираю отчёт: запускаю диагностику…");
+            let lists = crate::core::share::Share::collect(p, None, &crate::core::gamefilter::GameFilter::default());
+            let names = ["Мои домены", "Мои исключения доменов", "Мои IP", "Мои исключения IP"];
+            let mut mine = Vec::new();
+            for (name, items) in names.iter().zip(&lists.lists) {
+                if !items.is_empty() {
+                    let shown: Vec<String> = items.iter().take(40).cloned().collect();
+                    let more = if items.len() > 40 { format!(" и ещё {}", items.len() - 40) } else { String::new() };
+                    mine.push(format!("{name} ({}): {}{more}", items.len(), shown.join(", ")));
+                }
+            }
+            sections.insert(1, ("Свои списки".into(), mine));
             let diag = crate::core::diagnostics::run(p);
             let when = crate::log::now_stamp();
             let input = crate::core::report::Input {
@@ -730,6 +755,8 @@ impl App {
                 problem,
                 unreachable,
                 diag: &diag,
+                sections,
+                log,
             };
             let text = crate::core::report::build(&input);
             match crate::core::report::save(&text, &when) {
@@ -742,12 +769,113 @@ impl App {
         });
     }
 
+    fn report_sections(&self) -> Vec<(String, Vec<String>)> {
+        let mut state = Vec::new();
+        match &self.status {
+            Some(s) => {
+                let service = match s.service {
+                    ServiceState::Running => "работает",
+                    ServiceState::Stopped => "остановлена",
+                    ServiceState::NotInstalled => "не установлена",
+                };
+                state.push(format!("Служба: {service}, стратегия: {}", s.installed_strategy.as_deref().unwrap_or("нет")));
+                state.push(format!("Движок запущен: {}", if s.engine_running { "да" } else { "нет" }));
+                if let Some(d) = s.foreign_dir() {
+                    state.push(format!("Служба из другой папки: {}", d.display()));
+                }
+                if !s.foreign_engines.is_empty() {
+                    state.push(format!("Запущен другой обход: {}", s.foreign_engines.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")));
+                }
+            }
+            None => state.push("Состояние службы ещё не прочитано".into()),
+        }
+        match self.warp.as_ref().filter(|w| w.installed) {
+            Some(w) => {
+                let conn = match w.conn {
+                    crate::core::warp::Conn::Connected => "подключён",
+                    crate::core::warp::Conn::Connecting => "подключается",
+                    crate::core::warp::Conn::Disconnected => "отключён",
+                    crate::core::warp::Conn::Unknown => "состояние неизвестно",
+                };
+                state.push(format!("WARP: {conn}, режим «{}»", w.mode.label()))
+            }
+            None => state.push("WARP: не установлен".into()),
+        }
+        state.push(format!("Telegram через WARP: {}", if crate::core::tgwarp::enabled() { "включён" } else { "выключен" }));
+        state.push(format!("Telegram-прокси: {}", if crate::core::tgproxy::control::snapshot().is_some() { "работает" } else { "выключен" }));
+        state.push(match crate::core::lanproxy::control::snapshot() {
+            Some(s) => format!("Раздача на телефон: работает, устройств {}, соединений {}", s.clients, s.total),
+            None => "Раздача на телефон: выключена".into(),
+        });
+        if !self.health_alert.is_empty() {
+            state.push(format!("Слежение: не открываются {}", self.health_alert.join(", ")));
+        }
+        let rules: Vec<String> = crate::core::rules::load_or_empty(self.paths.as_ref())
+            .iter()
+            .map(|r| format!("{} — {}", r.domains.join(", "), crate::core::rules::label(&r.technique)))
+            .collect();
+        let sites: Vec<String> = self
+            .sites
+            .iter()
+            .map(|s| if s.ok { format!("{}: открывается, {} мс, {}", s.url, s.ms, s.detail) } else { format!("{}: НЕ открывается, {}", s.url, s.detail) })
+            .collect();
+        vec![("Состояние".into(), state), ("Правила для сайтов".into(), rules), ("Проверка сайтов".into(), sites)]
+    }
+
     pub(super) fn repick(&mut self, ctx: &egui::Context) {
         self.picker.mode = 0;
         self.picker.scope = 0;
         self.tab = Tab::Picker;
         if !self.picker.running && !self.busy {
             self.start_pick(ctx);
+        }
+    }
+
+    pub(super) fn auto_repick(&mut self, ctx: &egui::Context) {
+        if self.picker.running || self.busy {
+            return;
+        }
+        let current = self
+            .status
+            .as_ref()
+            .and_then(|s| s.active_strategy())
+            .and_then(|id| self.strategies.iter().find(|s| s.matches(id)))
+            .map(|s| s.path.clone());
+        self.picker.auto = Some(current);
+        self.repick(ctx);
+        if !self.picker.running {
+            self.picker.auto = None;
+        } else {
+            self.toast(ctx, Lvl::Info, "Подбираю стратегию: в конце лаунчер сам поставит лучшую, если она лучше текущей");
+        }
+    }
+
+    pub(super) fn finish_auto(&mut self, ctx: &egui::Context, completed: bool) {
+        let Some(current) = self.picker.auto.take() else { return };
+        if !completed {
+            return;
+        }
+        match self.picker.auto_choice(current.as_deref()) {
+            picker::Choice::NoBlocks => self.toast(ctx, Lvl::Info, "Без обхода всё открывается: похоже, провайдер сейчас ничего не блокирует. Стратегию оставил как есть"),
+            picker::Choice::Keep(Some(name)) => self.toast(
+                ctx,
+                Lvl::Info,
+                format!("Лучше «{name}» в быстром наборе ничего нет, оставил её. Можно запустить полный подбор: набор «Все» на вкладке «Подбор»"),
+            ),
+            picker::Choice::Keep(None) => self.toast(ctx, Lvl::Err, "Подбор не нашёл рабочей стратегии. Попробуйте полный подбор: набор «Все» на вкладке «Подбор»"),
+            picker::Choice::Switch { path, name, from, score } => {
+                if let Some(idx) = self.strategies.iter().position(|s| s.path == path) {
+                    self.selected = Some(idx);
+                    self.health_alert.clear();
+                    let why = match from {
+                        Some((old, was)) => format!("Ставлю «{name}»: открывает {score} сайтов против {was} у «{old}»"),
+                        None => format!("Ставлю «{name}»: она лучшая в подборе"),
+                    };
+                    self.toast(ctx, Lvl::Ok, why);
+                    self.tab = Tab::Main;
+                    self.install_selected(ctx);
+                }
+            }
         }
     }
 
@@ -774,7 +902,14 @@ impl App {
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.busy, theme::Primary("Подобрать заново".into())).clicked() {
+                    if ui
+                        .add_enabled(!self.busy && !self.picker.running, theme::Primary("Подобрать и поставить".into()))
+                        .on_hover_text("Около минуты: лаунчер проверит быстрый набор стратегий и сам поставит лучшую, если она лучше текущей")
+                        .clicked()
+                    {
+                        act = 4;
+                    }
+                    if ui.add_enabled(!self.busy && !self.picker.running, egui::Button::new("Открыть подбор")).clicked() {
                         act = 1;
                     }
                     if ui.button("Проверить ещё раз").clicked() {
@@ -793,6 +928,7 @@ impl App {
                 self.toast(ctx, Lvl::Info, "Проверяю YouTube и Discord…");
             }
             3 => self.health_alert.clear(),
+            4 => self.auto_repick(ctx),
             _ => {}
         }
     }
@@ -828,6 +964,14 @@ impl App {
         if idx.is_empty() {
             self.toast(ctx, Lvl::Info, "В utils/optimal_strategies.txt нет стратегий, выберите набор «Все»");
             return;
+        }
+        let mut idx = idx;
+        if let Some(Some(cur)) = &self.picker.auto {
+            if let Some(i) = self.strategies.iter().position(|s| &s.path == cur) {
+                if !idx.contains(&i) {
+                    idx.push(i);
+                }
+            }
         }
         let list: Vec<crate::core::strategy::Strategy> = idx.iter().map(|&i| self.strategies[i].clone()).collect();
         let mut add_to: Vec<std::path::PathBuf> = Vec::new();
@@ -1000,6 +1144,32 @@ mod tests {
     fn outcome(name: &str, path: Option<&str>, ok: &[bool]) -> Outcome {
         let checks = ok.iter().map(|&o| Check { ok: o, ms: 100, code: if o { 200 } else { 0 }, exit: if o { 0 } else { 28 }, ..Check::failed() }).collect();
         Outcome { name: name.into(), path: path.map(PathBuf::from), error: None, checks }
+    }
+
+    #[test]
+    fn auto_choice_only_switches_when_better() {
+        let mut st = PickerState::default();
+        st.targets = ["a.com", "b.com", "c.com"]
+            .iter()
+            .map(|h| Target { name: h.to_string(), category: "Сайты".into(), url: format!("https://{h}/"), kind: CheckKind::Tls13 })
+            .collect();
+        st.results = vec![
+            outcome("Без обхода", None, &[false, false, false]),
+            outcome("general", Some("g.bat"), &[true, false, false]),
+            outcome("ALT 2", Some("a2.bat"), &[true, true, true]),
+        ];
+        match st.auto_choice(Some(Path::new("g.bat"))) {
+            picker::Choice::Switch { path, name, from, score } => {
+                assert_eq!((path, name.as_str(), score), (PathBuf::from("a2.bat"), "ALT 2", 3));
+                assert_eq!(from, Some(("general".to_string(), 1)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(st.auto_choice(Some(Path::new("a2.bat"))), picker::Choice::Keep(Some("ALT 2".into())));
+        st.results[2] = outcome("ALT 2", Some("a2.bat"), &[true, false, false]);
+        assert!(matches!(st.auto_choice(Some(Path::new("g.bat"))), picker::Choice::Keep(Some(_))));
+        st.results[0] = outcome("Без обхода", None, &[true, true, true]);
+        assert_eq!(st.auto_choice(Some(Path::new("g.bat"))), picker::Choice::NoBlocks);
     }
 
     #[test]

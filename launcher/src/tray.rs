@@ -36,6 +36,14 @@ pub fn busy() -> bool {
     BUSY.load(Ordering::Relaxed)
 }
 
+pub fn claim() -> bool {
+    !BUSY.swap(true, Ordering::Relaxed)
+}
+
+pub fn release() {
+    BUSY.store(false, Ordering::Relaxed);
+}
+
 pub fn take_events() -> Vec<(bool, String)> {
     EVENTS.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default()
 }

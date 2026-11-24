@@ -215,6 +215,62 @@ fn first(list: Vec<Profile>, host: &str, ips: &[IpAddr], udp: bool, cache: &mut 
     None
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Verdict {
+    Touched,
+    ByName,
+    ByContent,
+    NotListed,
+    Excluded,
+    Passed,
+    NoProfile,
+    Unseen,
+}
+
+pub fn verdict(args: &str, udp: bool, ip: IpAddr, port: u16, cache: &mut Cache) -> Verdict {
+    let key = if udp { "--wf-udp=" } else { "--wf-tcp=" };
+    if !tokens(args).iter().any(|t| t.strip_prefix(key).is_some_and(|v| ports_include(v, port))) {
+        return Verdict::Unseen;
+    }
+    let mut seen = Vec::new();
+    for p in profiles(args) {
+        let port_ok = match (udp, &p.tcp, &p.udp) {
+            (false, Some(s), _) | (true, _, Some(s)) => ports_include(s, port),
+            (_, None, None) => true,
+            _ => false,
+        };
+        if !port_ok {
+            continue;
+        }
+        if let Some(l) = &p.l7 {
+            let web = if udp { port == 443 && l.split(',').any(|x| x == "quic") } else { matches!(port, 80 | 443) && l.split(',').any(|x| x == "tls" || x == "http") };
+            if !web {
+                seen.push(Verdict::ByContent);
+                continue;
+            }
+        }
+        if p.ip_excludes.iter().any(|f| cache.nets(f).iter().any(|n| n.contains(&ip))) {
+            seen.push(Verdict::Excluded);
+            continue;
+        }
+        if (!p.ipsets.is_empty() || !p.ips.is_empty()) && !(p.ips.iter().any(|n| n.contains(&ip)) || p.ipsets.iter().any(|f| cache.nets(f).iter().any(|n| n.contains(&ip)))) {
+            seen.push(Verdict::NotListed);
+            continue;
+        }
+        if !p.hostlists.is_empty() || !p.domains.is_empty() {
+            seen.push(Verdict::ByName);
+            continue;
+        }
+        return if p.desync { Verdict::Touched } else { Verdict::Passed };
+    }
+    seen.into_iter().min_by_key(|v| match v {
+        Verdict::ByName | Verdict::ByContent => 0,
+        Verdict::Excluded => 1,
+        _ => 2,
+    })
+    .unwrap_or(Verdict::NoProfile)
+}
+
 pub fn touches(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> bool {
     first(profiles(args), host, ips, false, cache).is_some_and(|p| p.desync)
 }
@@ -279,6 +335,38 @@ mod tests {
         assert!(!touches(&ruled, "youtube.com", &ip("8.8.8.8"), &mut c));
         assert!(touches("--wf-tcp=443 --filter-tcp=443 --dpi-desync=fake", "any.org", &ip("1.1.1.1"), &mut c));
         assert!(!touches("--filter-tcp=443 --filter-l7=stun --dpi-desync=fake", "any.org", &ip("1.1.1.1"), &mut c));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn verdict_for_app_traffic() {
+        let dir = std::env::temp_dir().join(format!("hz-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("mine.txt");
+        let excl = dir.join("excl.txt");
+        let list = dir.join("list.txt");
+        std::fs::write(&mine, "5.6.7.0/24\r\n").unwrap();
+        std::fs::write(&excl, "9.9.9.9\r\n").unwrap();
+        std::fs::write(&list, "youtube.com\r\n").unwrap();
+        let (m, e, l) = (mine.display(), excl.display(), list.display());
+        let args = |game: &str| {
+            format!(
+                "--wf-tcp=80,443,{game} --wf-udp=443,50000-50100,{game} --filter-udp=443 --hostlist=\"{l}\" --ipset-exclude=\"{e}\" --dpi-desync=fake --new --filter-udp=50000-50100 --filter-l7=discord,stun --dpi-desync=fake --new --filter-tcp=80,443 --hostlist=\"{l}\" --ipset-exclude=\"{e}\" --dpi-desync=fake --new --filter-tcp={game} --ipset=\"{m}\" --ipset-exclude=\"{e}\" --dpi-desync=fake --new --filter-udp={game} --ipset=\"{m}\" --ipset-exclude=\"{e}\" --dpi-desync=fake"
+            )
+        };
+        let (on, off) = (args("1024-65535"), args("12"));
+        let mut c = Cache::default();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(verdict(&on, true, ip("5.6.7.8"), 27015, &mut c), Verdict::Touched);
+        assert_eq!(verdict(&off, true, ip("5.6.7.8"), 27015, &mut c), Verdict::Unseen);
+        assert_eq!(verdict(&on, true, ip("1.2.3.4"), 27015, &mut c), Verdict::NotListed);
+        assert_eq!(verdict(&on, true, ip("9.9.9.9"), 27015, &mut c), Verdict::Excluded);
+        assert_eq!(verdict(&on, false, ip("1.2.3.4"), 443, &mut c), Verdict::ByName);
+        assert_eq!(verdict(&off, true, ip("1.2.3.4"), 50010, &mut c), Verdict::ByContent);
+        assert_eq!(verdict("--wf-udp=443,3000 --filter-udp=443 --dpi-desync=fake", true, ip("1.2.3.4"), 3000, &mut c), Verdict::NoProfile);
+        assert_eq!(verdict(&off, false, ip("1.2.3.4"), 22, &mut c), Verdict::Unseen);
+        assert_eq!(verdict("--wf-tcp=443 --filter-tcp=443 --hostlist-domains=a.com --new --filter-tcp=443 --dpi-desync=fake", false, ip("1.1.1.1"), 443, &mut c), Verdict::Touched);
+        assert_eq!(verdict("--wf-tcp=443 --filter-tcp=443", false, ip("1.1.1.1"), 443, &mut c), Verdict::Passed);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

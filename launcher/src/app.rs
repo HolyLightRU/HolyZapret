@@ -1,3 +1,4 @@
+mod appcheck_ui;
 mod confirm;
 mod diag_tab;
 mod lists_tab;
@@ -8,6 +9,7 @@ mod share_ui;
 mod sites_tab;
 mod tools_tab;
 mod unpack_ui;
+mod update_ui;
 mod tg_ui;
 mod trial;
 mod warp_ui;
@@ -41,6 +43,7 @@ enum Msg {
     Site(SiteResult),
     SitesDone,
     Diag(Vec<Finding>),
+    CheckChanged,
     Version(Result<UpdateRelease, String>),
     Found(Result<Found, String>),
     FlowsealLatest(Result<Release, String>),
@@ -48,6 +51,9 @@ enum Msg {
     Rules(crate::core::rules::Event),
     Rescan,
     Updated,
+    UpdateStage(String),
+    UpdateFailed(String),
+    Restart(std::path::PathBuf),
     Autostart(bool),
     Warp(crate::core::warp::State),
     TgForeign(Vec<String>),
@@ -58,19 +64,71 @@ enum Msg {
     Shared,
     WhatsNew(String, String),
     Health(Vec<String>),
+    AutoPick(bool, String),
     Relocated(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf),
     Unpacked(Result<(std::path::PathBuf, std::path::PathBuf, bool), String>),
     Done,
+}
+
+fn auto_repick_now(p: &Paths, current: Option<&str>, tx: &Sender<Msg>, ctx: &egui::Context) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let strategies = strategy::discover(p);
+    let cur = current.and_then(|id| strategies.iter().find(|s| s.matches(id)));
+    let _ = tx.send(Msg::AutoPick(true, "Обход перестал работать, а компьютером сейчас не пользуются: подбираю стратегию в фоне".into()));
+    ctx.request_repaint();
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    {
+        let (cancel, done) = (cancel.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if crate::core::health::idle_secs() < 3 {
+                    cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    }
+    let r = crate::core::health::auto_pick(p, cur, cancel);
+    done.store(true, Ordering::Relaxed);
+    let msg = match r {
+        Ok(crate::core::picker::Choice::Switch { path, name, from, score }) => match strategies.iter().find(|s| s.path == path) {
+            Some(s) => match service::install(p, s) {
+                Ok(_) => {
+                    let text = match from {
+                        Some((old, was)) => format!("Поставлена «{name}» вместо «{old}»: открывает {score} сайтов против {was}"),
+                        None => format!("Поставлена «{name}»"),
+                    };
+                    tray::notify("HolyZapret сменил стратегию", &text);
+                    text
+                }
+                Err(e) => format!("Подбор нашёл «{name}», но поставить не удалось: {e}"),
+            },
+            None => format!("Подбор нашёл «{name}», но её файл не найден"),
+        },
+        Ok(crate::core::picker::Choice::Keep(Some(name))) => format!("Автоподбор: лучше «{name}» в быстром наборе нет, оставил её"),
+        Ok(crate::core::picker::Choice::Keep(None)) => "Автоподбор не нашёл рабочей стратегии. Попробуйте полный подбор".into(),
+        Ok(crate::core::picker::Choice::NoBlocks) => "Автоподбор: без обхода всё открывается, стратегию оставил".into(),
+        Err(e) => format!("Автоподбор остановлен: {e}"),
+    };
+    let _ = tx.send(Msg::AutoPick(false, msg));
+    ctx.request_repaint();
 }
 
 fn health_loop(
     p: Paths,
     flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    auto: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ui_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: Sender<Msg>,
     ctx: egui::Context,
 ) {
     use std::sync::atomic::Ordering;
+    const IDLE: u64 = 15 * 60;
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+    let mut last_auto: Option<std::time::Instant> = None;
     const STEP: u64 = 5;
     const FIRST: u64 = 300;
     const EVERY: u64 = 1200;
@@ -80,6 +138,20 @@ fn health_loop(
     let mut wait = FIRST;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(STEP));
+        let ready = auto.load(Ordering::Relaxed)
+            && flag.load(Ordering::Relaxed)
+            && !watch.current().is_empty()
+            && strategy.is_some()
+            && last_auto.is_none_or(|t| t.elapsed() > COOLDOWN)
+            && !ui_busy.load(Ordering::Relaxed)
+            && crate::core::health::idle_secs() >= IDLE;
+        if ready && tray::claim() {
+            last_auto = Some(std::time::Instant::now());
+            auto_repick_now(&p, strategy.as_deref(), &tx, &ctx);
+            tray::release();
+            wait = 30;
+            continue;
+        }
         let forced = force.swap(false, Ordering::Relaxed);
         wait = wait.saturating_sub(STEP);
         if !forced && (wait > 0 || !flag.load(Ordering::Relaxed)) {
@@ -217,6 +289,7 @@ pub struct App {
     game_edit: Option<(gamefilter::GameFilter, String, String)>,
     game_err: Option<String>,
     diag: diag_tab::DiagState,
+    check: appcheck_ui::CheckState,
     local_version: Option<String>,
     remote_version: Option<String>,
     remote_release: Option<UpdateRelease>,
@@ -232,11 +305,15 @@ pub struct App {
     whats_new: Option<(String, String)>,
     watch: bool,
     watch_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    auto_pick: bool,
+    auto_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ui_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     health_force: std::sync::Arc<std::sync::atomic::AtomicBool>,
     health_alert: Vec<String>,
     old_folder: Option<std::path::PathBuf>,
     unpack: Option<unpack_ui::UnpackState>,
     share: share_ui::ShareState,
+    update: update_ui::UpdateUi,
     phone: phone_tab::PhoneState,
     flowseal_version: Option<String>,
     flowseal_latest: Option<Release>,
@@ -295,6 +372,7 @@ impl App {
             game_edit: None,
             game_err: None,
             diag: Default::default(),
+            check: Default::default(),
             local_version,
             remote_version: None,
             remote_release: None,
@@ -310,11 +388,15 @@ impl App {
             whats_new: None,
             watch: saved.watch,
             watch_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.watch)),
+            auto_pick: saved.auto_pick,
+            auto_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved.auto_pick)),
+            ui_busy: Default::default(),
             health_force: Default::default(),
             health_alert: Vec::new(),
             old_folder: None,
             unpack: None,
             share: Default::default(),
+            update: Default::default(),
             phone: Default::default(),
             flowseal_version,
             flowseal_latest: None,
@@ -409,7 +491,8 @@ impl App {
         if let Some(p) = app.paths.clone() {
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
             let (flag, force) = (app.watch_flag.clone(), app.health_force.clone());
-            std::thread::spawn(move || health_loop(p, flag, force, tx, ctx));
+            let (auto, ui_busy) = (app.auto_flag.clone(), app.ui_busy.clone());
+            std::thread::spawn(move || health_loop(p, flag, force, auto, ui_busy, tx, ctx));
         }
         if let Some(p) = app.paths.clone() {
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
@@ -542,6 +625,7 @@ impl App {
                     self.start_site_check(ctx);
                 }
                 Msg::TrialStarted(Err(e)) => self.toast(ctx, Lvl::Err, format!("Пробный запуск: {e}")),
+                Msg::CheckChanged => self.check_changed(),
                 Msg::Diag(d) => {
                     self.diag.findings = d;
                     self.diag.running = false;
@@ -570,6 +654,7 @@ impl App {
                     if fin {
                         self.busy = false;
                         self.refresh(ctx);
+                        self.finish_auto(ctx, completed);
                     }
                 }
                 Msg::FlowsealLatest(r) => {
@@ -590,9 +675,19 @@ impl App {
                 }
                 Msg::Rescan => self.rescan(),
                 Msg::Updated => {
+                    self.update.running = false;
+                    self.update.open = false;
                     self.local_version = self.paths.as_ref().and_then(update::local_version);
                     self.rescan();
                 }
+                Msg::UpdateStage(s) => self.update.stage = s,
+                Msg::UpdateFailed(e) => {
+                    self.update.running = false;
+                    self.update.open = true;
+                    self.note(Lvl::Err, format!("Обновление не удалось: {e}"));
+                    self.update.error = Some(e);
+                }
+                Msg::Restart(exe) => self.restart_into(ctx, exe),
                 Msg::Done => self.busy = false,
                 Msg::WhatsNew(v, body) => self.whats_new = Some((v, body)),
                 Msg::Relocated(root, exe, old) => {
@@ -607,6 +702,14 @@ impl App {
                     }
                 }
                 Msg::Unpacked(r) => self.on_unpacked(ctx, r),
+                Msg::AutoPick(started, text) => {
+                    self.busy = started;
+                    self.toast(ctx, if started { Lvl::Info } else { Lvl::Ok }, text);
+                    if !started {
+                        self.rescan();
+                        self.refresh(ctx);
+                    }
+                }
                 Msg::Health(failing) => {
                     if failing.is_empty() {
                         if !self.health_alert.is_empty() {
@@ -633,6 +736,7 @@ impl App {
                     self.sidebar_open = d.sidebar_open;
                     self.flow = d.flow;
                     self.watch = d.watch;
+                    self.auto_pick = d.auto_pick;
                     self.health_alert.clear();
                     self.last_pick = None;
                     self.game_edit = None;
@@ -779,7 +883,11 @@ impl App {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(6.0);
             if let Some(r) = self.update_available().filter(|_| self.paths.is_some()) {
-                theme::chip(ui, &format!("Доступна {r}"), YELLOW);
+                let text = self.update.status().unwrap_or_else(|| format!("Доступна {r}"));
+                let chip = theme::chip(ui, &text, YELLOW).interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Обновить HolyZapret");
+                if chip.clicked() {
+                    self.open_update();
+                }
             }
         });
     }
@@ -1036,6 +1144,9 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::icon_button(ui, theme::icon::DELETE, "Очистить журнал").clicked() {
                         self.log.clear();
+                    }
+                    if ui.add_enabled(self.paths.is_some() && !self.busy, egui::Button::new("Отчёт для разработчика")).on_hover_text("Соберёт всё о вашей системе и обходе в один файл на рабочем столе, его можно отправить разработчику").clicked() {
+                        self.open_report();
                     }
                     if theme::icon_button(ui, theme::icon::COPY, "Скопировать всё").clicked() {
                         let text: Vec<String> =
@@ -1375,9 +1486,12 @@ impl eframe::App for App {
         self.draw_confirm(&ctx);
         self.draw_unpack(&ctx);
         self.draw_share(&ctx);
+        self.draw_update(&ctx);
+        self.report_dialog(&ctx);
         if self.confirm.is_none() && self.tab != Tab::Wizard && self.unpack.is_none() {
             self.draw_whats_new(&ctx);
         }
+        self.ui_busy.store(self.busy || self.picker.running || self.trial.is_some() || self.update.running, std::sync::atomic::Ordering::Relaxed);
         let now = Settings {
             advanced: self.advanced,
             close_to_tray: self.close_to_tray,
@@ -1385,11 +1499,13 @@ impl eframe::App for App {
             wizard_done: self.wizard_done,
             flow: self.flow,
             watch: self.watch,
+            auto_pick: self.auto_pick,
         };
         if now != self.saved {
             settings::save(&now);
             self.saved = now;
             self.watch_flag.store(self.watch, std::sync::atomic::Ordering::Relaxed);
+            self.auto_flag.store(self.auto_pick, std::sync::atomic::Ordering::Relaxed);
             if !self.watch {
                 self.health_alert.clear();
             }

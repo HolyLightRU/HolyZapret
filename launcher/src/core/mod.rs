@@ -1,8 +1,10 @@
+pub mod appcheck;
 pub mod autostart;
 pub mod checks;
 pub mod coverage;
 pub mod diagnostics;
 pub mod discover;
+pub mod fetch;
 pub mod flowseal;
 pub mod gamefilter;
 pub mod health;

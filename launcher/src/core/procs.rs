@@ -34,26 +34,39 @@ pub fn list(names: &[&str]) -> Vec<Proc> {
     find(|name| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
-pub fn find(pred: impl Fn(&str) -> bool) -> Vec<Proc> {
-    let mut out = Vec::new();
+pub fn names() -> std::collections::HashMap<u32, String> {
+    let mut out = std::collections::HashMap::new();
+    each(|pid, name| {
+        out.insert(pid, name.to_string());
+    });
+    out
+}
+
+fn each(mut f: impl FnMut(u32, &str)) {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap.is_null() || snap as isize == -1 {
-            return out;
+            return;
         }
         let mut e: PROCESSENTRY32W = std::mem::zeroed();
         e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut more = Process32FirstW(snap, &mut e) != 0;
         while more {
             let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
-            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
-            if pred(&name) {
-                out.push(Proc { name, path: image_path(e.th32ProcessID) });
-            }
+            f(e.th32ProcessID, &String::from_utf16_lossy(&e.szExeFile[..len]));
             more = Process32NextW(snap, &mut e) != 0;
         }
         CloseHandle(snap);
     }
+}
+
+pub fn find(pred: impl Fn(&str) -> bool) -> Vec<Proc> {
+    let mut out = Vec::new();
+    each(|pid, name| {
+        if pred(name) {
+            out.push(Proc { name: name.to_string(), path: image_path(pid) });
+        }
+    });
     out
 }
 

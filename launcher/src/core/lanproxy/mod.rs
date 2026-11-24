@@ -1,4 +1,5 @@
 pub mod control;
+pub mod diag;
 pub mod page;
 
 use std::collections::{HashMap, HashSet};

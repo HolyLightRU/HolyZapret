@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "LOCAL_VERSION=3.1.2"
+set "LOCAL_VERSION=3.1.3"
 
 :: External commands
 if "%~1"=="status_zapret" (

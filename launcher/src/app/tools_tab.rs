@@ -186,38 +186,6 @@ impl App {
         });
     }
 
-    pub(super) fn run_update(&mut self, ctx: &egui::Context) {
-        let Some(rel) = self.remote_release.clone() else {
-            self.check_version(ctx);
-            return;
-        };
-        let only_service = self.status.as_ref().is_some_and(|s| s.active_strategy().is_some() && s.foreign_engines.is_empty());
-        if self.trial.is_some() || (self.status.as_ref().is_some_and(|s| s.engine_running) && !only_service) {
-            self.toast(ctx, Lvl::Err, "Сначала выключите защиту и пробный запуск: движок держит файлы, которые нужно обновить");
-            return;
-        }
-        self.spawn(ctx, move |p, tx| {
-            send(tx, Lvl::Info, format!("Скачиваю HolyZapret {}…", rel.version));
-            let bytes = match crate::core::selfupdate::download(&rel) {
-                Ok(b) => b,
-                Err(e) => {
-                    notify(tx, Lvl::Err, format!("Обновление не удалось: {e}"));
-                    let _ = tx.send(Msg::Updated);
-                    return;
-                }
-            };
-            let paused = crate::core::service::pause_ours(p);
-            match crate::core::selfupdate::install(p, &rel, &bytes) {
-                Ok(sum) => notify(tx, Lvl::Ok, sum.to_string()),
-                Err(e) => notify(tx, Lvl::Err, format!("Обновление не удалось: {e}")),
-            }
-            if let Some(paused) = paused {
-                result_msg(tx, crate::core::service::resume(p, paused), "Служба после обновления");
-            }
-            let _ = tx.send(Msg::Updated);
-        });
-    }
-
     pub(super) fn flowseal_action(&mut self, ctx: &egui::Context, install: bool) {
         if self.flowseal_in_use() {
             self.toast(ctx, Lvl::Err, "Служба сейчас использует стратегию Flowseal, сначала удалите службу");
@@ -263,6 +231,7 @@ impl App {
                 let newer = self.update_available();
                 let local = self.local_version.clone().unwrap_or_else(|| "?".into());
                 let (ver_text, ver_color) = match (&newer, &self.remote_version) {
+                    (Some(_), _) if self.update.running => (self.update.status().unwrap_or_default(), YELLOW),
                     (Some(r), _) => (format!("{local} → {r}"), YELLOW),
                     (None, _) if crate::core::TEST_BUILD => ("Тестовая сборка: обновления выключены".to_string(), YELLOW),
                     (None, Some(_)) => (format!("Установлена {local}, последняя"), Color32::from_gray(150)),
@@ -331,7 +300,7 @@ impl App {
                 self.run_hosts(ctx);
             }
             match (clicks[1], update_offered) {
-                (Some(0), true) => self.confirm = Some(super::confirm::Confirm::Update),
+                (Some(0), true) => self.open_update(),
                 (Some(_), _) => self.check_version(ctx),
                 _ => {}
             }
@@ -367,6 +336,16 @@ impl App {
             let mut watch = self.watch;
             if setting_row(ui, &mut watch, true, "Следить за работой обхода", "Раз в 20 минут проверяет YouTube и Discord и сообщает, если обход перестал работать") {
                 self.watch = watch;
+            }
+            let mut auto = self.auto_pick;
+            if setting_row(
+                ui,
+                &mut auto,
+                self.watch,
+                "Подбирать стратегию самому",
+                "Если обход сломался и 15 минут никто не трогает компьютер, подберёт стратегию получше",
+            ) {
+                self.auto_pick = auto;
             }
             let mut flow = self.flow;
             if setting_row(ui, &mut flow, true, "Живые градиенты", "Цвета акцентов медленно перетекают, пока окно лаунчера активно") {

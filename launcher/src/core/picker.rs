@@ -6,7 +6,7 @@ use super::{kill_process, run_hidden};
 use std::fs;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -217,6 +217,32 @@ pub fn unreachable_checks(targets: &[Target], results: &[Outcome]) -> Vec<bool> 
             dead(&base.checks[i]) && !tried.is_empty() && tried.iter().all(|o| dead(&o.checks[i]))
         })
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Choice {
+    NoBlocks,
+    Keep(Option<String>),
+    Switch { path: PathBuf, name: String, from: Option<(String, usize)>, score: usize },
+}
+
+pub fn choose(targets: &[Target], results: &[Outcome], current: Option<&Path>) -> Choice {
+    let mask = either(&noisy_checks(targets, results), &unreachable_checks(targets, results));
+    let score = |o: &Outcome| o.clean_score(&mask);
+    let ok: Vec<&Outcome> = results.iter().filter(|o| o.error.is_none() && o.checks.len() == targets.len()).collect();
+    let Some(best) = ok.iter().copied().max_by_key(|o| (score(o), o.path.is_none(), std::cmp::Reverse(o.frozen()))) else {
+        return Choice::Keep(None);
+    };
+    if score(best) == 0 {
+        return Choice::Keep(None);
+    }
+    let Some(path) = best.path.clone() else { return Choice::NoBlocks };
+    let cur = current.and_then(|c| ok.iter().find(|o| o.path.as_deref() == Some(c)));
+    match cur {
+        Some(c) if c.path == best.path || score(best) <= score(c) => Choice::Keep(Some(c.name.clone())),
+        Some(c) => Choice::Switch { path, name: best.name.clone(), from: Some((c.name.clone(), score(c))), score: score(best) },
+        None => Choice::Switch { path, name: best.name.clone(), from: None, score: score(best) },
+    }
 }
 
 pub fn either(a: &[bool], b: &[bool]) -> Vec<bool> {

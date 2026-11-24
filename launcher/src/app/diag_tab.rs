@@ -37,6 +37,13 @@ impl App {
     }
 
     pub(super) fn diag_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let views = vec!["Система".to_string(), "Программа".to_string()];
+        theme::segmented(ui, &views, &mut self.check.view);
+        ui.add_space(8.0);
+        if self.check.view == 1 {
+            self.check_tab(ui, ctx);
+            return;
+        }
         if !self.diag.ran && !self.diag.running && self.paths.is_some() {
             self.run_diag(ctx);
         }

@@ -221,6 +221,10 @@ pub fn render(rules: &[Rule]) -> String {
     out
 }
 
+pub fn load_or_empty(paths: Option<&Paths>) -> Vec<Rule> {
+    paths.map(load).unwrap_or_default()
+}
+
 pub fn load(paths: &Paths) -> Vec<Rule> {
     parse(&fs::read_to_string(path(paths)).unwrap_or_default())
 }
