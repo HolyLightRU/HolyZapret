@@ -34,6 +34,41 @@ pub fn list(names: &[&str]) -> Vec<Proc> {
     find(|name| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
+pub fn windowed() -> std::collections::HashSet<String> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW,
+    };
+    unsafe extern "system" fn visit(h: HWND, l: LPARAM) -> i32 {
+        unsafe {
+            let pids = &mut *(l as *mut Vec<u32>);
+            let tool = GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0;
+            if IsWindowVisible(h) != 0 && GetWindowTextLengthW(h) > 0 && GetWindow(h, GW_OWNER).is_null() && !tool {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, &mut pid);
+                pids.push(pid);
+            }
+        }
+        1
+    }
+    let mut pids: Vec<u32> = Vec::new();
+    unsafe {
+        EnumWindows(Some(visit), &mut pids as *mut Vec<u32> as LPARAM);
+    }
+    let names = names();
+    pids.iter().filter_map(|p| names.get(p)).map(|n| n.to_lowercase()).filter(|n| !SHELL.contains(&n.as_str())).collect()
+}
+
+const SHELL: [&str; 7] = [
+    "textinputhost.exe",
+    "applicationframehost.exe",
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "lockapp.exe",
+    "explorer.exe",
+];
+
 pub fn names() -> std::collections::HashMap<u32, String> {
     let mut out = std::collections::HashMap::new();
     each(|pid, name| {

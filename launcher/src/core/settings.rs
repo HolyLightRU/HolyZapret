@@ -50,6 +50,82 @@ pub fn last_strategy() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+pub fn ray_enabled() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_none_or(|k| read(&k, "RayOfLight", true))
+}
+
+pub fn set_ray_enabled(on: bool) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayOfLight", &(on as u32));
+    }
+}
+
+pub const DEFAULT_EXPERIMENT: &str = "adaptive";
+
+pub fn ray_experiment() -> String {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("RayExperiment").ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_EXPERIMENT.into())
+}
+
+pub fn set_ray_experiment(v: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayExperiment", &v);
+    }
+}
+
+pub const DEFAULT_QUIC: &str = "adaptive";
+
+pub fn ray_quic() -> String {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("RayQuic").ok())
+        .unwrap_or_else(|| DEFAULT_QUIC.into())
+}
+
+pub fn ray_autolist() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_none_or(|k| read(&k, "RayAutoList", true))
+}
+
+pub fn ray_gateway() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_some_and(|k| read(&k, "RayGateway", false))
+}
+
+pub fn set_ray_gateway(on: bool) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayGateway", &(on as u32));
+    }
+}
+
+pub fn set_ray_autolist(on: bool) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayAutoList", &(on as u32));
+    }
+}
+
+pub fn set_ray_quic(v: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayQuic", &v);
+    }
+}
+
+pub fn ray_apps() -> (String, String) {
+    let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok();
+    let get = |n: &str| k.as_ref().and_then(|k| k.get_value::<String, _>(n).ok()).unwrap_or_default();
+    (get("RayAll"), get("RaySkip"))
+}
+
+pub fn set_ray_apps(all: &str, skip: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayAll", &all);
+        let _ = k.set_value("RaySkip", &skip);
+    }
+}
+
 pub fn report_place() -> (String, String) {
     let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok();
     let get = |n: &str| k.as_ref().and_then(|k| k.get_value::<String, _>(n).ok()).unwrap_or_default();

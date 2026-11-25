@@ -105,6 +105,7 @@ pub fn curl_error(exit: i32) -> String {
         28 => "таймаут".into(),
         35 | 60 => "ошибка TLS".into(),
         52 | 56 => "соединение сброшено".into(),
+        -1 => "не удалось собрать запрос".into(),
         n => format!("ошибка curl {n}"),
     }
 }
@@ -118,7 +119,69 @@ pub fn judge(url: &str, custom: bool, exit: Option<i32>, out: &str) -> SiteResul
     SiteResult { url: url.to_string(), ok, code, detail, ms: (secs * 1000.0) as u128, custom }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hello {
+    Answered,
+    Refused,
+}
+
+pub fn tls13_hello(host: &str) -> Option<Vec<u8>> {
+    let mut h = rayoflight::tls::with_sni(rayoflight::desync::FAKE_DEFAULT, host)?;
+    rayoflight::sys::random(&mut h[11..43]);
+    let sid = h[43] as usize;
+    rayoflight::sys::random(&mut h[44..44 + sid]);
+    Some(h)
+}
+
+pub fn tls13_probe(host: &str, timeout: std::time::Duration) -> (Result<Hello, i32>, u128) {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    let start = std::time::Instant::now();
+    let ms = || start.elapsed().as_millis();
+    let Some(addr) = (host, 443).to_socket_addrs().ok().and_then(|mut a| a.next()) else { return (Err(6), ms()) };
+    let Some(hello) = tls13_hello(host) else { return (Err(-1), ms()) };
+    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return (Err(28), ms()),
+        Err(_) => return (Err(7), ms()),
+    };
+    let _ = s.set_read_timeout(Some(timeout.saturating_sub(start.elapsed()).max(std::time::Duration::from_millis(200))));
+    if s.write_all(&hello).is_err() {
+        return (Err(56), ms());
+    }
+    let mut buf = [0u8; 16];
+    let mut got = 0;
+    while got < 6 {
+        match s.read(&mut buf[got..]) {
+            Ok(0) => return (Err(52), ms()),
+            Ok(n) => got += n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => return (Err(28), ms()),
+            Err(_) => return (Err(56), ms()),
+        }
+    }
+    let r = match (buf[0], buf[5]) {
+        (0x16, 0x02) => Ok(Hello::Answered),
+        (0x15, _) => Ok(Hello::Refused),
+        _ => Err(35),
+    };
+    (r, ms())
+}
+
+fn probe_site(site: &Site) -> SiteResult {
+    let host = super::picker::host_of(&site.url);
+    let (r, ms) = tls13_probe(&host, std::time::Duration::from_secs(6));
+    let (ok, detail) = match r {
+        Ok(Hello::Answered) => (true, "TLS 1.3".to_string()),
+        Ok(Hello::Refused) => (true, "TLS 1.3, отказ".to_string()),
+        Err(e) => (false, curl_error(e)),
+    };
+    SiteResult { url: site.url.clone(), ok, code: 0, detail, ms, custom: site.custom }
+}
+
 pub fn check_one(site: &Site) -> SiteResult {
+    if site.url.starts_with("https://") && !super::picker::tls13_supported() {
+        return probe_site(site);
+    }
     let out = Command::new("curl.exe")
         .args(["-s", "-o", "NUL", "-L", "-m", "6", "-A", UA, "-w", "%{http_code} %{time_total}", &site.url])
         .creation_flags(CREATE_NO_WINDOW)
@@ -148,6 +211,26 @@ pub fn check_all(sites: Vec<Site>, tx: Sender<SiteResult>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls13_hello_names_the_site() {
+        let h = tls13_hello("www.youtube.com").unwrap();
+        assert_eq!(rayoflight::tls::sni(&h).as_deref(), Some("www.youtube.com"));
+        assert_eq!(rayoflight::tls::record_len(&h), Some(h.len()));
+        let again = tls13_hello("www.youtube.com").unwrap();
+        assert_ne!(h[11..43], again[11..43]);
+        assert_eq!(curl_error(-1), "не удалось собрать запрос");
+    }
+
+    #[test]
+    #[ignore]
+    fn tls13_probe_live() {
+        for host in ["discord.com", "www.google.com", "www.youtube.com", "rutracker.org"] {
+            let (r, ms) = tls13_probe(host, std::time::Duration::from_secs(6));
+            assert_eq!(r, Ok(Hello::Answered), "{host} {ms}");
+        }
+        assert_eq!(tls13_probe("no-such-host.invalid", std::time::Duration::from_secs(3)).0, Err(6));
+    }
 
     #[test]
     fn responses_judged() {

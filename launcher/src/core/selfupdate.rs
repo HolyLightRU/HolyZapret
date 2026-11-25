@@ -26,6 +26,7 @@ pub struct Summary {
     pub added: usize,
     pub unchanged: usize,
     pub preserved: usize,
+    pub moved: usize,
     pub self_replaced: bool,
 }
 
@@ -36,6 +37,9 @@ impl fmt::Display for Summary {
             "Версия {}: обновлено файлов — {}, новых — {}, без изменений — {}, сохранено ваших — {}",
             self.version, self.updated, self.added, self.unchanged, self.preserved
         )?;
+        if self.moved > 0 {
+            write!(f, ". Батники переехали в папку scripts, старые копии из корня убраны — {}", self.moved)?;
+        }
         if self.self_replaced {
             write!(f, ". Лаунчер обновлён и сейчас перезапустится")?;
         }
@@ -328,10 +332,57 @@ fn install_zip(paths: &Paths, bytes: &[u8], version: &str) -> anyhow::Result<Sum
         let self_exe = std::env::current_exe().ok();
         let mut sum = Summary { version: version.to_string(), ..Default::default() };
         copy_over(&src, &paths.root, self_exe.as_deref(), &mut sum)?;
+        sum.moved = tidy_root(&src, &paths.root);
         Ok(sum)
     })();
     let _ = fs::remove_dir_all(&tmp);
     result
+}
+
+const LEGACY_DIRS: [&str; 2] = ["additional", "experimental"];
+const RETIRED: [&str; 1] = ["auto_update.bat"];
+
+fn tidy_root(src: &Path, root: &Path) -> usize {
+    let scripts = src.join("scripts");
+    if !scripts.is_dir() {
+        return 0;
+    }
+    let mut n = 0;
+    for f in RETIRED {
+        if scripts.join(f).exists() {
+            continue;
+        }
+        for old in [root.join(f), root.join("scripts").join(f)] {
+            if old.is_file() && fs::remove_file(&old).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(&scripts) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let old = root.join(&name);
+            if e.path().is_file() && old.is_file() && fs::remove_file(&old).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    for d in LEGACY_DIRS {
+        let (new, old) = (scripts.join(d), root.join(d));
+        if !new.is_dir() || !old.is_dir() {
+            continue;
+        }
+        if let Ok(rd) = fs::read_dir(&new) {
+            for e in rd.flatten() {
+                let f = old.join(e.file_name());
+                if f.is_file() && fs::remove_file(&f).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        let _ = fs::remove_dir(&old);
+    }
+    n
 }
 
 fn ensure_stopped() -> anyhow::Result<()> {
@@ -404,6 +455,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn old_root_scripts_are_removed_after_move() {
+        let base = std::env::temp_dir().join(format!("hz-tidy-{}", std::process::id()));
+        let (src, root) = (base.join("src"), base.join("root"));
+        for (rel, body) in [("scripts/general.bat", "x"), ("scripts/manager.bat", "x"), ("scripts/additional/a.bat", "x")] {
+            put_file(&src, rel, body);
+        }
+        for (rel, body) in [("general.bat", "old"), ("manager.bat", "old"), ("mine.bat", "keep"), ("additional/a.bat", "old"), ("additional/own.bat", "keep")] {
+            put_file(&root, rel, body);
+        }
+        assert_eq!(tidy_root(&src, &root), 3);
+        assert!(!root.join("general.bat").exists() && !root.join("manager.bat").exists());
+        assert!(root.join("mine.bat").is_file() && root.join("additional").join("own.bat").is_file());
+        assert!(!root.join("additional").join("a.bat").exists());
+        assert_eq!(tidy_root(&root, &root), 0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn retired_strategy_is_removed_on_update() {
+        let base = std::env::temp_dir().join(format!("hz-retired-{}", std::process::id()));
+        let (src, root) = (base.join("src"), base.join("root"));
+        put_file(&src, "scripts/general.bat", "new");
+        put_file(&root, "auto_update.bat", "old");
+        put_file(&root, "scripts/auto_update.bat", "old");
+        put_file(&root, "scripts/general.bat", "new");
+        assert_eq!(tidy_root(&src, &root), 2);
+        assert!(!root.join("auto_update.bat").exists() && !root.join("scripts").join("auto_update.bat").exists());
+        assert!(root.join("scripts").join("general.bat").is_file());
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn put_file(root: &Path, rel: &str, body: &str) {
@@ -561,7 +644,7 @@ mod tests {
         let sum = install_zip(&paths, &zip, "9.9.9").unwrap();
         assert_eq!(
             sum,
-            Summary { version: "9.9.9".into(), updated: 3, added: 2, unchanged: 1, preserved: 2, self_replaced: false }
+            Summary { version: "9.9.9".into(), updated: 3, added: 2, unchanged: 1, preserved: 2, moved: 0, self_replaced: false }
         );
         assert!(sum.to_string().contains("9.9.9"));
         assert_eq!(read(&root, "manager.bat"), "set \"LOCAL_VERSION=9.9.9\"");

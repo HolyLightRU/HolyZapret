@@ -18,6 +18,13 @@ pub struct Strategy {
     pub lists_label: String,
     pub blocks: usize,
     pub game_filter: bool,
+    pub ray: Option<(String, PathBuf)>,
+}
+
+impl Strategy {
+    pub fn source(&self) -> &std::path::Path {
+        self.ray.as_ref().map(|r| r.1.as_path()).unwrap_or(&self.path)
+    }
 }
 
 impl Strategy {
@@ -32,25 +39,48 @@ fn is_service_file(name: &str) -> bool {
     l.starts_with("service") || l == "holy_host_system.bat" || l == "manager.bat"
 }
 
+pub const SCRIPTS: &str = "scripts";
+
+pub fn scripts_dir(paths: &Paths) -> PathBuf {
+    paths.root.join(SCRIPTS)
+}
+
+fn subdirs(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<(String, PathBuf)> = rd.flatten().filter(|e| e.path().is_dir()).map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).collect();
+    v.sort();
+    v
+}
+
 pub fn discover(paths: &Paths) -> Vec<Strategy> {
     let mut out = Vec::new();
-    collect(paths, &paths.root, "Основные", &mut out);
-    if let Ok(rd) = fs::read_dir(&paths.root) {
-        let mut dirs: Vec<_> = rd.flatten().filter(|e| e.path().is_dir()).collect();
-        dirs.sort_by_key(|e| e.file_name());
-        for d in dirs {
-            let name = d.file_name().to_string_lossy().into_owned();
-            if matches!(name.as_str(), "bin" | "lists" | "exp-list" | "utils" | "launcher" | "target" | "flowseal.tmp")
-                || name.starts_with('.')
-            {
-                continue;
+    let scripts = scripts_dir(paths);
+    let mut nested = Vec::new();
+    if scripts.is_dir() {
+        collect(paths, &scripts, "Основные", &mut out);
+        for (name, dir) in subdirs(&scripts) {
+            if !name.starts_with('.') {
+                collect(paths, &dir, &name, &mut out);
+                nested.push(name.to_lowercase());
             }
-            let category = match flowseal::version_in(&d.path()) {
-                Some(v) if name == flowseal::DIR => format!("Flowseal {v}"),
-                _ => name,
-            };
-            collect(paths, &d.path(), &category, &mut out);
         }
+    }
+    let known: Vec<String> = out.iter().map(|s| s.id.to_lowercase()).collect();
+    let mut legacy = Vec::new();
+    collect(paths, &paths.root, "Основные", &mut legacy);
+    out.extend(legacy.into_iter().filter(|s| !known.contains(&s.id.to_lowercase())));
+    for (name, dir) in subdirs(&paths.root) {
+        if matches!(name.as_str(), "bin" | "lists" | "exp-list" | "utils" | "launcher" | "target" | "flowseal.tmp" | "docs" | SCRIPTS)
+            || name.starts_with('.')
+            || nested.contains(&name.to_lowercase())
+        {
+            continue;
+        }
+        let category = match flowseal::version_in(&dir) {
+            Some(v) if name == flowseal::DIR => format!("Flowseal {v}"),
+            _ => name,
+        };
+        collect(paths, &dir, &category, &mut out);
     }
     out
 }
@@ -86,7 +116,9 @@ fn collect(paths: &Paths, dir: &Path, category: &str, out: &mut Vec<Strategy>) {
         } else {
             (paths.engine(), paths.bin(), paths.lists())
         };
-        let rel = f.path().strip_prefix(&paths.root).map(|p| p.to_path_buf()).unwrap_or_else(|_| f.path());
+        let full = f.path();
+        let scripts = scripts_dir(paths);
+        let rel = full.strip_prefix(&scripts).or_else(|_| full.strip_prefix(&paths.root)).map(|p| p.to_path_buf()).unwrap_or_else(|_| full.clone());
         let id = rel.with_extension("").to_string_lossy().replace('/', "\\");
         let lists_label = lists
             .strip_prefix(&paths.root)
@@ -103,12 +135,13 @@ fn collect(paths: &Paths, dir: &Path, category: &str, out: &mut Vec<Strategy>) {
             lists_label,
             blocks: text.matches("--new").count() + 1,
             game_filter: lower.contains("%gamefilter"),
+            ray: None,
         });
     }
 }
 
 pub fn extract_args(strategy: &Strategy, _paths: &Paths, gf: &GameFilter) -> anyhow::Result<String> {
-    let text = fs::read_to_string(&strategy.path)?;
+    let text = fs::read_to_string(strategy.source())?;
     let bin = format!("{}\\", strategy.bin.display());
     let lists = format!("{}\\", strategy.lists.display());
 
@@ -233,6 +266,29 @@ mod tests {
     }
 
     #[test]
+    fn scripts_folder_keeps_ids_and_hides_old_copies() {
+        let root = std::env::temp_dir().join(format!("hz-scripts-test-{}", std::process::id()));
+        let line = "\"%BIN%HolyZapret.exe\" --wf-tcp=443 --hostlist=\"%LISTS%list-general.txt\"\r\n";
+        fs::create_dir_all(root.join("scripts").join("additional")).unwrap();
+        fs::create_dir_all(root.join("additional")).unwrap();
+        fs::write(root.join("scripts").join("general.bat"), format!("set \"LISTS=%~dp0..\\exp-list\\\"\r\n{line}")).unwrap();
+        fs::write(root.join("scripts").join("manager.bat"), line).unwrap();
+        fs::write(root.join("scripts").join("additional").join("ALT 1.bat"), line).unwrap();
+        fs::write(root.join("general.bat"), line).unwrap();
+        fs::write(root.join("mine.bat"), line).unwrap();
+        fs::write(root.join("additional").join("ALT 1.bat"), line).unwrap();
+        let p = Paths { root: root.clone() };
+        let all = discover(&p);
+        let _ = fs::remove_dir_all(&root);
+        let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["general", "additional\\ALT 1", "mine"]);
+        assert_eq!(all[0].path, root.join("scripts").join("general.bat"));
+        assert_eq!(all[0].lists, p.exp_lists());
+        assert_eq!(all[1].category, "additional");
+        assert_eq!(all[2].category, "Основные");
+    }
+
+    #[test]
     fn cmd_carets_are_unescaped_outside_quotes() {
         assert_eq!(unescape_cmd("--dpi-desync-fake-tls=^! --x=1"), "--dpi-desync-fake-tls=! --x=1");
         assert_eq!(unescape_cmd(r#"--a="C:/p^q" --b=^^"#), r#"--a="C:/p^q" --b=^"#);
@@ -247,6 +303,14 @@ mod tests {
         let p = Paths { root };
         let all = discover(&p);
         assert!(!all.is_empty());
+        let general = all.iter().find(|s| s.id == "general").unwrap();
+        let mut virt = general.clone();
+        virt.path = general.path.with_file_name("rayoflight-sni-split.virtual");
+        virt.ray = Some(("sni-split".into(), general.path.clone()));
+        let gf = GameFilter::default();
+        assert_eq!(extract_args(&virt, &p, &gf).unwrap(), extract_args(general, &p, &gf).unwrap());
+        assert_eq!(general.path, p.root.join("scripts").join("general.bat"));
+        assert!(all.iter().any(|s| s.id.starts_with("additional\\")) && all.iter().any(|s| s.id.starts_with("experimental\\")));
         for s in &all {
             let args = extract_args(s, &p, &GameFilter::all()).unwrap();
             assert!(!args.contains('^'), "{}: {args}", s.name);

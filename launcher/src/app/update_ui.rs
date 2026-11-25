@@ -181,7 +181,13 @@ impl App {
             match r {
                 Ok(sum) => {
                     notify(tx, Lvl::Ok, sum.to_string());
-                    match exe.filter(|_| sum.self_replaced) {
+                    let release_exe = p.root.join("HolyZapret Launcher.exe");
+                    let exe = match exe {
+                        Some(_) if crate::core::TEST_BUILD && !sum.self_replaced && release_exe.is_file() => Some(release_exe),
+                        e if sum.self_replaced => e,
+                        _ => None,
+                    };
+                    match exe {
                         Some(exe) => {
                             let _ = tx.send(Msg::Restart(exe));
                         }
@@ -214,7 +220,7 @@ impl App {
         let available = self.update_available().filter(|_| self.paths.is_some());
         if let Some(v) = &available {
             let quiet = self.busy || self.picker.running || self.tab == Tab::Wizard || self.confirm.is_some() || self.unpack.is_some() || self.whats_new.is_some() || self.share.open;
-            if !self.update.open && !self.update.running && self.update.dismissed.as_ref() != Some(v) && !quiet {
+            if !crate::core::TEST_BUILD && !self.update.open && !self.update.running && self.update.dismissed.as_ref() != Some(v) && !quiet {
                 self.update.open = true;
             }
         }
@@ -240,7 +246,13 @@ impl App {
         let u = &self.update;
         let modal = egui::Modal::new(egui::Id::NULL.with("update")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
-            let title = if u.running { format!("Обновляю HolyZapret до {v}") } else { format!("Вышла HolyZapret {v}") };
+            let test = crate::core::TEST_BUILD;
+            let title = match (u.running, test) {
+                (true, true) => format!("Перехожу на релиз {v}"),
+                (true, false) => format!("Обновляю HolyZapret до {v}"),
+                (false, true) => format!("Перейти на релиз {v}?"),
+                (false, false) => format!("Вышла HolyZapret {v}"),
+            };
             ui.label(RichText::new(title).size(17.0).strong());
             ui.add_space(4.0);
             if u.running {
@@ -258,11 +270,18 @@ impl App {
                     });
                 }
             } else {
+                let text = if test {
+                    format!(
+                        "Сейчас стоит тестовая сборка {local}. Релиз {v} скачается с GitHub и встанет поверх неё: ваши списки, правила и настройки сохранятся, удалять папку и скачивать архив вручную не нужно. Защита остановится на несколько секунд, а лаунчер перезапустится уже обычной версией и дальше будет обновляться как обычно."
+                    )
+                } else {
+                    format!(
+                        "Сейчас установлена {local}. Обновление скачается с GitHub и встанет поверх: ваши списки, правила и настройки сохранятся. Защита остановится на несколько секунд, а лаунчер сам перезапустится."
+                    )
+                };
                 ui.add(
                     egui::Label::new(
-                        RichText::new(format!(
-                            "Сейчас установлена {local}. Обновление скачается с GitHub и встанет поверх: ваши списки, правила и настройки сохранятся. Защита остановится на несколько секунд, а лаунчер сам перезапустится."
-                        ))
+                        RichText::new(text)
                         .color(Color32::from_gray(190)),
                     )
                     .wrap(),
@@ -279,7 +298,11 @@ impl App {
                         hide = true;
                     }
                 } else {
-                    let label = if u.error.is_some() { "Повторить" } else { "Обновить" };
+                    let label = match (u.error.is_some(), test) {
+                        (true, _) => "Повторить",
+                        (false, true) => "Перейти на релиз",
+                        (false, false) => "Обновить",
+                    };
                     if ui.add(theme::Primary(label.into())).clicked() {
                         go = true;
                     }

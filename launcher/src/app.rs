@@ -2,9 +2,11 @@ mod appcheck_ui;
 mod confirm;
 mod crash_ui;
 mod diag_tab;
+mod home_ray;
 mod lists_tab;
 mod phone_tab;
 mod picker_tab;
+mod ray_ui;
 mod rules_ui;
 mod share_ui;
 mod sites_tab;
@@ -36,6 +38,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use theme::{CYAN, GREEN, PINK, RED, YELLOW};
 
 const TOAST_LIFE: f64 = 4.5;
+
+const POST_INSTALL: &str = "Проверка после установки";
+const SITE_RETRIES: u8 = 2;
 
 enum Msg {
     Status(Status),
@@ -273,6 +278,8 @@ pub struct App {
     sites_running: bool,
     sites_total: usize,
     sites_announce: Option<&'static str>,
+    sites_retry: u8,
+    home: home_ray::RayHome,
     trial: Option<trial::Trial>,
     wizard: wizard::WizardState,
     wizard_done: bool,
@@ -291,6 +298,7 @@ pub struct App {
     game_err: Option<String>,
     diag: diag_tab::DiagState,
     check: appcheck_ui::CheckState,
+    ray: ray_ui::RayState,
     crash: Option<String>,
     crash_seen: bool,
     local_version: Option<String>,
@@ -336,6 +344,7 @@ impl App {
         let (tx, rx) = channel();
         let archived = crate::core::unpack::from_archive();
         let paths = paths::find_root().filter(|_| !archived).map(|root| Paths { root });
+        let pick_root = paths.as_ref().map(|p| p.root.clone());
         crate::core::tgwarp::init();
         let renamed = paths.as_ref().map(|p| crate::core::names::repair_tree(&p.root)).unwrap_or_default();
         let strategies = paths.as_ref().map(strategy::discover).unwrap_or_default();
@@ -360,11 +369,16 @@ impl App {
             sites_running: false,
             sites_total: 0,
             sites_announce: None,
+            sites_retry: 0,
+            home: Default::default(),
             trial: None,
             wizard: Default::default(),
             wizard_done: saved.wizard_done,
             autostart: None,
-            last_pick: crate::core::pickstore::load(),
+            last_pick: crate::core::pickstore::load().map(|lp| match &pick_root {
+                Some(r) => crate::core::pickstore::relocate(lp, r),
+                None => lp,
+            }),
             warp: None,
             tg: tg_ui::TgState::detect(),
             flow_last: 0.0,
@@ -378,6 +392,7 @@ impl App {
             game_err: None,
             diag: Default::default(),
             check: Default::default(),
+            ray: Default::default(),
             crash: crate::core::crash::take(),
             crash_seen: false,
             local_version,
@@ -552,11 +567,11 @@ impl App {
     }
 
     fn update_available(&self) -> Option<String> {
-        if crate::core::TEST_BUILD {
-            return None;
-        }
         let r = self.remote_version.as_ref()?;
         let l = self.local_version.clone().unwrap_or_default();
+        if crate::core::TEST_BUILD {
+            return (!selfupdate::is_newer(r, &l)).then(|| r.clone());
+        }
         selfupdate::is_newer(&l, r).then(|| r.clone())
     }
 
@@ -619,9 +634,24 @@ impl App {
                 }
                 Msg::Log(l, t) => self.note(l, t),
                 Msg::Toast(l, t) => self.toast(ctx, l, t),
-                Msg::Site(r) => self.sites.push(r),
+                Msg::Site(r) => match self.sites.iter().position(|s| s.url == r.url) {
+                    Some(i) => self.sites[i] = r,
+                    None => self.sites.push(r),
+                },
                 Msg::SitesDone => {
                     self.sites_running = false;
+                    let failing: Vec<String> = self.sites.iter().filter(|s| !s.ok).map(|s| s.url.clone()).collect();
+                    if self.sites_announce == Some(POST_INSTALL) && !failing.is_empty() && self.sites_retry < SITE_RETRIES && self.ray_adapts() {
+                        let n = failing.len();
+                        if self.start_site_recheck(ctx, failing) {
+                            self.sites_retry += 1;
+                            if self.sites_retry == 1 {
+                                self.note(Lvl::Info, format!("Не открылось сайтов: {n}. RayOfLight подбирает для них приём, проверяю ещё раз"));
+                            }
+                            continue;
+                        }
+                    }
+                    self.sites_retry = 0;
                     if let Some(what) = self.sites_announce.take() {
                         let ok = self.sites.iter().filter(|s| s.ok).count();
                         let total = self.sites.len();
@@ -639,7 +669,8 @@ impl App {
                     }
                 }
                 Msg::PostInstallCheck => {
-                    self.sites_announce = Some("Проверка после установки");
+                    self.sites_announce = Some(POST_INSTALL);
+                    self.sites_retry = 0;
                     self.start_site_check(ctx);
                 }
                 Msg::TrialStarted(Ok(t)) => {
@@ -846,7 +877,14 @@ impl App {
                             format!("Часть правил для сайтов подобрана под «{}»: перепроверьте их кнопкой «Перепроверить» на вкладке «Сайты»", others.join("», «")),
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    match crate::core::ray::wait_ready(p, std::time::Duration::from_secs(15)) {
+                        Some(true) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                        Some(false) => {
+                            let last = crate::core::ray::last_line(p).unwrap_or_else(|| "журнал пуст".into());
+                            notify(tx, Lvl::Err, format!("RayOfLight не включил перехват за 15 секунд, сайты из общего списка работать не будут. Последняя строка журнала движка: {last}"));
+                        }
+                        None => std::thread::sleep(std::time::Duration::from_secs(3)),
+                    }
                     let _ = tx.send(Msg::PostInstallCheck);
                 }
                 Err(e) => notify(tx, Lvl::Err, format!("Ошибка установки: {e}")),
@@ -860,6 +898,7 @@ impl App {
             ServiceState::Stopped => self.spawn(ctx, |_, tx| {
                 result_msg(tx, service::start().map(|_| "Служба запущена".to_string()), "Не удалось запустить службу")
             }),
+            ServiceState::NotInstalled if self.home.on => self.install_general(ctx),
             ServiceState::NotInstalled => self.install_selected(ctx),
         }
     }
@@ -908,8 +947,10 @@ impl App {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.add_space(6.0);
             if let Some(r) = self.update_available().filter(|_| self.paths.is_some()) {
-                let text = self.update.status().unwrap_or_else(|| format!("Доступна {r}"));
-                let chip = theme::chip(ui, &text, YELLOW).interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Обновить HolyZapret");
+                let offer = if crate::core::TEST_BUILD { format!("Есть релиз {r}") } else { format!("Доступна {r}") };
+                let text = self.update.status().unwrap_or(offer);
+                let tip = if crate::core::TEST_BUILD { "Перейти с тестовой сборки на релиз" } else { "Обновить HolyZapret" };
+                let chip = theme::chip(ui, &text, YELLOW).interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip);
                 if chip.clicked() {
                     self.open_update();
                 }
@@ -935,6 +976,7 @@ impl App {
                 let tip = match s.service {
                     ServiceState::Running => "Выключить: удалить службу",
                     ServiceState::Stopped => "Запустить службу",
+                    ServiceState::NotInstalled if self.home.on => "Включить защиту с RayOfLight",
                     ServiceState::NotInstalled => "Установить выбранную стратегию",
                 };
                 let resp = theme::power_button(ui, running, self.busy || tray::busy()).on_hover_text(tip);
@@ -942,7 +984,9 @@ impl App {
                     self.power(ctx, s.service.clone());
                 }
                 ui.add_space(10.0);
+                let text_w = (ui.available_width() - 230.0).max(180.0);
                 ui.vertical(|ui| {
+                    ui.set_max_width(text_w);
                     ui.add_space(8.0);
                     let title = match s.service {
                         ServiceState::Running => "Защита активна",
@@ -950,7 +994,18 @@ impl App {
                         ServiceState::NotInstalled => "Защита выключена",
                     };
                     ui.label(RichText::new(title).size(22.0).strong().color(Color32::WHITE));
+                    let ray_sub = (self.home.on && s.foreign_dir().is_none()).then(|| {
+                        let (q, e) = (settings::ray_quic(), settings::ray_experiment());
+                        if q == "adaptive" && e == "adaptive" {
+                            return "RayOfLight · самоподстройка".to_string();
+                        }
+                        let quic = if q.is_empty() { "QUIC на обычном движке".to_string() } else { crate::core::ray::quic_label(&q).to_string() };
+                        format!("RayOfLight · {} · {quic}", crate::core::ray::experiment_label(&e))
+                    });
                     let sub = match (s.foreign_dir(), s.active_strategy()) {
+                        (None, Some(n)) if ray_sub.is_some() && !n.eq_ignore_ascii_case("general") => format!("Стратегия: {n}"),
+                        (None, Some(_)) if ray_sub.is_some() => ray_sub.clone().unwrap_or_default(),
+                        (None, None) if self.home.on => "Нажмите кнопку: включится RayOfLight с самоподстройкой".to_string(),
                         (Some(d), _) => format!(
                             "Служба из другой папки: {}{}",
                             d.display(),
@@ -961,7 +1016,7 @@ impl App {
                     };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(RichText::new(sub).color(Color32::from_gray(160)));
+                        ui.add(egui::Label::new(RichText::new(&sub).color(Color32::from_gray(160))).truncate()).on_hover_text(&sub);
                         if let Some((text, hover)) = &extra {
                             let link = ui
                                 .add(egui::Label::new(RichText::new(text).color(theme::CYAN)).sense(egui::Sense::click()))
@@ -1035,10 +1090,15 @@ impl App {
     }
 
     fn main_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.home.refresh(self.paths.as_ref());
         self.health_card(ui, ctx);
         self.trial_card(ui, ctx);
         self.hero(ui, ctx);
         self.warp_row(ui, ctx);
+        if self.home.on {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.ray_home(ui, ctx));
+            return;
+        }
         let cats = self.categories();
         let pick_tab = self.last_pick.as_ref().is_some_and(|p| self.strategies.iter().any(|s| p.scores.contains_key(&s.path)));
         let offset = if pick_tab { 2 } else { 1 };
@@ -1189,15 +1249,19 @@ impl App {
                 3 => Some(Lvl::Info),
                 _ => None,
             };
-            egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 let mut any = false;
-                for e in self.log.iter().filter(|e| want.is_none_or(|w| w == e.lvl)) {
+                for e in self.log.iter().rev().filter(|e| want.is_none_or(|w| w == e.lvl)) {
                     any = true;
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+                    let width = ui.available_width();
+                    let galley = ui.painter().layout(e.text.clone(), egui::FontId::proportional(14.0), Color32::from_gray(220), (width - 140.0 - 14.0).max(80.0));
+                    let first = galley.rows.first().map_or(galley.size().y, |r| r.rect().height());
+                    let height = (galley.size().y + 30.0 - first).max(30.0);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
                     let p = ui.painter();
                     p.rect_filled(rect, CornerRadius::same(8), Color32::from_white_alpha(5));
-                    let y = rect.center().y;
+                    let y = rect.top() + 15.0;
                     p.text(
                         egui::pos2(rect.left() + 10.0, y),
                         egui::Align2::LEFT_CENTER,
@@ -1206,15 +1270,8 @@ impl App {
                         Color32::from_gray(120),
                     );
                     let color = lvl_color(e.lvl);
-                    let pill = theme::paint_pill(p, egui::pos2(rect.left() + 128.0, y), e.lvl.tag(), color);
-                    let galley = p.layout(
-                        e.text.clone(),
-                        egui::FontId::proportional(14.0),
-                        Color32::from_gray(220),
-                        rect.right() - pill.right() - 24.0,
-                    );
-                    let gy = y - galley.rows.first().map_or(galley.size().y, |r| r.rect().height()) / 2.0;
-                    p.with_clip_rect(rect).galley(egui::pos2(pill.right() + 12.0, gy), galley, Color32::from_gray(220));
+                    theme::paint_pill(p, egui::pos2(rect.left() + 128.0, y), e.lvl.tag(), color);
+                    p.with_clip_rect(rect).galley(egui::pos2(rect.left() + 140.0, y - first / 2.0), galley, Color32::from_gray(220));
                 }
                 if !any {
                     ui.add_space(30.0);

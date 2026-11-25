@@ -4,6 +4,8 @@ $rootDir = Split-Path $PSScriptRoot
 $listsDir = Join-Path $rootDir "lists"
 $expListsDir = Join-Path $rootDir "exp-list"
 $utilsDir = Join-Path $rootDir "utils"
+$scriptsDir = Join-Path $rootDir "scripts"
+if (-not (Test-Path $scriptsDir)) { $scriptsDir = $rootDir }
 $resultsDir = Join-Path $utilsDir "результаты тестов"
 if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir | Out-Null }
 
@@ -260,13 +262,13 @@ $dpiTargets = Build-DpiTargets -CustomUrl $dpiCustomUrl
 # === Сбор всех .bat стратегий (как в manager.bat) ===
 $batFiles = @()
 # Корень
-Get-ChildItem -Path $rootDir -Filter "*.bat" | Where-Object {
+Get-ChildItem -Path $scriptsDir -Filter "*.bat" | Where-Object {
     $n = $_.Name.ToLower()
     $n -notlike "service*" -and $n -ne "holy_host_system.bat" -and $n -ne "manager.bat"
 } | ForEach-Object { $batFiles += $_ }
 
 # Подпапки
-Get-ChildItem -Path $rootDir -Directory | ForEach-Object {
+Get-ChildItem -Path $scriptsDir -Directory | ForEach-Object {
     Get-ChildItem -Path $_.FullName -Filter "*.bat" | Where-Object {
         $n = $_.Name.ToLower()
         $n -notlike "service*" -and $n -ne "holy_host_system.bat"

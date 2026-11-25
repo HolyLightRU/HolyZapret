@@ -26,6 +26,7 @@ pub struct PickerState {
     results: Vec<Outcome>,
     chosen: Option<usize>,
     optimal: Option<usize>,
+    rays: Option<usize>,
     pub(super) scope: usize,
     report_form: Option<(String, String, String)>,
     pub(super) sites: String,
@@ -36,15 +37,16 @@ pub struct PickerState {
 impl PickerState {
     pub fn invalidate(&mut self) {
         self.optimal = None;
+        self.rays = None;
         self.default_targets.clear();
     }
 
     fn preview_targets(&self) -> Vec<Target> {
-        if self.scope == 1 {
-            picker::custom_targets(&picker::parse_sites(&self.sites).0)
-        } else {
-            self.default_targets.clone()
+        let mut t = if self.scope == 1 { picker::custom_targets(&picker::parse_sites(&self.sites).0) } else { self.default_targets.clone() };
+        if self.mode == 3 && !t.is_empty() {
+            t.extend(picker::quic_targets());
         }
+        t
     }
 
     pub fn running(&self) -> bool {
@@ -72,7 +74,7 @@ impl PickerState {
     pub fn optimal_count(&mut self, paths: Option<&crate::core::paths::Paths>, strategies: &[crate::core::strategy::Strategy]) -> usize {
         if self.optimal.is_none() {
             if let Some(p) = paths {
-                self.optimal = Some(picker::optimal(p, strategies).len());
+                self.optimal = Some(picker::optimal(p, strategies).len() + crate::core::ray::quick_variant(p, strategies).is_some() as usize);
             }
         }
         self.optimal.unwrap_or(0)
@@ -167,8 +169,13 @@ impl PickerState {
         picker::unreachable_checks(&self.targets, &self.results)
     }
 
-    fn unreachable_names(&self) -> Vec<String> {
-        self.targets.iter().zip(self.unreachable()).filter(|(_, n)| *n).map(|(t, _)| picker::check_label(t)).collect()
+    fn unreachable_names(&self) -> (Vec<String>, Vec<String>) {
+        let dead = self.unreachable();
+        let dns = picker::dns_failures(&self.results, &dead);
+        let pick = |want_dns: bool| -> Vec<String> {
+            self.targets.iter().enumerate().filter(|(i, _)| dead[*i] && dns[*i] == want_dns).map(|(_, t)| picker::check_label(t)).collect()
+        };
+        (pick(true), pick(false))
     }
 
     fn mask(&self) -> Vec<bool> {
@@ -274,7 +281,10 @@ impl App {
                 self.picker.default_targets = picker::load_targets(p);
             }
             if self.picker.optimal.is_none() {
-                self.picker.optimal = Some(picker::optimal(p, &self.strategies).len());
+                self.picker.optimal = Some(picker::optimal(p, &self.strategies).len() + crate::core::ray::quick_variant(p, &self.strategies).is_some() as usize);
+            }
+            if self.picker.rays.is_none() {
+                self.picker.rays = Some(crate::core::ray::virtual_strategies(p, &self.strategies).len());
             }
         }
         theme::card(ui, |ui| {
@@ -311,17 +321,23 @@ impl App {
         let optimal = self.picker.optimal.unwrap_or(0);
         let all = self.strategies.len();
         let exp = self.strategies.iter().filter(|s| s.category == crate::core::EXPERIMENTAL).count();
+        let rays = self.picker.rays.unwrap_or(0);
         theme::row(ui, 36.0, |ui| {
             theme::row_label(ui, "Набор", 110.0);
             let mut labels = vec![format!("Быстрый · {optimal}"), format!("Все · {all}")];
+            let mut modes = vec![0, 1];
             if exp > 0 {
                 labels.push(format!("Эксперимент · {}", exp + optimal));
+                modes.push(2);
             }
-            theme::segmented(ui, &labels, &mut self.picker.mode);
+            if rays > 0 {
+                labels.push(format!("RayOfLight · {}", rays + 1));
+                modes.push(3);
+            }
+            let mut sel = modes.iter().position(|&m| m == self.picker.mode).unwrap_or(0);
+            theme::segmented(ui, &labels, &mut sel);
+            self.picker.mode = modes[sel];
         });
-        if self.picker.mode == 2 && exp == 0 {
-            self.picker.mode = 0;
-        }
         theme::row(ui, 36.0, |ui| {
             theme::row_label(ui, "Проверять", 110.0);
             let labels = vec!["Все сайты".to_string(), "Только мои".to_string()];
@@ -370,6 +386,7 @@ impl App {
         let n = match self.picker.mode {
             0 => optimal,
             2 => exp + optimal,
+            3 => rays + 1,
             _ => all,
         };
         let minutes = ((n + 1) * SECONDS_PER_STRATEGY).div_ceil(60);
@@ -382,6 +399,11 @@ impl App {
                 preview.len()
             ));
         }
+        if self.picker.mode == 3 {
+            notes.push(
+                "Сравнение движков: general на обычном движке и каждый эксперимент RayOfLight на тех же сайтах, плюс 4 проверки QUIC. Лучший можно сразу поставить.".to_string(),
+            );
+        }
         if self.picker.scope == 1 {
             notes.push("Если сайт после подбора открывается не полностью, найдите его дополнительные домены во вкладке «Списки».".into());
         }
@@ -392,7 +414,7 @@ impl App {
         }
         notes.push("Подбор сначала проверяет сайты без обхода, чтобы понять, что заблокировано.".into());
         if !picker::tls13_supported() {
-            notes.push("Эта версия Windows не поддерживает TLS 1.3 в системном curl, поэтому сайты проверяются только через TLS 1.2.".into());
+            notes.push("В curl этой версии Windows нет TLS 1.3, поэтому TLS 1.3 проверяется по ответу сайта на первое сообщение, без загрузки страницы.".into());
         }
         for e in bad.iter().take(3) {
             ui.label(RichText::new(e).color(RED).size(12.5));
@@ -492,7 +514,14 @@ impl App {
                     .size(12.5),
                 );
             }
-            let dead = self.picker.unreachable_names();
+            let (no_dns, dead) = self.picker.unreachable_names();
+            if !no_dns.is_empty() && !self.picker.running {
+                ui.label(
+                    RichText::new(format!("Адрес не находится: такого сайта нет в DNS или в адресе опечатка. Обход тут не поможет, в счёт не идут: {}", no_dns.join(", ")))
+                        .weak()
+                        .size(12.5),
+                );
+            }
             if !dead.is_empty() && !self.picker.running {
                 ui.label(
                     RichText::new(format!(
@@ -649,7 +678,7 @@ impl App {
             self.confirm = Some(super::confirm::Confirm::RemoveService);
         }
         if let Some(i) = install {
-            let path = self.picker.results[i].path.clone();
+            let path = self.picker.results[i].path.clone().and_then(|p| self.install_target(p));
             if let Some(idx) = path.and_then(|p| self.strategies.iter().position(|s| s.path == p)) {
                 self.selected = Some(idx);
                 self.tab = Tab::Main;
@@ -823,6 +852,19 @@ impl App {
         if let Some(c) = &self.crash {
             out.push(("Падение лаунчера в прошлый раз".into(), c.lines().map(String::from).collect()));
         }
+        if crate::core::TEST_BUILD || crate::core::settings::ray_enabled() {
+            if let Some(p) = &self.paths {
+                out.push(("RayOfLight".into(), crate::core::ray::report_lines(p)));
+            }
+        }
+        let gw = self.phone.gateway_iface();
+        if crate::core::settings::ray_gateway() || gw.as_ref().is_some_and(|i| i.forwarding) {
+            out.push(("Компьютер как шлюз".into(), vec![crate::core::gateway::report_line(gw.as_ref())]));
+        }
+        let devices = crate::core::lanproxy::control::report_lines();
+        if !devices.is_empty() {
+            out.push(("Раздача: что запрашивают устройства".into(), devices));
+        }
         out
     }
 
@@ -868,7 +910,8 @@ impl App {
             ),
             picker::Choice::Keep(None) => self.toast(ctx, Lvl::Err, "Подбор не нашёл рабочей стратегии. Попробуйте полный подбор: набор «Все» на вкладке «Подбор»"),
             picker::Choice::Switch { path, name, from, score } => {
-                if let Some(idx) = self.strategies.iter().position(|s| s.path == path) {
+                let target = self.install_target(path);
+                if let Some(idx) = target.and_then(|p| self.strategies.iter().position(|s| s.path == p)) {
                     self.selected = Some(idx);
                     self.health_alert.clear();
                     let why = match from {
@@ -946,11 +989,57 @@ impl App {
         on
     }
 
+    fn start_ray_pick(&mut self, ctx: &egui::Context, p: &crate::core::paths::Paths) {
+        let virt = crate::core::ray::virtual_strategies(p, &self.strategies);
+        let Some(general) = self.strategies.iter().find(|s| s.id == "general").cloned() else {
+            self.toast(ctx, Lvl::Err, "Не найдена стратегия general");
+            return;
+        };
+        if virt.is_empty() {
+            self.toast(ctx, Lvl::Err, "RayOfLight недоступен: нет RayOfLight.exe или general изменена");
+            return;
+        }
+        let mut list = vec![general];
+        list.extend(virt);
+        self.run_pick_list(ctx, p.clone(), list);
+    }
+
+    fn install_target(&mut self, path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        let general = self.strategies.iter().find(|s| s.id == "general").map(|s| s.path.clone());
+        let compared = self.picker.results.iter().any(|r| r.path.as_deref().and_then(crate::core::ray::virtual_experiment).is_some());
+        match crate::core::ray::virtual_experiment(&path) {
+            Some(exp) => {
+                crate::core::settings::set_ray_enabled(true);
+                match exp.strip_prefix("quic-") {
+                    Some(q) => {
+                        crate::core::settings::set_ray_experiment("general");
+                        crate::core::settings::set_ray_quic(q);
+                    }
+                    None => {
+                        crate::core::settings::set_ray_experiment(&exp);
+                    }
+                }
+                self.ray = Default::default();
+                general
+            }
+            None => {
+                if compared && general.as_ref() == Some(&path) {
+                    crate::core::settings::set_ray_enabled(false);
+                    self.ray = Default::default();
+                }
+                Some(path)
+            }
+        }
+    }
+
     pub(super) fn start_pick(&mut self, ctx: &egui::Context) {
         if self.warp_blocks_checks() {
             return;
         }
         let Some(p) = self.paths.clone() else { return };
+        if self.picker.mode == 3 {
+            return self.start_ray_pick(ctx, &p);
+        }
         let idx: Vec<usize> = match self.picker.mode {
             0 => picker::optimal(&p, &self.strategies),
             2 => {
@@ -977,13 +1066,32 @@ impl App {
                 }
             }
         }
-        let list: Vec<crate::core::strategy::Strategy> = idx.iter().map(|&i| self.strategies[i].clone()).collect();
+        let mut list: Vec<crate::core::strategy::Strategy> = idx.iter().map(|&i| self.strategies[i].clone()).collect();
+        if self.picker.mode == 0 {
+            if let Some(v) = crate::core::ray::quick_variant(&p, &self.strategies) {
+                list.push(v);
+            }
+        }
+        self.run_pick_list(ctx, p, list);
+    }
+
+    fn run_pick_list(&mut self, ctx: &egui::Context, p: crate::core::paths::Paths, list: Vec<crate::core::strategy::Strategy>) {
         let mut add_to: Vec<std::path::PathBuf> = Vec::new();
         let targets = if self.picker.scope == 1 {
             let urls = picker::parse_sites(&self.picker.sites).0;
             if urls.is_empty() {
                 self.toast(ctx, Lvl::Info, "Впишите сайт, для которого нужно подобрать стратегию");
                 return;
+            }
+            let hosts: Vec<String> = urls.iter().map(|u| picker::host_of(u)).collect();
+            let missing = picker::unresolved(&hosts);
+            let urls: Vec<String> = urls.into_iter().filter(|u| !missing.contains(&picker::host_of(u))).collect();
+            if urls.is_empty() {
+                self.toast(ctx, Lvl::Err, format!("Адрес не находится: {}. Проверьте, нет ли опечатки", missing.join(", ")));
+                return;
+            }
+            if !missing.is_empty() {
+                self.toast(ctx, Lvl::Info, format!("Адрес не находится: {}. Эти сайты не проверяю", missing.join(", ")));
             }
             if !self.picker.skip_lists {
                 for s in &list {
@@ -997,6 +1105,10 @@ impl App {
         } else {
             picker::load_targets(&p)
         };
+        let mut targets = targets;
+        if self.picker.mode == 3 {
+            targets.extend(picker::quic_targets());
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let st = &mut self.picker;
         st.targets = targets.clone();
@@ -1051,6 +1163,9 @@ fn result_row(
     let name_col = if rank.is_none() { Color32::from_gray(160) } else { Color32::WHITE };
     p.text(egui::pos2(rect.left() + 44.0, y1), egui::Align2::LEFT_CENTER, &o.name, egui::FontId::proportional(15.0), name_col);
     let (ok, total) = o.score_without(noisy);
+    let meta = if o.error.is_some() { String::new() } else { format!("{ok}/{total} · {} мс", o.avg_ms()) };
+    let meta = p.layout_no_wrap(meta, egui::FontId::proportional(12.5), Color32::from_gray(170));
+    let limit = rect.right() - 16.0 - meta.size().x - 14.0;
     let mut x = rect.left() + 44.0;
     if let Some(e) = &o.error {
         let mut short: String = e.chars().take(70).collect();
@@ -1059,15 +1174,28 @@ fn result_row(
         }
         p.text(egui::pos2(x, y2), egui::Align2::LEFT_CENTER, format!("Не запустилась: {short}"), egui::FontId::proportional(12.0), RED);
     } else {
-        for c in cats {
-            let (a, b) = o.category_without(targets, c, noisy);
-            if b == 0 {
-                continue;
+        let shown: Vec<(String, Color32)> = cats
+            .iter()
+            .filter_map(|c| {
+                let (a, b) = o.category_without(targets, c, noisy);
+                if b > 0 {
+                    return Some((format!("{c} {a}/{b}"), if a == b { GREEN } else if a == 0 { RED } else { YELLOW }));
+                }
+                masked(targets, c, noisy).then(|| (format!("{c} —"), Color32::from_gray(120)))
+            })
+            .collect();
+        for (i, (text, col)) in shown.iter().enumerate() {
+            let g = p.layout_no_wrap(text.clone(), egui::FontId::proportional(12.0), *col);
+            let more = p.layout_no_wrap(format!("ещё {}", shown.len() - i), egui::FontId::proportional(12.0), Color32::from_gray(150));
+            let last = i + 1 == shown.len();
+            if x + g.size().x > limit || (!last && x + g.size().x + 14.0 + more.size().x > limit) {
+                if x + more.size().x <= limit {
+                    p.galley(egui::pos2(x, y2 - more.size().y / 2.0), more, Color32::from_gray(150));
+                }
+                break;
             }
-            let col = if a == b { GREEN } else if a == 0 { RED } else { YELLOW };
-            let g = p.layout_no_wrap(format!("{c} {a}/{b}"), egui::FontId::proportional(12.0), col);
             let w = g.size().x;
-            p.galley(egui::pos2(x, y2 - g.size().y / 2.0), g, col);
+            p.galley(egui::pos2(x, y2 - g.size().y / 2.0), g, *col);
             x += w + 14.0;
         }
     }
@@ -1078,11 +1206,8 @@ fn result_row(
         let fill = egui::Rect::from_min_size(bar.min, egui::vec2(bar_w * ok as f32 / total as f32, 6.0));
         theme::gradient_rect(p, fill, 3.0, PINK, CYAN);
     }
-    let mut right = egui::pos2(rect.right() - 16.0, y2);
-    let meta = if o.error.is_some() { String::new() } else { format!("{ok}/{total} · {} мс", o.avg_ms()) };
-    let g = p.layout_no_wrap(meta, egui::FontId::proportional(12.5), Color32::from_gray(170));
-    right.x -= g.size().x;
-    p.galley(egui::pos2(right.x, y2 - g.size().y / 2.0), g, Color32::from_gray(170));
+    let mx = rect.right() - 16.0 - meta.size().x;
+    p.galley(egui::pos2(mx, y2 - meta.size().y / 2.0), meta, Color32::from_gray(170));
     let mut pill_right = egui::pos2(bar.left() - 12.0, y1);
     if best {
         let r = theme::paint_pill(p, pill_right, "Лучшая", GREEN);
@@ -1096,12 +1221,20 @@ fn result_row(
     })
 }
 
+fn masked(targets: &[Target], cat: &str, noisy: &[bool]) -> bool {
+    targets.iter().enumerate().any(|(i, t)| t.category == cat && noisy.get(i).copied().unwrap_or(false))
+}
+
 fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) -> String {
     let mut lines: Vec<String> = cats
         .iter()
         .map(|c| {
             let (a, b) = o.category_without(targets, c, noisy);
-            (b > 0).then(|| format!("{c}: {a} из {b}"))
+            if b > 0 {
+                Some(format!("{c}: {a} из {b}"))
+            } else {
+                masked(targets, c, noisy).then(|| format!("{c}: не в счёт, недоступен и без обхода, и со всеми стратегиями"))
+            }
         })
         .flatten()
         .collect();
@@ -1115,6 +1248,7 @@ fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) ->
                 picker::CheckKind::Tls12 => "TLS 1.2",
                 picker::CheckKind::Tls13 => "TLS 1.3",
                 picker::CheckKind::Freeze => "загрузка",
+                picker::CheckKind::Quic => "QUIC",
             };
             format!("  {} ({kind}): {}", t.name, c.detail())
         })
@@ -1135,6 +1269,9 @@ fn tip_text(o: &Outcome, targets: &[Target], cats: &[String], noisy: &[bool]) ->
         if !untouched.is_empty() {
             lines.push(format!("Не обходит (не открываются и без обхода): {}", untouched.join(", ")));
         }
+        if let Some(r) = &o.ray {
+            lines.push(r.clone());
+        }
     }
     lines.join("\n")
 }
@@ -1147,7 +1284,7 @@ mod tests {
 
     fn outcome(name: &str, path: Option<&str>, ok: &[bool]) -> Outcome {
         let checks = ok.iter().map(|&o| Check { ok: o, ms: 100, code: if o { 200 } else { 0 }, exit: if o { 0 } else { 28 }, ..Check::failed() }).collect();
-        Outcome { name: name.into(), path: path.map(PathBuf::from), error: None, checks }
+        Outcome { name: name.into(), path: path.map(PathBuf::from), error: None, checks, ray: None }
     }
 
     #[test]

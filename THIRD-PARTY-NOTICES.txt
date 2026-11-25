@@ -8,7 +8,10 @@ HolyZapret использует и распространяет код и фай
 zapret — https://github.com/bol-van/zapret
 ==============================================================================
 Используется: движок bin/HolyZapret.exe (winws из zapret v72.2), файлы
-фейковых пакетов bin/*.bin, формат и параметры стратегий.
+фейковых пакетов bin/*.bin, формат и параметры стратегий. В собственный движок
+RayOfLight (launcher/rayoflight) перенесены встроенный фейк TLS
+(assets/fake_tls_default.bin из nfq/desync.c) и логика приёмов fake и
+multisplit с seqovl (nfq/desync.c, nfq/darkmagic.c, nfq/nfqws.c).
 
 MIT License
 

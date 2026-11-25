@@ -42,6 +42,7 @@ enum Act {
     Cloudflare(bool),
     Warp(bool),
     WarpProxy,
+    Lan(bool),
 }
 
 fn muted(text: impl Into<String>) -> RichText {
@@ -165,6 +166,38 @@ impl App {
                     });
                 }
                 _ => {}
+            }
+            theme::row(ui, 34.0, |ui| {
+                ui.label(RichText::new("Для телефонов в домашней сети").color(Color32::from_gray(225)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut on = saved.config.lan;
+                    if theme::toggle(ui, &mut on).changed() {
+                        act = Some(Act::Lan(on));
+                    }
+                });
+            });
+            ui.add(
+                egui::Label::new(muted(
+                    "Telegram на телефоне подключается к этому прокси сам, без VPN и приложений: нужен только прокси в настройках Telegram. Путь тот же, что у Telegram на компьютере, в том числе через WARP, если он включён выше. Подключиться могут только устройства из вашей сети.",
+                ))
+                .wrap(),
+            );
+            if let (true, Some(link)) = (saved.config.lan, control::phone_link()) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    super::phone_tab::qr(ui, &link, 132.0);
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Наведите камеру телефона").strong());
+                        ui.add(
+                            egui::Label::new(muted(
+                                "Откроется Telegram и предложит подключить прокси, нажмите «Подключить». Телефон должен быть в той же сети, что и компьютер.",
+                            ))
+                            .wrap(),
+                        );
+                        ui.add(egui::Label::new(muted(&link)).truncate());
+                    });
+                });
             }
             if !self.tg.foreign.is_empty() {
                 theme::row(ui, 34.0, |ui| {
@@ -297,6 +330,17 @@ impl App {
                 }
             }
             Act::WarpProxy => self.warp_proxy_on(ctx),
+            Act::Lan(on) => {
+                let config = tgproxy::Config { lan: on, ..saved.config.clone() };
+                let note = if !on {
+                    "Telegram-прокси снова только для этого компьютера"
+                } else if snap.is_some() {
+                    "Прокси открыт для домашней сети: наведите камеру телефона на QR-код"
+                } else {
+                    "Прокси будет доступен в домашней сети, когда вы его включите"
+                };
+                self.tg_apply(ctx, config, note);
+            }
             Act::Cloudflare(cf) => {
                 let config = tgproxy::Config { cloudflare: cf, ..saved.config.clone() };
                 self.tg_apply(ctx, config, if cf { "Запасной путь через Cloudflare включён" } else { "Запасной путь через Cloudflare выключен" });

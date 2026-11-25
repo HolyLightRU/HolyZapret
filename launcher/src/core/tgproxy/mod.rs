@@ -26,11 +26,16 @@ pub struct Config {
     pub secret: [u8; 16],
     pub cloudflare: bool,
     pub cf_domain: String,
+    pub lan: bool,
 }
 
 impl Config {
     pub fn link(&self) -> String {
         format!("tg://proxy?server=127.0.0.1&port={}&secret=dd{}", self.port, hex(&self.secret))
+    }
+
+    pub fn phone_link(&self, ip: &str) -> String {
+        format!("https://t.me/proxy?server={ip}&port={}&secret=dd{}", self.port, hex(&self.secret))
     }
 }
 
@@ -113,28 +118,33 @@ pub fn start(config: Config) -> anyhow::Result<Handle> {
 }
 
 fn start_with(config: Config, routes: Routes) -> anyhow::Result<Handle> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", config.port))
+    let host = if config.lan { "0.0.0.0" } else { "127.0.0.1" };
+    let listener = std::net::TcpListener::bind((host, config.port))
         .map_err(|e| anyhow::anyhow!("порт {} занят или недоступен: {e}", config.port))?;
     listener.set_nonblocking(true)?;
     let stats = Arc::new(Stats::default());
     let shared = Arc::new(Shared { secret: config.secret, routes, stats: stats.clone() });
     let (tx, rx) = oneshot::channel();
+    let lan = config.lan;
     let thread = std::thread::Builder::new().name("tg-proxy".into()).spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
         rt.block_on(async move {
             let Ok(listener) = TcpListener::from_std(listener) else { return };
-            serve(listener, shared, rx).await;
+            serve(listener, shared, rx, lan).await;
         });
     })?;
     Ok(Handle { stop: Some(tx), thread: Some(thread), stats, config })
 }
 
-async fn serve(listener: TcpListener, shared: Arc<Shared>, mut stop: oneshot::Receiver<()>) {
+async fn serve(listener: TcpListener, shared: Arc<Shared>, mut stop: oneshot::Receiver<()>, lan: bool) {
     loop {
         tokio::select! {
             _ = &mut stop => break,
             r = listener.accept() => {
-                if let Ok((s, _)) = r {
+                if let Ok((s, peer)) = r {
+                    if lan && !crate::core::lanproxy::is_lan(&peer.ip()) {
+                        continue;
+                    }
                     let sh = shared.clone();
                     tokio::spawn(async move {
                         sh.stats.active.fetch_add(1, Ordering::Relaxed);
@@ -319,8 +329,9 @@ mod tests {
     #[test]
     fn secret_and_link() {
         let s = [0xab; 16];
-        let c = Config { port: 1443, secret: s, cloudflare: true, cf_domain: String::new() };
+        let c = Config { port: 1443, secret: s, cloudflare: true, cf_domain: String::new(), lan: false };
         assert_eq!(c.link(), format!("tg://proxy?server=127.0.0.1&port=1443&secret=dd{}", "ab".repeat(16)));
+        assert_eq!(c.phone_link("192.168.1.10"), format!("https://t.me/proxy?server=192.168.1.10&port=1443&secret=dd{}", "ab".repeat(16)));
         assert_eq!(parse_secret(&hex(&s)), Some(s));
         assert_eq!(parse_secret(&format!("dd{}", hex(&s))), Some(s));
         assert_eq!(parse_secret("xyz"), None);
@@ -374,7 +385,7 @@ mod tests {
             let secret = new_secret();
             let mut routes = Routes::new(None, false).unwrap();
             routes.plain_ws = Some(tg_addr);
-            let cfg = Config { port, secret, cloudflare: false, cf_domain: String::new() };
+            let cfg = Config { port, secret, cloudflare: false, cf_domain: String::new(), lan: false };
             let handle = start_with(cfg, routes).unwrap();
 
             let (init, mut cl) = peers::client(&secret, Proto::Intermediate, 2);
@@ -405,7 +416,7 @@ mod tests {
         rt.block_on(async {
             let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
             let secret = new_secret();
-            let handle = start(Config { port, secret, cloudflare: true, cf_domain: String::new() }).unwrap();
+            let handle = start(Config { port, secret, cloudflare: true, cf_domain: String::new(), lan: false }).unwrap();
             for (dc, proto) in [(2i16, Proto::Secure), (-4, Proto::Intermediate), (1, Proto::Abridged), (5, Proto::Secure)] {
                 let (init, mut cl) = peers::client(&secret, proto, dc);
                 let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -449,7 +460,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            let cfg = Config { port, secret: new_secret(), cloudflare: false, cf_domain: String::new() };
+            let cfg = Config { port, secret: new_secret(), cloudflare: false, cf_domain: String::new(), lan: false };
             let handle = start(cfg).unwrap();
             let (init, _) = peers::client(&new_secret(), Proto::Secure, 2);
             let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

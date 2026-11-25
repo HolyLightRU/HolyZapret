@@ -131,6 +131,23 @@ fn start(port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn page_address() -> Option<String> {
+    let port = PROXY.lock().unwrap().as_ref()?.port;
+    Some(format!("{}:{port}", super::lan_ip()?))
+}
+
+pub fn ensure_page() -> anyhow::Result<()> {
+    if PROXY.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    if super::lan_ip().is_none() {
+        anyhow::bail!("компьютер не подключён к домашней сети: нет локального адреса");
+    }
+    start(load().port)?;
+    soft_off();
+    Ok(())
+}
+
 pub fn shutdown() {
     let h = PROXY.lock().unwrap().take();
     if h.is_some() {
@@ -204,6 +221,55 @@ pub fn snapshot() -> Option<Snapshot> {
         down: s.down.load(Ordering::Relaxed),
         last_error: s.last_error.lock().unwrap().clone(),
     })
+}
+
+pub fn devices() -> Vec<(std::net::IpAddr, super::Device)> {
+    let g = PROXY.lock().unwrap();
+    let Some(h) = g.as_ref() else { return Vec::new() };
+    let mut v: Vec<(std::net::IpAddr, super::Device)> = h.stats.devices.lock().unwrap().iter().map(|(k, d)| (*k, d.clone())).collect();
+    v.sort_by(|a, b| b.1.last.cmp(&a.1.last));
+    v
+}
+
+pub fn device_title(ip: &std::net::IpAddr, d: &super::Device) -> String {
+    match super::device_kind(&d.agents) {
+        Some(k) => format!("{ip} · {k}"),
+        None => ip.to_string(),
+    }
+}
+
+pub fn visit_line(v: &super::Visit) -> String {
+    let target = match (v.kind, v.port) {
+        ("HTTPS", 443) | ("HTTP", 80) | ("UDP", _) => v.host.clone(),
+        _ => format!("{}:{}", v.host, v.port),
+    };
+    let times = if (2..=4).contains(&(v.count % 10)) && !(12..=14).contains(&(v.count % 100)) { "раза" } else { "раз" };
+    let mut out = format!("{target} · {} · {} {times}", v.kind, v.count);
+    if v.open > 0 {
+        out.push_str(&format!(" · открыто {}", v.open));
+    }
+    if v.down > 0 {
+        out.push_str(&format!(" · получено {}", crate::core::tgproxy::control::human(v.down)));
+    }
+    if let Some(e) = &v.error {
+        out.push_str(&format!(" · ошибка: {e}"));
+    }
+    out
+}
+
+pub fn report_lines() -> Vec<String> {
+    let mut out = Vec::new();
+    for (ip, d) in devices() {
+        out.push(format!("Устройство {}, последнее обращение {} с назад", device_title(&ip, &d), d.last.elapsed().as_secs()));
+        for a in &d.agents {
+            out.push(format!("  программа: {a}"));
+        }
+        for e in &d.errors {
+            out.push(format!("  ошибка запроса: {e}"));
+        }
+        out.extend(d.visits.iter().take(40).map(|v| format!("  {}", visit_line(v))));
+    }
+    out
 }
 
 #[cfg(test)]

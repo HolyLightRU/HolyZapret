@@ -18,18 +18,9 @@ pub struct Seen {
     pub flow: Flow,
 }
 
-const LAYER_FLOW: i32 = 2;
-const FLAG_SNIFF: u64 = 1;
-const FLAG_RECV_ONLY: u64 = 4;
-const EVENT_ESTABLISHED: u32 = 1;
+use rayoflight::windivert::{self, Address};
 
-#[repr(C)]
-struct Address {
-    timestamp: i64,
-    bits: u32,
-    reserved: u32,
-    data: [u8; 64],
-}
+const EVENT_ESTABLISHED: u32 = 1;
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -48,7 +39,7 @@ pub fn decode_addr(words: [u32; 4], v6: bool) -> IpAddr {
 }
 
 fn decode(a: &Address) -> Option<Seen> {
-    if (a.bits >> 8) & 0xFF != EVENT_ESTABLISHED || (a.bits >> 18) & 1 == 1 {
+    if a.event() != EVENT_ESTABLISHED || a.loopback() {
         return None;
     }
     let d = &a.data;
@@ -60,7 +51,7 @@ fn decode(a: &Address) -> Option<Seen> {
         17 => true,
         _ => return None,
     };
-    let ip = decode_addr(remote, (a.bits >> 20) & 1 == 1);
+    let ip = decode_addr(remote, a.ipv6());
     Some(Seen { pid, flow: Flow { udp, ip, port } })
 }
 
@@ -72,66 +63,27 @@ pub fn is_public(ip: &IpAddr) -> bool {
 }
 
 pub fn watch(bin: &Path, stop: Arc<AtomicBool>, mut sink: impl FnMut(Seen)) -> anyhow::Result<()> {
-    use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    type Open = unsafe extern "C" fn(*const u8, i32, i16, u64) -> HANDLE;
-    type Recv = unsafe extern "C" fn(HANDLE, *mut core::ffi::c_void, u32, *mut u32, *mut Address) -> i32;
-    type Shutdown = unsafe extern "C" fn(HANDLE, i32) -> i32;
-    type Close = unsafe extern "C" fn(HANDLE) -> i32;
-    let dll = bin.join("WinDivert.dll");
-    if !dll.is_file() {
-        anyhow::bail!("не найден {}", dll.display());
-    }
-    let wide: Vec<u16> = dll.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        let lib = LoadLibraryW(wide.as_ptr());
-        if lib.is_null() {
-            anyhow::bail!("не удалось загрузить WinDivert.dll (код {})", GetLastError());
-        }
-        let get = |name: &[u8]| GetProcAddress(lib, name.as_ptr());
-        let (Some(open), Some(recv), Some(shutdown), Some(close)) =
-            (get(b"WinDivertOpen\0"), get(b"WinDivertRecv\0"), get(b"WinDivertShutdown\0"), get(b"WinDivertClose\0"))
-        else {
-            anyhow::bail!("WinDivert.dll слишком старый");
-        };
-        let open: Open = std::mem::transmute(open);
-        let recv: Recv = std::mem::transmute(recv);
-        let shutdown: Shutdown = std::mem::transmute(shutdown);
-        let close: Close = std::mem::transmute(close);
-        let h = open(b"true\0".as_ptr(), LAYER_FLOW, 0, FLAG_SNIFF | FLAG_RECV_ONLY);
-        if h == INVALID_HANDLE_VALUE || h.is_null() {
-            let code = GetLastError();
-            anyhow::bail!(match code {
-                5 => "нет прав администратора".to_string(),
-                2 | 3 => "не найден драйвер WinDivert64.sys рядом с WinDivert.dll".to_string(),
-                577 | 1275 => "Windows не дала загрузить драйвер WinDivert".to_string(),
-                c => format!("WinDivert не открылся (код {c})"),
-            });
-        }
-        let raw = h as usize;
-        let done = Arc::new(AtomicBool::new(false));
-        let waker = {
-            let (stop, done) = (stop.clone(), done.clone());
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                shutdown(raw as HANDLE, 3);
-            })
-        };
-        let mut a: Address = std::mem::zeroed();
-        while !stop.load(Ordering::Relaxed) {
-            if recv(h, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut a) == 0 {
-                break;
+    let lib = windivert::Lib::load(bin).map_err(anyhow::Error::msg)?;
+    let h = lib.open("true", windivert::LAYER_FLOW, 0, windivert::FLAG_SNIFF | windivert::FLAG_RECV_ONLY).map_err(anyhow::Error::msg)?;
+    let shutter = h.shutter();
+    let done = Arc::new(AtomicBool::new(false));
+    let waker = {
+        let (stop, done) = (stop.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            if let Some(s) = decode(&a) {
-                sink(s);
-            }
+            shutter.shutdown();
+        })
+    };
+    while !stop.load(Ordering::Relaxed) {
+        let Some(a) = h.recv_event() else { break };
+        if let Some(s) = decode(&a) {
+            sink(s);
         }
-        done.store(true, Ordering::Relaxed);
-        let _ = waker.join();
-        close(h);
     }
+    done.store(true, Ordering::Relaxed);
+    let _ = waker.join();
     Ok(())
 }
 
@@ -251,7 +203,7 @@ mod tests {
 
     #[test]
     fn decodes_windivert_flow() {
-        let mut a = Address { timestamp: 0, bits: 2 | (1 << 8), reserved: 0, data: [0; 64] };
+        let mut a = Address { bits: 2 | (1 << 8), ..Default::default() };
         a.data[16..20].copy_from_slice(&1234u32.to_le_bytes());
         a.data[36..40].copy_from_slice(&u32::from(Ipv4Addr::new(5, 6, 7, 8)).to_le_bytes());
         a.data[40..44].copy_from_slice(&0xFFFFu32.to_le_bytes());

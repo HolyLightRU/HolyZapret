@@ -155,6 +155,24 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult, can_pick: bool) -> Option<Til
 }
 
 impl App {
+    pub(super) fn ray_adapts(&self) -> bool {
+        use crate::core::{ray, settings};
+        let Some(p) = &self.paths else { return false };
+        let adapts = settings::ray_experiment() == "adaptive" || settings::ray_autolist();
+        settings::ray_enabled() && adapts && ray::read_live(p).is_some_and(|(l, age)| l.running && age.as_secs() < 10)
+    }
+
+    pub(super) fn start_site_recheck(&mut self, ctx: &egui::Context, urls: Vec<String>) -> bool {
+        let Some(p) = &self.paths else { return false };
+        let sites: Vec<_> = checks::load_sites(p).into_iter().filter(|s| urls.contains(&s.url)).collect();
+        if sites.is_empty() || self.warp_blocks_checks() {
+            return false;
+        }
+        self.sites_running = true;
+        self.spawn_site_check(ctx, sites);
+        true
+    }
+
     pub(super) fn start_site_check(&mut self, ctx: &egui::Context) {
         if self.warp_blocks_checks() {
             return;
@@ -164,6 +182,10 @@ impl App {
         self.sites.clear();
         self.sites_total = sites.len();
         self.sites_running = true;
+        self.spawn_site_check(ctx, sites);
+    }
+
+    fn spawn_site_check(&mut self, ctx: &egui::Context, sites: Vec<checks::Site>) {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         let (itx, irx) = channel();
         let total = sites.len();

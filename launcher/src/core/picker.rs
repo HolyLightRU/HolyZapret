@@ -48,6 +48,7 @@ pub enum CheckKind {
     Tls12,
     Tls13,
     Freeze,
+    Quic,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +118,7 @@ pub struct Outcome {
     pub path: Option<PathBuf>,
     pub error: Option<String>,
     pub checks: Vec<Check>,
+    pub ray: Option<String>,
 }
 
 impl Outcome {
@@ -254,6 +256,7 @@ pub fn check_label(t: &Target) -> String {
         CheckKind::Freeze => format!("{} / {}", t.category, t.name),
         CheckKind::Tls12 => format!("{} / {} (TLS 1.2)", t.category, t.name),
         CheckKind::Tls13 => format!("{} / {} (TLS 1.3)", t.category, t.name),
+        CheckKind::Quic => format!("{} / {} (QUIC)", t.category, t.name),
     }
 }
 
@@ -324,9 +327,6 @@ pub fn load_targets(paths: &Paths) -> Vec<Target> {
             t.push(Target { name: name.into(), category: "WARP".into(), url: url.into(), kind });
         }
     }
-    if !tls13_supported() {
-        t.retain(|x| x.kind != CheckKind::Tls13);
-    }
     for (name, url) in FREEZE_SUITE {
         t.push(Target { name: name.to_string(), category: HOSTING.into(), url: url.to_string(), kind: CheckKind::Freeze });
     }
@@ -345,6 +345,43 @@ pub fn parse_sites(text: &str) -> (Vec<String>, Vec<String>) {
     (ok, bad)
 }
 
+pub const DNS_FAIL: i32 = 6;
+
+pub fn unresolved(hosts: &[String]) -> Vec<String> {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    for h in hosts {
+        let (tx, h) = (tx.clone(), h.clone());
+        std::thread::spawn(move || {
+            let ok = (h.as_str(), 443).to_socket_addrs().is_ok_and(|mut a| a.next().is_some());
+            let _ = tx.send((h, ok));
+        });
+    }
+    drop(tx);
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut missing = Vec::new();
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok((h, false)) => missing.push(h),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+pub fn dns_failures(results: &[Outcome], dead: &[bool]) -> Vec<bool> {
+    (0..dead.len())
+        .map(|i| {
+            dead[i]
+                && results.iter().filter(|o| o.error.is_none() && o.checks.get(i).is_some_and(|c| !c.skipped)).all(|o| o.checks[i].exit == DNS_FAIL)
+                && results.iter().any(|o| o.checks.get(i).is_some_and(|c| c.exit == DNS_FAIL))
+        })
+        .collect()
+}
+
 pub fn host_of(url: &str) -> String {
     url.split_once("://").map(|x| x.1).unwrap_or(url).split('/').next().unwrap_or(url).to_string()
 }
@@ -356,9 +393,6 @@ pub fn custom_targets(urls: &[String]) -> Vec<Target> {
         let name = host_of(url);
         let category = if per_site { name.clone() } else { MY_SITES.to_string() };
         for kind in [CheckKind::Tls12, CheckKind::Tls13] {
-            if kind == CheckKind::Tls13 && !tls13_supported() {
-                continue;
-            }
             t.push(Target { name: name.clone(), category: category.clone(), url: url.clone(), kind });
         }
     }
@@ -436,6 +470,7 @@ pub fn judge(kind: CheckKind, exit: i32, w: &str) -> Check {
     let ms = (time * 1000.0) as u32;
     match kind {
         CheckKind::Tls12 | CheckKind::Tls13 => Check { ok: exit_ok && code > 0, frozen: false, ms, code, exit, skipped: false },
+        CheckKind::Quic => Check { ok: exit_ok, frozen: false, ms, code, exit, skipped: false },
         CheckKind::Freeze => {
             let kb = size as f64 / 1024.0;
             let frozen = !exit_ok && (14.0..=22.0).contains(&kb);
@@ -452,7 +487,70 @@ pub(crate) fn run_check(t: &Target) -> Check {
     if t.kind == CheckKind::Freeze && !c.ok && !c.frozen { curl_check(t) } else { c }
 }
 
+pub const QUIC: &str = "QUIC";
+const QUIC_SITES: [&str; 4] = ["www.youtube.com", "redirector.googlevideo.com", "www.google.com", "discord.com"];
+const QUIC_FAKE: &[u8] = include_bytes!("../../../bin/quic_initial_www_google_com.bin");
+
+pub fn quic_targets() -> Vec<Target> {
+    QUIC_SITES.iter().map(|h| Target { name: h.to_string(), category: QUIC.into(), url: format!("https://{h}/"), kind: CheckKind::Quic }).collect()
+}
+
+pub fn quic_probe(host: &str) -> Option<Vec<u8>> {
+    use rayoflight::quic;
+    let (i, hello) = quic::hello_of(QUIC_FAKE)?;
+    let named = quic::with_sni(&hello, host)?;
+    let mut dcid = [0u8; 8];
+    rayoflight::sys::random(&mut dcid);
+    let mut frames = Vec::new();
+    quic::crypto_frame(&mut frames, 0, &named);
+    Some(quic::seal_initial(&dcid, &i.scid, &[], 0, &frames, 1250))
+}
+
+fn quic_check(t: &Target) -> Check {
+    use std::net::{ToSocketAddrs, UdpSocket};
+    let host = host_of(&t.url);
+    let start = Instant::now();
+    let done = |ok: bool, exit: i32| Check { ok, frozen: false, ms: start.elapsed().as_millis() as u32, code: 0, exit, skipped: false };
+    let Some(addr) = (host.as_str(), 443).to_socket_addrs().ok().and_then(|mut a| a.find(|x| x.is_ipv4())) else { return done(false, 6) };
+    let Some(pkt) = quic_probe(&host) else { return done(false, -1) };
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return done(false, 7) };
+    if sock.connect(addr).is_err() {
+        return done(false, 7);
+    }
+    let mut buf = [0u8; 2048];
+    for wait in [1500u64, 2500] {
+        if sock.send(&pkt).is_err() {
+            return done(false, 7);
+        }
+        let until = Instant::now() + Duration::from_millis(wait);
+        while let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+            let _ = sock.set_read_timeout(Some(left));
+            match sock.recv(&mut buf) {
+                Ok(n) if rayoflight::quic::is_long_header(&buf[..n]) => return done(true, 0),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    done(false, 28)
+}
+
+fn hello_check(t: &Target) -> Check {
+    let (r, ms) = super::checks::tls13_probe(&host_of(&t.url), Duration::from_secs(5));
+    let (ok, exit) = match r {
+        Ok(_) => (true, 0),
+        Err(e) => (false, e),
+    };
+    Check { ok, frozen: false, ms: ms as u32, code: 0, exit, skipped: false }
+}
+
 fn curl_check(t: &Target) -> Check {
+    if t.kind == CheckKind::Quic {
+        return quic_check(t);
+    }
+    if t.kind == CheckKind::Tls13 && !tls13_supported() {
+        return hello_check(t);
+    }
     let mut args: Vec<&str> = vec!["-s", "-o", "NUL", "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"];
     match t.kind {
         CheckKind::Tls12 => args.extend(["-I", "-m", "5", "--tlsv1.2", "--tls-max", "1.2", "-w", "%{http_code} 0 %{time_total}"]),
@@ -466,6 +564,7 @@ fn curl_check(t: &Target) -> Check {
             "-w",
             "%{http_code} %{size_download} %{time_total}",
         ]),
+        CheckKind::Quic => {}
     }
     args.push(&t.url);
     let out = Command::new("curl.exe").args(&args).creation_flags(CREATE_NO_WINDOW).output();
@@ -568,10 +667,53 @@ pub fn log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join("holyzapret-picker").join(format!("{safe}.log"))
 }
 
+static COMPANION: std::sync::Mutex<Option<(Child, PathBuf)>> = std::sync::Mutex::new(None);
+static RAY_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn start_engine(paths: &Paths, s: &Strategy, game_filter: &GameFilter, rules: bool) -> anyhow::Result<Child> {
     super::lists::ensure_user_files(&strategy::lists_dir(s, paths))?;
     let args = if rules { super::rules::with_rules(paths, s, game_filter)? } else { strategy::extract_args(s, paths, game_filter)? };
-    start_raw(&s.engine, &s.bin, &args, &s.name)
+    let Some((exp, _)) = &s.ray else { return start_raw(&s.engine, &s.bin, &args, &s.name) };
+    let lists = super::ray::lists_arg(s, paths);
+    let quic = exp.starts_with("quic-");
+    let take = super::ray::takeover(&args, &lists, quic).ok_or_else(|| anyhow::anyhow!("у general не найден профиль для сайтов из списка"))?;
+    if quic && !take.quic {
+        anyhow::bail!("у general не найден профиль QUIC для сайтов из списка");
+    }
+    let stripped = take.args.clone();
+    let ray = super::ray::exe(paths).ok_or_else(|| anyhow::anyhow!("нет RayOfLight.exe"))?;
+    let winws = start_raw(&s.engine, &s.bin, &stripped, &s.name)?;
+    std::thread::sleep(Duration::from_millis(300));
+    let live = log_path(&format!("{}-ray", s.name)).with_extension("json");
+    let _ = fs::remove_file(&live);
+    let cli = format!("{}{}", super::ray::cli_args(paths, s, exp, &live), take.cli());
+    match start_raw(&ray, &s.bin, &cli, &format!("{}-ray", s.name)) {
+        Ok(c) => {
+            if let Ok(mut g) = COMPANION.lock() {
+                *g = Some((c, live));
+            }
+            Ok(winws)
+        }
+        Err(e) => {
+            stop_engine(Some(winws));
+            Err(e)
+        }
+    }
+}
+
+fn stop_companion() {
+    let Some((mut c, live)) = COMPANION.lock().ok().and_then(|mut g| g.take()) else { return };
+    std::thread::sleep(Duration::from_millis(super::ray::PICK_LIVE_MS + 150));
+    let summary = fs::read_to_string(&live).ok().and_then(|t| super::ray::parse_live(&t)).map(|l| super::ray::pick_summary(&l));
+    let _ = c.kill();
+    let _ = c.wait();
+    if let Ok(mut g) = RAY_SUMMARY.lock() {
+        *g = Some(summary.unwrap_or_else(|| "RayOfLight: сводки нет, движок не успел её записать".into()));
+    }
+}
+
+fn take_ray_summary() -> Option<String> {
+    RAY_SUMMARY.lock().ok().and_then(|mut g| g.take())
 }
 
 pub(crate) fn start_raw(engine: &std::path::Path, bin: &std::path::Path, args: &str, name: &str) -> anyhow::Result<Child> {
@@ -618,9 +760,18 @@ pub(crate) fn warm_up(child: &mut Child, name: &str, cancel: &AtomicBool) -> Res
         if let Ok(Some(_)) = child.try_wait() {
             return Err(engine_error(&fs::read_to_string(log_path(name)).unwrap_or_default()));
         }
+        if companion_exited() {
+            let log = fs::read_to_string(log_path(&format!("{name}-ray"))).unwrap_or_default();
+            let last = log.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("движок завершился сразу после запуска");
+            return Err(format!("RayOfLight: {last}"));
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+fn companion_exited() -> bool {
+    COMPANION.lock().ok().is_some_and(|mut g| g.as_mut().is_some_and(|(c, _)| matches!(c.try_wait(), Ok(Some(_)))))
 }
 
 pub fn start_trial(paths: &Paths, s: &Strategy, game_filter: &GameFilter) -> anyhow::Result<Child> {
@@ -639,6 +790,7 @@ pub fn stop_trial(child: Child) {
 }
 
 pub(crate) fn stop_engine(child: Option<Child>) {
+    stop_companion();
     if let Some(mut c) = child {
         let _ = c.kill();
         let _ = c.wait();
@@ -675,7 +827,7 @@ pub fn run(
     let hosting_ips = resolve_hosting(&targets);
     let mut cover = super::coverage::Cache::default();
     if !cancel.load(Ordering::Relaxed) {
-        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone() }));
+        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone(), ray: None }));
         if !add_to.is_empty() {
             let (blocked, open) = blocked_sites(&targets, &base);
             let added = site_domains(&blocked);
@@ -689,7 +841,8 @@ pub fn run(
             break;
         }
         emit(Event::Phase { index: i + 1, name: s.name.clone() });
-        let mut outcome = Outcome { name: s.name.clone(), path: Some(s.path.clone()), error: None, checks: Vec::new() };
+        let _ = take_ray_summary();
+        let mut outcome = Outcome { name: s.name.clone(), path: Some(s.path.clone()), error: None, checks: Vec::new(), ray: None };
         let skip = strategy::extract_args(s, &paths, &game_filter)
             .map(|a| coverage_skips(&targets, &hosting_ips, &a, &mut cover))
             .unwrap_or_else(|_| vec![false; targets.len()]);
@@ -725,6 +878,7 @@ pub fn run(
         if outcome.error.is_some() {
             outcome.checks = vec![Check::failed(); targets.len()];
         }
+        outcome.ray = take_ray_summary().filter(|_| s.ray.is_some());
         if !cancel.load(Ordering::Relaxed) || outcome.error.is_some() {
             emit(Event::Done(outcome));
         }
@@ -789,7 +943,7 @@ mod tests {
         let targets = vec![t("a.com"), t("b.com")];
         let ok = Check { ok: true, frozen: false, ms: 10, code: 200, exit: 0, skipped: false };
         let dead = Check::failed();
-        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks };
+        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks, ray: None };
         let general = out(Some("g"), vec![Check::skipped_from(&ok), Check::skipped_from(&dead)]);
         assert_eq!(general.score(), (1, 1));
         assert_eq!(general.category(&targets, HOSTING), (1, 1));
@@ -840,8 +994,9 @@ mod tests {
             path: Some(PathBuf::from(name)),
             error: None,
             checks: vec![c(yt, false), c(cdn, false), c(het, false)],
+            ray: None,
         };
-        let base = Outcome { name: "base".into(), path: None, error: None, checks: vec![c(false, false), c(false, false), c(false, true)] };
+        let base = Outcome { name: "base".into(), path: None, error: None, checks: vec![c(false, false), c(false, false), c(false, true)], ray: None };
         let mut results = vec![base, run("lucky", true, true, true), run("b", true, false, true), run("c", true, false, false), run("d", false, false, false)];
         assert_eq!(noisy_checks(&targets, &results), vec![false, true, false]);
         let noisy = noisy_checks(&targets, &results);
@@ -858,7 +1013,7 @@ mod tests {
         let t = |name: &str| Target { name: name.into(), category: "x".into(), url: String::new(), kind: CheckKind::Freeze };
         let targets = vec![t("yt"), t("cdn77"), t("frozen"), t("ok")];
         let c = |ok: bool, frozen: bool| Check { ok, frozen, ms: 10, code: if ok { 200 } else { 0 }, exit: if ok { 0 } else { 28 }, skipped: false };
-        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks };
+        let out = |path: Option<&str>, checks: Vec<Check>| Outcome { name: "s".into(), path: path.map(PathBuf::from), error: None, checks, ray: None };
         let base = out(None, vec![c(false, false), c(false, false), c(false, true), c(true, false)]);
         let a = out(Some("a"), vec![c(true, false), c(false, false), c(false, true), c(true, false)]);
         let b = out(Some("b"), vec![c(false, false), c(false, false), c(false, true), c(true, false)]);
@@ -910,6 +1065,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn quic_check_live() {
+        let r: Vec<(String, bool, u32)> = quic_targets().iter().map(|t| { let c = run_check(t); (t.name.clone(), c.ok, c.ms) }).collect();
+        assert!(r.iter().all(|x| x.1), "{r:?}");
+    }
+
+    #[test]
+    fn missing_addresses_are_found() {
+        let m = unresolved(&["localhost".to_string(), "no-such-host.invalid".to_string()]);
+        assert_eq!(m, vec!["no-such-host.invalid".to_string()]);
+        let c = |exit: i32| Check { ok: false, frozen: false, ms: 0, code: 0, exit, skipped: false };
+        let o = |a: i32, b: i32| Outcome { name: "x".into(), path: None, error: None, checks: vec![c(a), c(b)], ray: None };
+        assert_eq!(dns_failures(&[o(6, 28), o(6, 28)], &[true, true]), vec![true, false]);
+        assert_eq!(dns_failures(&[o(6, 6), o(28, 6)], &[true, false]), vec![false, false]);
+    }
+
+    #[test]
+    fn quic_probe_names_the_site() {
+        let p = quic_probe("www.youtube.com").unwrap();
+        assert_eq!(p.len(), 1250);
+        let (_, hello) = rayoflight::quic::hello_of(&p).unwrap();
+        assert_eq!(rayoflight::quic::sni(&hello).as_deref(), Some("www.youtube.com"));
+        assert!(quic_targets().iter().all(|t| t.kind == CheckKind::Quic && t.category == QUIC));
+        assert!(judge(CheckKind::Quic, 0, "").ok);
+    }
+
+    #[test]
     fn engine_errors_skip_noise() {
         let log = "github version v72.2 (abc)\r\n\r\nwe have 9 user defined desync profile(s)\r\nLoading hostlist C:/x.txt\r\nloading plain text list\r\ncould not read C:/bin/x.bin\r\n";
         assert_eq!(engine_error(log), "could not read C:/bin/x.bin");
@@ -920,7 +1102,7 @@ mod tests {
     fn outcome_scores() {
         let targets = parse_targets("### A\nA = \"https://a.com\"\n### B\nB = \"https://b.com\"\n");
         let c = |ok, ms| Check { ok, frozen: false, ms, code: 0, exit: 0, skipped: false };
-        let o = Outcome { name: "x".into(), path: None, error: None, checks: vec![c(true, 100), c(true, 300), c(false, 0), c(true, 200)] };
+        let o = Outcome { name: "x".into(), path: None, error: None, checks: vec![c(true, 100), c(true, 300), c(false, 0), c(true, 200)], ray: None };
         assert_eq!(o.score(), (3, 4));
         assert_eq!(o.category(&targets, "B"), (1, 2));
         assert_eq!(o.avg_ms(), 200);

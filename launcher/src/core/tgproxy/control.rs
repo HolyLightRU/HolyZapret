@@ -8,7 +8,24 @@ use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 
 const KEY: &str = r"Software\HolyZapret";
+const RULE: &str = "HolyZapret Telegram proxy";
 static PROXY: Mutex<Option<Handle>> = Mutex::new(None);
+
+fn firewall(port: Option<u16>) {
+    crate::core::run_hidden("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={RULE}")]);
+    if let Some(p) = port {
+        crate::core::run_hidden(
+            "netsh",
+            &["advfirewall", "firewall", "add", "rule", &format!("name={RULE}"), "dir=in", "action=allow", "protocol=TCP", &format!("localport={p}"), "remoteip=localsubnet", "profile=any"],
+        );
+    }
+}
+
+pub fn phone_link() -> Option<String> {
+    let g = PROXY.lock().unwrap();
+    let h = g.as_ref().filter(|h| h.config.lan)?;
+    Some(h.config.phone_link(&crate::core::lanproxy::lan_ip()?.to_string()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Saved {
@@ -43,6 +60,7 @@ pub fn load() -> Saved {
         secret: secret.unwrap_or_else(new_secret),
         cloudflare: num("TgCloudflare").is_none_or(|v| v != 0),
         cf_domain: text("TgCfDomain"),
+        lan: num("TgLan").is_some_and(|v| v != 0),
     };
     let saved = Saved { enabled: num("TgProxy").is_some_and(|v| v != 0), config };
     if secret.is_none() {
@@ -58,18 +76,26 @@ pub fn save(s: &Saved) {
         let _ = k.set_value("TgSecret", &hex(&s.config.secret));
         let _ = k.set_value("TgCloudflare", &(s.config.cloudflare as u32));
         let _ = k.set_value("TgCfDomain", &s.config.cf_domain);
+        let _ = k.set_value("TgLan", &(s.config.lan as u32));
     }
 }
 
 pub fn start(config: Config) -> anyhow::Result<()> {
     stop();
+    let lan = config.lan.then_some(config.port);
     let h = super::start(config)?;
     *PROXY.lock().unwrap() = Some(h);
+    if lan.is_some() {
+        firewall(lan);
+    }
     Ok(())
 }
 
 pub fn stop() {
     let h = PROXY.lock().unwrap().take();
+    if h.as_ref().is_some_and(|h| h.config.lan) {
+        firewall(None);
+    }
     drop(h);
 }
 

@@ -55,6 +55,19 @@ pub fn parse(text: &str) -> LastPick {
     p
 }
 
+pub fn relocate(mut p: LastPick, root: &std::path::Path) -> LastPick {
+    let scripts = root.join("scripts");
+    p.scores = p
+        .scores
+        .into_iter()
+        .map(|(k, v)| {
+            let moved = (!k.exists()).then(|| k.strip_prefix(root).ok().map(|r| scripts.join(r))).flatten().filter(|n| n.exists());
+            (moved.unwrap_or(k), v)
+        })
+        .collect();
+    p
+}
+
 pub fn load() -> Option<LastPick> {
     let text = std::fs::read_to_string(file()?).ok()?;
     let p = parse(&text);
@@ -84,6 +97,15 @@ mod tests {
     fn round_trip_and_order() {
         let mut p = LastPick { when: "21.11 22:40".into(), ..Default::default() };
         p.scores.insert(PathBuf::from(r"C:\hz\general.bat"), Score { ok: 33, total: 33, frozen: 0, ms: 500, failed: false });
+        let base = std::env::temp_dir().join(format!("hz-pick-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("scripts")).unwrap();
+        std::fs::write(base.join("scripts").join("general.bat"), "x").unwrap();
+        let mut old = LastPick::default();
+        old.scores.insert(base.join("general.bat"), Score { ok: 1, total: 2, frozen: 0, ms: 1, failed: false });
+        old.scores.insert(base.join("gone.bat"), Score { ok: 1, total: 2, frozen: 0, ms: 1, failed: false });
+        let moved = relocate(old, &base);
+        assert!(moved.scores.contains_key(&base.join("scripts").join("general.bat")) && moved.scores.contains_key(&base.join("gone.bat")));
+        let _ = std::fs::remove_dir_all(&base);
         p.scores.insert(PathBuf::from(r"C:\hz\b.bat"), Score { ok: 30, total: 33, frozen: 2, ms: 300, failed: false });
         p.scores.insert(PathBuf::from(r"C:\hz\c.bat"), Score { ok: 0, total: 33, frozen: 0, ms: 0, failed: true });
         let back = parse(&to_text(&p));

@@ -1,7 +1,7 @@
 use super::{App, Msg, Tab, notify, result_msg, send};
 use crate::core::gamefilter::{self, GameFilter, Mode};
 use crate::core::service::ServiceState;
-use crate::core::{flowseal, hosts, update};
+use crate::core::{flowseal, hosts};
 use crate::log::Lvl;
 use crate::theme::{self, CYAN, RED, YELLOW};
 use eframe::egui::{self, Color32, RichText};
@@ -102,17 +102,6 @@ impl App {
                 }
                 Err(e) => notify(tx, Lvl::Err, format!("Ошибка записи hosts: {e}")),
             }
-        });
-    }
-
-    fn run_auto_update(&mut self, ctx: &egui::Context) {
-        self.spawn(ctx, |p, tx| {
-            result_msg(
-                tx,
-                update::update_auto_update(p).map(|_| "auto_update.bat обновлён".to_string()),
-                "Ошибка загрузки auto_update.bat",
-            );
-            let _ = tx.send(Msg::Rescan);
         });
     }
 
@@ -239,8 +228,10 @@ impl App {
                 let local = self.local_version.clone().unwrap_or_else(|| "?".into());
                 let (ver_text, ver_color) = match (&newer, &self.remote_version) {
                     (Some(_), _) if self.update.running => (self.update.status().unwrap_or_default(), YELLOW),
+                    (Some(r), _) if crate::core::TEST_BUILD => (format!("Тестовая сборка {local}, есть релиз {r}"), YELLOW),
                     (Some(r), _) => (format!("{local} → {r}"), YELLOW),
-                    (None, _) if crate::core::TEST_BUILD => ("Тестовая сборка: обновления выключены".to_string(), YELLOW),
+                    (None, Some(r)) if crate::core::TEST_BUILD => (format!("Тестовая сборка {local} новее релиза {r}"), YELLOW),
+                    (None, None) if crate::core::TEST_BUILD && self.version_error.is_none() => ("Тестовая сборка, проверяю релизы…".to_string(), YELLOW),
                     (None, Some(_)) => (format!("Установлена {local}, последняя"), Color32::from_gray(150)),
                     (None, None) => match &self.version_error {
                         Some(e) => (format!("Не удалось проверить: {e}"), RED),
@@ -249,7 +240,8 @@ impl App {
                 };
                 let mut actions = vec![act("Проверить", false, true)];
                 if let Some(r) = &newer {
-                    actions.insert(0, act(format!("Обновить до {r}"), true, free));
+                    let label = if crate::core::TEST_BUILD { format!("Перейти на релиз {r}") } else { format!("Обновить до {r}") };
+                    actions.insert(0, act(label, true, free));
                 }
                 clicks[1] = tool_card(
                     &mut cols[1],
@@ -261,15 +253,7 @@ impl App {
                 );
                 update_offered = newer.is_some();
             });
-            ui.columns(2, |cols| {
-                clicks[2] = tool_card(
-                    &mut cols[0],
-                    theme::icon::DOWNLOAD,
-                    "auto_update.bat",
-                    "Загружает свежую версию этой стратегии с GitHub",
-                    None,
-                    &[act("Обновить", false, free)],
-                );
+            {
                 let inst = self.flowseal_version.clone();
                 let latest = self.flowseal_latest.as_ref().map(|r| r.version.clone());
                 let (fs_text, fs_color) = match (&inst, &latest) {
@@ -290,19 +274,20 @@ impl App {
                     actions.push(act("Удалить", false, free));
                 }
                 clicks[3] = tool_card(
-                    &mut cols[1],
+                    ui,
                     theme::icon::LISTS,
                     "Стратегии Flowseal",
                     "Оригинальные стратегии Flowseal со своим движком winws.exe в папке flowseal",
                     Some((fs_text, fs_color)),
                     &actions,
                 );
-            });
+            }
             self.warp_card(ui, ctx);
             if self.tg.client.is_none() {
                 self.tg_card(ui, ctx);
             }
             self.settings_card(ui, ctx);
+            self.ray_card(ui, ctx);
             if clicks[0].is_some() {
                 self.run_hosts(ctx);
             }
@@ -310,9 +295,6 @@ impl App {
                 (Some(0), true) => self.open_update(),
                 (Some(_), _) => self.check_version(ctx),
                 _ => {}
-            }
-            if clicks[2].is_some() {
-                self.run_auto_update(ctx);
             }
             match clicks[3] {
                 Some(0) => self.flowseal_action(ctx, true),

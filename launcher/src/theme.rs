@@ -68,7 +68,6 @@ pub mod icon {
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
     pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const CHAT: &str = "\u{E8BD}";
-    pub const DOWNLOAD: &str = "\u{E896}";
     pub const SETTINGS: &str = "\u{E713}";
     pub const CLOUD: &str = "\u{E753}";
     pub const POWER: &str = "\u{E7E8}";
@@ -434,6 +433,10 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, tip: &str) -> Response {
     resp.on_hover_text(tip)
 }
 
+pub fn solid_popup() -> egui::style::StyleModifier {
+    egui::style::StyleModifier::new(|s| s.visuals.window_fill = Color32::from_rgb(30, 27, 38))
+}
+
 pub fn segmented(ui: &mut Ui, items: &[String], selected: &mut usize) -> bool {
     let mut changed = false;
     let font = FontId::new(13.5, FontFamily::Proportional);
@@ -458,39 +461,30 @@ pub fn segmented(ui: &mut Ui, items: &[String], selected: &mut usize) -> bool {
             });
         return changed;
     }
-    egui::Frame::new()
-        .fill(Color32::from_white_alpha(8))
-        .stroke(Stroke::new(1.0, Color32::from_white_alpha(12)))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for (i, label) in items.iter().enumerate() {
-                    let font = FontId::new(13.5, FontFamily::Proportional);
-                    let galley = ui.painter().layout_no_wrap(label.clone(), font, Color32::WHITE);
-                    let size = Vec2::new(galley.size().x + 26.0, 28.0);
-                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-                    let on = *selected == i;
-                    if on {
-                        ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::from_white_alpha(26));
-                        let bar = egui::Rect::from_center_size(
-                            egui::pos2(rect.center().x, rect.bottom() - 3.0),
-                            Vec2::new(14.0, 2.0),
-                        );
-                        gradient_rect(ui.painter(), bar, 1.0, PINK, CYAN);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::from_white_alpha(12));
-                    }
-                    let col = if on { Color32::WHITE } else { Color32::from_gray(175) };
-                    ui.painter().galley(rect.center() - galley.size() / 2.0 - Vec2::new(0.0, 1.0), galley, col);
-                    if resp.clicked() && !on {
-                        *selected = i;
-                        changed = true;
-                    }
-                }
-            });
-        });
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(need, 34.0), Sense::hover());
+    ui.painter().rect_filled(outer, CornerRadius::same(10), Color32::from_white_alpha(8));
+    ui.painter().rect_stroke(outer, CornerRadius::same(10), Stroke::new(1.0, Color32::from_white_alpha(12)), egui::StrokeKind::Inside);
+    let mut x = outer.left() + 4.0;
+    for (i, label) in items.iter().enumerate() {
+        let galley = ui.painter().layout_no_wrap(label.clone(), font.clone(), Color32::WHITE);
+        let rect = egui::Rect::from_min_size(egui::pos2(x, outer.top() + 3.0), Vec2::new(galley.size().x + 26.0, 28.0));
+        x = rect.right() + 2.0;
+        let resp = ui.interact(rect, ui.scope_id().with(("segmented", i, label.as_str())), Sense::click());
+        let on = *selected == i;
+        if on {
+            ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::from_white_alpha(26));
+            let bar = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 3.0), Vec2::new(14.0, 2.0));
+            gradient_rect(ui.painter(), bar, 1.0, PINK, CYAN);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::from_white_alpha(12));
+        }
+        let col = if on { Color32::WHITE } else { Color32::from_gray(175) };
+        ui.painter().galley(rect.center() - galley.size() / 2.0 - Vec2::new(0.0, 1.0), galley, col);
+        if resp.clicked() && !on {
+            *selected = i;
+            changed = true;
+        }
+    }
     changed
 }
 

@@ -2,7 +2,7 @@ use super::paths::Paths;
 use std::fs;
 
 pub const DEFAULT_RANGE: &str = "1024-65535";
-const OFF_PORT: &str = "12";
+pub const OFF_PORT: &str = "12";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {

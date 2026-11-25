@@ -1,4 +1,3 @@
-use super::net::{self, RAW_BASE};
 use super::paths::Paths;
 use std::fs;
 
@@ -9,12 +8,13 @@ fn parse_version(text: &str) -> Option<String> {
     Some(text[start..start + end].to_string())
 }
 
-pub fn local_version(paths: &Paths) -> Option<String> {
-    parse_version(&fs::read_to_string(paths.root.join("manager.bat")).ok()?)
+fn script(paths: &Paths, name: &str) -> std::path::PathBuf {
+    let s = super::strategy::scripts_dir(paths);
+    if s.is_dir() { s.join(name) } else { paths.root.join(name) }
 }
 
-pub fn update_auto_update(paths: &Paths) -> anyhow::Result<()> {
-    let text = net::get_text(&format!("{RAW_BASE}auto_update.bat"))?;
-    fs::write(paths.root.join("auto_update.bat"), text)?;
-    Ok(())
+pub fn local_version(paths: &Paths) -> Option<String> {
+    let text = fs::read_to_string(script(paths, "manager.bat")).or_else(|_| fs::read_to_string(paths.root.join("manager.bat"))).ok()?;
+    parse_version(&text)
 }
+

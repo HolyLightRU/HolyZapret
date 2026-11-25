@@ -30,6 +30,7 @@ pub struct CheckState {
     names_at: Option<Instant>,
     picked: Option<String>,
     running_list: Vec<String>,
+    windowed: std::collections::HashSet<String>,
     running_at: Option<Instant>,
     filter: String,
     target: Option<Target>,
@@ -178,6 +179,7 @@ impl App {
             v.sort_by_key(|n| n.to_lowercase());
             v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
             self.check.running_list = v;
+            self.check.windowed = crate::core::procs::windowed();
             self.check.running_at = Some(Instant::now());
         }
         let seen = self.check.seen.lock().unwrap().clone();
@@ -225,7 +227,7 @@ impl App {
                     },
                     None => "Любая программа".to_string(),
                 };
-                egui::ComboBox::from_id_salt("appcheck_pick").selected_text(label).width(300.0).height(360.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("appcheck_pick").selected_text(label).width(300.0).height(360.0).popup_style(crate::theme::solid_popup()).show_ui(ui, |ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.check.filter).hint_text("Поиск по имени").desired_width(f32::INFINITY));
                     let f = self.check.filter.trim().to_lowercase();
                     let fits = |n: &str| f.is_empty() || n.to_lowercase().contains(&f);
@@ -245,14 +247,8 @@ impl App {
                         }
                     }
                     let rest: Vec<&String> = self.check.running_list.iter().filter(|n| fits(n) && count(n).is_none()).collect();
-                    if !rest.is_empty() {
-                        ui.separator();
-                        ui.label(muted("Запущены"));
-                        for n in rest {
-                            if ui.selectable_label(on(n), n.as_str()).clicked() {
-                                pick = Some(n.clone());
-                            }
-                        }
+                    if let Some(n) = super::ray_ui::proc_rows(ui, &mut self.ray.icons, rest, &self.check.windowed, &on) {
+                        pick = Some(n);
                     }
                     if let Some(p) = pick {
                         self.check.picked = Some(p);

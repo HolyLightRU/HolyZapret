@@ -101,8 +101,19 @@ pub fn stop_engines() {
 }
 
 
-fn command(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
+fn engine_args(paths: &Paths, s: &Strategy) -> anyhow::Result<(String, bool)> {
     let args = super::rules::with_rules(paths, s, &super::gamefilter::load(paths))?;
+    if super::ray::applies(paths, s, &args) {
+        let lists = super::ray::lists_arg(s, paths);
+        if let Some(t) = super::ray::takeover(&args, &lists, !super::settings::ray_quic().is_empty()) {
+            return Ok((t.args, true));
+        }
+    }
+    Ok((args, false))
+}
+
+fn command(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
+    let (args, _) = engine_args(paths, s)?;
     Ok(format!("\"{}\" {}", s.engine.display(), args))
 }
 
@@ -182,7 +193,13 @@ pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
         ],
     );
     super::settings::set_last_strategy(&s.id);
-    Ok(format!("Служба установлена со стратегией «{}»", s.name))
+    let ray = engine_args(paths, s).map(|(_, r)| r).unwrap_or(false);
+    let extra = match super::ray::sync(paths, s, ray) {
+        Ok(Some(m)) => format!(". {m}"),
+        Ok(None) => String::new(),
+        Err(e) => format!(". RayOfLight не запустился: {e}"),
+    };
+    Ok(format!("Служба установлена со стратегией «{}»{extra}", s.name))
 }
 
 pub fn start() -> anyhow::Result<()> {
@@ -194,7 +211,7 @@ pub fn start() -> anyhow::Result<()> {
 }
 
 pub fn unload_windivert() -> anyhow::Result<()> {
-    if process_running("HolyZapret.exe") || process_running("winws.exe") {
+    if process_running("HolyZapret.exe") || process_running("winws.exe") || process_running(super::ray::EXE) {
         anyhow::bail!("драйвер занят движком, сначала выключите защиту");
     }
     for d in ["WinDivert", "WinDivert14"] {
@@ -220,6 +237,7 @@ fn remove_quiet() {
 pub fn remove() -> String {
     let existed = query(SERVICE) != ServiceState::NotInstalled;
     remove_quiet();
+    super::ray::remove();
     for d in ["WinDivert", "WinDivert14"] {
         run_hidden("net", &["stop", d]);
         run_hidden("sc", &["delete", d]);

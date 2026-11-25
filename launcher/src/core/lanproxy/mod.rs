@@ -18,6 +18,51 @@ const CONNECT: Duration = Duration::from_secs(10);
 const HEAD_LIMIT: usize = 16 * 1024;
 const UDP_PEERS: usize = 4096;
 const UDP_NAMES: usize = 256;
+const DEVICE_VISITS: usize = 60;
+const DEVICE_AGENTS: usize = 4;
+const DEVICE_ERRORS: usize = 5;
+const DEVICES: usize = 32;
+
+#[derive(Clone, Debug)]
+pub struct Visit {
+    pub host: String,
+    pub port: u16,
+    pub kind: &'static str,
+    pub count: u32,
+    pub open: u32,
+    pub down: u64,
+    pub error: Option<String>,
+    pub last: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub agents: Vec<String>,
+    pub visits: Vec<Visit>,
+    pub errors: Vec<String>,
+    pub last: std::time::Instant,
+}
+
+impl Device {
+    fn new() -> Self {
+        Device { agents: Vec::new(), visits: Vec::new(), errors: Vec::new(), last: std::time::Instant::now() }
+    }
+
+    fn visit(&mut self, host: &str, port: u16, kind: &'static str) -> &mut Visit {
+        let now = std::time::Instant::now();
+        self.last = now;
+        let pos = self.visits.iter().position(|v| v.host == host && v.port == port && v.kind == kind);
+        let v = match pos {
+            Some(i) => self.visits.remove(i),
+            None => Visit { host: host.to_string(), port, kind, count: 0, open: 0, down: 0, error: None, last: now },
+        };
+        self.visits.insert(0, v);
+        self.visits.truncate(DEVICE_VISITS);
+        let v = &mut self.visits[0];
+        v.last = now;
+        v
+    }
+}
 
 #[derive(Default)]
 pub struct Stats {
@@ -29,12 +74,91 @@ pub struct Stats {
     pub down: AtomicU64,
     pub clients: Mutex<HashSet<IpAddr>>,
     pub last_error: Mutex<String>,
+    pub devices: Mutex<HashMap<IpAddr, Device>>,
 }
 
 impl Stats {
     fn error(&self, e: impl Into<String>) {
         self.failed.fetch_add(1, Ordering::Relaxed);
         *self.last_error.lock().unwrap() = e.into();
+    }
+
+    fn device<R>(&self, ip: IpAddr, f: impl FnOnce(&mut Device) -> R) -> R {
+        let mut g = self.devices.lock().unwrap();
+        if !g.contains_key(&ip) && g.len() >= DEVICES {
+            if let Some(old) = g.iter().min_by_key(|(_, d)| d.last).map(|(k, _)| *k) {
+                g.remove(&old);
+            }
+        }
+        f(g.entry(ip).or_insert_with(Device::new))
+    }
+
+    fn opened(&self, ip: IpAddr, host: &str, port: u16, kind: &'static str, agent: Option<&str>) {
+        self.device(ip, |d| {
+            if let Some(a) = agent.filter(|a| !d.agents.iter().any(|x| x == a)) {
+                d.agents.insert(0, a.to_string());
+                d.agents.truncate(DEVICE_AGENTS);
+            }
+            let v = d.visit(host, port, kind);
+            v.count += 1;
+            v.open += 1;
+        });
+    }
+
+    fn closed(&self, ip: IpAddr, host: &str, port: u16, kind: &'static str, result: Result<u64, String>) {
+        self.device(ip, |d| {
+            let v = d.visit(host, port, kind);
+            v.open = v.open.saturating_sub(1);
+            match result {
+                Ok(n) => v.down += n,
+                Err(e) => v.error = Some(e),
+            }
+        });
+    }
+
+    fn device_error(&self, ip: IpAddr, e: String) {
+        self.device(ip, |d| {
+            d.last = std::time::Instant::now();
+            d.errors.retain(|x| *x != e);
+            d.errors.insert(0, e);
+            d.errors.truncate(DEVICE_ERRORS);
+        });
+    }
+}
+
+pub fn user_agent(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    text.split("\r\n").skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case("user-agent").then(|| v.trim().chars().take(160).collect())
+    })
+}
+
+pub fn device_kind(agents: &[String]) -> Option<&'static str> {
+    let all = agents.join(" ");
+    let has = |s: &str| all.to_ascii_lowercase().contains(&s.to_ascii_lowercase());
+    if has("PlayStation") || has("PS5") || has("PS4") {
+        Some("PlayStation")
+    } else if has("iPhone") || has("iPad") {
+        Some("iPhone")
+    } else if has("Android TV") || has("SmartTV") || has("BRAVIA") || has("Tizen") || has("webOS") {
+        Some("телевизор")
+    } else if has("Android") {
+        Some("Android")
+    } else if has("Windows") {
+        Some("компьютер с Windows")
+    } else {
+        None
+    }
+}
+
+fn head_preview(head: &[u8]) -> String {
+    let line = head.split(|b| *b == b'\r' || *b == b'\n').next().unwrap_or(head);
+    let text: String = String::from_utf8_lossy(line).chars().take(80).collect();
+    if text.chars().all(|c| !c.is_control()) && !text.is_empty() {
+        text
+    } else {
+        head.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
     }
 }
 
@@ -390,26 +514,70 @@ async fn dial(host: &str, port: u16, local: bool, warp: Option<SocketAddr>) -> a
     anyhow::bail!("{host}:{port}: {}", last.unwrap_or_default())
 }
 
-async fn request(s: &mut TcpStream, first: u8) -> anyhow::Result<(Request, Vec<u8>)> {
+async fn request(s: &mut TcpStream, first: u8) -> anyhow::Result<(Request, Vec<u8>, Option<String>)> {
     if first == 5 {
-        return Ok((socks(s).await?, Vec::new()));
+        return Ok((socks(s).await?, Vec::new(), None));
+    }
+    if first == 0x16 {
+        anyhow::bail!("устройство начало защищённое соединение вместо запроса к прокси: в настройках нужен обычный HTTP-прокси");
+    }
+    if first == 4 {
+        anyhow::bail!("устройство подключается как SOCKS4, а раздача понимает HTTP-прокси и SOCKS5");
     }
     let (head, rest) = read_head(s, Vec::new()).await?;
-    Ok((parse_http(&head).ok_or_else(|| anyhow::anyhow!("непонятный запрос"))?, rest))
+    let req = parse_http(&head).ok_or_else(|| anyhow::anyhow!("непонятный запрос: {}", head_preview(&head)))?;
+    Ok((req, rest, user_agent(&head)))
 }
 
 async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> anyhow::Result<()> {
+    let peer = s.peer_addr()?.ip();
     let mut first = [0u8; 1];
-    let (req, extra) = timeout(HANDSHAKE, async {
+    let parsed = timeout(HANDSHAKE, async {
         s.peek(&mut first).await?;
         request(&mut s, first[0]).await
     })
     .await
-    .map_err(|_| anyhow::anyhow!("клиент не прислал запрос"))??;
+    .map_err(|_| anyhow::anyhow!("клиент не прислал запрос"))
+    .and_then(|r| r);
+    let (req, extra, agent) = match parsed {
+        Ok(r) => r,
+        Err(e) => {
+            if stats.sharing.load(Ordering::Relaxed) {
+                stats.device_error(peer, e.to_string());
+            }
+            return Err(e);
+        }
+    };
+    let kind: &'static str = match &req {
+        Request::Socks { .. } => "SOCKS5",
+        Request::Connect { .. } => "HTTPS",
+        Request::Http { .. } => "HTTP",
+        Request::Local { .. } => "страница",
+        Request::Udp => "UDP",
+    };
+    if let (Request::Local { .. }, Some(a)) = (&req, agent.as_deref()) {
+        if stats.sharing.load(Ordering::Relaxed) {
+            stats.device(peer, |d| {
+                if !d.agents.iter().any(|x| x == a) {
+                    d.agents.insert(0, a.to_string());
+                    d.agents.truncate(DEVICE_AGENTS);
+                }
+            });
+        }
+    }
+    if matches!(req, Request::Udp) && stats.sharing.load(Ordering::Relaxed) {
+        stats.opened(peer, "UDP", 0, kind, None);
+        let r = udp_relay(s, stats.clone(), local).await;
+        stats.closed(peer, "UDP", 0, kind, r.as_ref().map(|_| 0).map_err(|e| e.to_string()));
+        return r;
+    }
     let (host, port, preface, reply): (String, u16, Vec<u8>, &[u8]) = match req {
         Request::Local { path } => {
             let addr = s.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| format!("127.0.0.1:{port}"));
-            let body = page::respond(&path, &addr, stats.sharing.load(Ordering::Relaxed));
+            let ip = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
+            let gw = crate::core::gateway::page_info(ip);
+            let tg = crate::core::tgproxy::control::phone_link();
+            let body = page::respond(&path, &addr, stats.sharing.load(Ordering::Relaxed), &gw, tg.as_deref());
             s.write_all(&body).await?;
             return Ok(());
         }
@@ -425,10 +593,17 @@ async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> 
             (host, port, head, b"")
         }
     };
-    let mut up = match dial(&host, port, local, crate::core::tgwarp::via()).await {
+    stats.opened(peer, &host, port, kind, agent.as_deref());
+    let r = relay(&mut s, &stats, &host, port, local, first[0], &preface, reply).await;
+    stats.closed(peer, &host, port, kind, r.as_ref().map(|n| *n).map_err(|e| e.to_string()));
+    r.map(|_| ())
+}
+
+async fn relay(s: &mut TcpStream, stats: &Stats, host: &str, port: u16, local: bool, first: u8, preface: &[u8], reply: &[u8]) -> anyhow::Result<u64> {
+    let mut up = match dial(host, port, local, crate::core::tgwarp::via()).await {
         Ok(u) => u,
         Err(e) => {
-            let fail: &[u8] = if first[0] == 5 { &[5, 4, 0, 1, 0, 0, 0, 0, 0, 0] } else { b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n" };
+            let fail: &[u8] = if first == 5 { &[5, 4, 0, 1, 0, 0, 0, 0, 0, 0] } else { b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n" };
             let _ = s.write_all(fail).await;
             return Err(e);
         }
@@ -437,7 +612,7 @@ async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> 
         s.write_all(reply).await?;
     }
     if !preface.is_empty() {
-        up.write_all(&preface).await?;
+        up.write_all(preface).await?;
         stats.up.fetch_add(preface.len() as u64, Ordering::Relaxed);
     }
     let off = async {
@@ -445,17 +620,19 @@ async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> 
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     };
+    let mut got = 0;
     tokio::select! {
-        r = tokio::io::copy_bidirectional(&mut s, &mut up) => {
+        r = tokio::io::copy_bidirectional(s, &mut up) => {
             let (a, b) = r.unwrap_or((0, 0));
             stats.up.fetch_add(a, Ordering::Relaxed);
             stats.down.fetch_add(b, Ordering::Relaxed);
+            got = b;
         }
         _ = off => {
             let _ = s.set_zero_linger();
         }
     }
-    Ok(())
+    Ok(got)
 }
 
 async fn serve(listener: TcpListener, stats: Arc<Stats>, port: u16, local: bool, mut stop: oneshot::Receiver<()>) {
@@ -598,6 +775,33 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(handle.stats.total.load(Ordering::Relaxed), 2);
         assert!(handle.stats.up.load(Ordering::Relaxed) >= 9);
+        handle.stop();
+    }
+
+    #[test]
+    fn devices_journal_records_hosts_agents_and_errors() {
+        let p = echo();
+        let mut handle = start_on("127.0.0.1", 18897, true).unwrap();
+        let mut h = std::net::TcpStream::connect(("127.0.0.1", 18897)).unwrap();
+        h.write_all(format!("CONNECT 127.0.0.1:{p} HTTP/1.1\r\nUser-Agent: Mozilla/5.0 (PlayStation; PlayStation 5/9.00) Cobalt/25\r\n\r\nhi").as_bytes()).unwrap();
+        let mut got = vec![0u8; 41];
+        h.read_exact(&mut got).unwrap();
+        drop(h);
+        let mut bad = std::net::TcpStream::connect(("127.0.0.1", 18897)).unwrap();
+        bad.write_all(b"FOO bar\r\n\r\n").unwrap();
+        let _ = bad.read(&mut [0u8; 8]);
+        let mut tls = std::net::TcpStream::connect(("127.0.0.1", 18897)).unwrap();
+        tls.write_all(&[0x16, 3, 1, 0, 5]).unwrap();
+        let _ = tls.read(&mut [0u8; 8]);
+        std::thread::sleep(Duration::from_millis(300));
+        let devices = handle.stats.devices.lock().unwrap().clone();
+        let d = &devices[&"127.0.0.1".parse::<IpAddr>().unwrap()];
+        assert_eq!(device_kind(&d.agents), Some("PlayStation"));
+        let v = &d.visits[0];
+        assert_eq!((v.host.as_str(), v.port, v.kind, v.count, v.open, v.down), ("127.0.0.1", p, "HTTPS", 1, 0, 2));
+        assert_eq!(control::visit_line(v), format!("127.0.0.1:{p} · HTTPS · 1 раз · получено 2 Б"));
+        assert!(d.errors.iter().any(|e| e.contains("непонятный запрос: FOO bar")), "{:?}", d.errors);
+        assert!(d.errors.iter().any(|e| e.contains("обычный HTTP-прокси")), "{:?}", d.errors);
         handle.stop();
     }
 

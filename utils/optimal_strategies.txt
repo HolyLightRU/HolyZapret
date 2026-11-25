@@ -1,4 +1,4 @@
-general.bat
+scripts/general.bat
 flowseal/general (FAKE TLS AUTO ALT3).bat
 flowseal/general (FAKE TLS AUTO ALT).bat
 flowseal/general (SIMPLE FAKE).bat

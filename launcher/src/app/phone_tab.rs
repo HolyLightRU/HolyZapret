@@ -15,6 +15,12 @@ pub struct PhoneState {
     net_at: Option<std::time::Instant>,
     diag: std::sync::Arc<std::sync::Mutex<Option<Vec<Finding>>>>,
     diag_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gw: std::sync::Arc<std::sync::Mutex<Option<crate::core::gateway::Iface>>>,
+    gw_at: Option<std::time::Instant>,
+    gw_on: Option<bool>,
+    gw_live: Option<(bool, bool, Vec<crate::core::ray::AppActivity>)>,
+    gw_live_at: Option<std::time::Instant>,
+    gw_page: bool,
 }
 
 fn fix_label(f: &Fix) -> &'static str {
@@ -72,7 +78,7 @@ fn muted(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).color(Color32::from_gray(165)).size(12.5)
 }
 
-fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
+pub(super) fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(12), Color32::WHITE);
@@ -108,7 +114,199 @@ enum Act {
     Diag(Option<Fix>),
 }
 
+impl PhoneState {
+    pub(super) fn gateway_iface(&self) -> Option<crate::core::gateway::Iface> {
+        self.gw.lock().unwrap().clone()
+    }
+}
+
+fn kv(ui: &mut egui::Ui, key: &str, value: &str) -> bool {
+    let mut copy = false;
+    theme::row(ui, 28.0, |ui| {
+        theme::row_label(ui, key, 170.0);
+        ui.label(RichText::new(value).size(14.0).strong());
+        if !value.contains(' ') && theme::icon_button(ui, theme::icon::COPY, "Скопировать").clicked() {
+            copy = true;
+        }
+    });
+    copy
+}
+
 impl App {
+    fn gateway_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use crate::core::{gateway, ray, settings};
+        let on = *self.phone.gw_on.get_or_insert_with(settings::ray_gateway);
+        if self.phone.gw_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(15)) {
+            self.phone.gw_at = Some(std::time::Instant::now());
+            let gw = self.phone.gw.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let i = gateway::iface();
+                *gw.lock().unwrap() = i;
+                ctx2.request_repaint();
+            });
+        }
+        if on && self.phone.gw_live_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2)) {
+            self.phone.gw_live_at = Some(std::time::Instant::now());
+            self.phone.gw_live = self.paths.as_ref().and_then(ray::read_live).map(|(l, age)| {
+                let devices = ray::by_app(&l).into_iter().filter(|a| a.app.starts_with(ray::DEVICE)).collect();
+                (l.running && age.as_secs() < 10, l.gateway, devices)
+            });
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        }
+        if on && !self.phone.gw_page {
+            self.phone.gw_page = true;
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = control::ensure_page();
+                ctx2.request_repaint();
+            });
+        }
+        let page_addr = if on { control::page_address() } else { None };
+        let iface = self.phone.gw.lock().unwrap().clone();
+        let (running, gw_active, devices) = self.phone.gw_live.clone().unwrap_or_default();
+        let ray_ok = running && gw_active;
+        let foreign = self.status.as_ref().and_then(|s| s.foreign_dir().map(|d| d.display().to_string()));
+        let installed = self.status.as_ref().is_some_and(|s| s.service != crate::core::service::ServiceState::NotInstalled);
+        let problem: Option<(String, Option<&str>)> = if !on || ray_ok {
+            None
+        } else if let Some(d) = &foreign {
+            Some((format!("Служба zapret сейчас установлена из другой папки: {d}. Шлюз работает только со службой из этой папки, поэтому устройства выходят в интернет без обхода."), Some("Установить general отсюда")))
+        } else if !installed {
+            Some(("Служба не установлена: устройства выходят в интернет через компьютер, но без обхода. Шлюз работает вместе с RayOfLight и стратегией general.".into(), Some("Установить general")))
+        } else if running {
+            Some(("RayOfLight работает, но без шлюза: служба установлена до того, как режим включили. Переустановите её, и обход заработает для устройств.".into(), Some("Переустановить службу")))
+        } else {
+            Some(("Обход для устройств работает вместе с RayOfLight и стратегией general. Сейчас RayOfLight не работает: устройства выходят в интернет через компьютер, но без обхода.".into(), None))
+        };
+        let mut fix = false;
+        let mut toggle = None;
+        let mut copy = None;
+        theme::card(ui, |ui| {
+            theme::row(ui, 32.0, |ui| {
+                ui.label(RichText::new(theme::icon::GLOBE).font(theme::icon_font(17.0)).color(CYAN));
+                ui.add_space(2.0);
+                ui.label(RichText::new("Компьютер как шлюз").size(15.5).strong());
+                match (on, ray_ok) {
+                    (true, true) => theme::chip(ui, "Работает", GREEN),
+                    (true, false) => theme::chip(ui, "Без обхода", YELLOW),
+                    (false, _) => theme::chip(ui, "Выключен", Color32::from_gray(160)),
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut v = on;
+                    if ui.add_enabled_ui(!self.busy, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                        toggle = Some(v);
+                    }
+                });
+            });
+            ui.add(
+                egui::Label::new(muted(
+                    "Для приставок и телевизоров, где прокси не помогает: PlayStation, Xbox, Switch, телевизоры. В настройках сети устройства этот компьютер указывается как шлюз, и всё, что открывает устройство, идёт через обход. Самому устройству прокси не нужен.",
+                ))
+                .wrap(),
+            );
+            if !on {
+                return;
+            }
+            if let Some((text, button)) = &problem {
+                ui.add_space(6.0);
+                if alert(ui, YELLOW, text, *button) && !self.busy {
+                    fix = true;
+                }
+            }
+            ui.add_space(6.0);
+            match &iface {
+                Some(i) => {
+                    ui.label(RichText::new("Что указать в настройках сети устройства (вручную)").strong());
+                    kv(ui, "IP-адрес", "тот, что устройство получило само");
+                    if kv(ui, "Маска подсети", &gateway::mask(i.prefix)) {
+                        copy = Some(gateway::mask(i.prefix));
+                    }
+                    if kv(ui, "Шлюз («Роутер»)", &i.ip) {
+                        copy = Some(i.ip.clone());
+                    }
+                    kv(ui, "DNS", "8.8.8.8 и 1.1.1.1");
+                    kv(ui, "Прокси", "не использовать");
+                    let state = if i.forwarding { "пересылка включена" } else { "пересылка выключена, включится вместе с RayOfLight" };
+                    ui.label(muted(format!("Сетевая карта «{}», роутер {}, {state}", i.alias, i.router)));
+                }
+                None => {
+                    ui.label(muted("Ищу сетевую карту с выходом в интернет…"));
+                }
+            }
+            if let Some(a) = &page_addr {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    qr(ui, &format!("http://{a}/gateway"), 132.0);
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Инструкция на телефоне").strong());
+                        ui.add(
+                            egui::Label::new(muted(
+                                "Наведите камеру телефона на код: откроется пошаговая настройка для PlayStation, Xbox, Switch и телевизоров с этими значениями и кнопками «Копировать».",
+                            ))
+                            .wrap(),
+                        );
+                        ui.label(muted(format!("Или откройте в браузере: http://{a}/gateway")));
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            if devices.is_empty() {
+                ui.label(muted("Устройств через шлюз пока не видно. Они появятся здесь, когда откроют сайт из списков."));
+            } else {
+                ui.label(RichText::new(format!("Через шлюз: {}", devices.len())).strong());
+                for d in &devices {
+                    let name = d.app.trim_start_matches(ray::DEVICE);
+                    let hosts = d.hosts.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                    let text = format!("{name} · обработано {} · {hosts}", d.handled);
+                    ui.add(egui::Label::new(muted(text)).truncate());
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(muted(
+                    "Компьютер должен быть включён: без него у устройства не будет интернета. Если роутер выдаст компьютеру другой адрес, шлюз на устройстве нужно поменять, поэтому адрес компьютера лучше закрепить в настройках роутера. Вернуть как было: в настройках сети устройства выберите «Автоматически». Не работает в гостевой сети Wi-Fi и если роутер изолирует устройства друг от друга.",
+                ))
+                .wrap(),
+            );
+        });
+        if let Some(c) = copy {
+            ctx.copy_text(c);
+            self.toast(ctx, Lvl::Ok, "Скопировано");
+        }
+        if fix {
+            let own = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
+            let target = own.or_else(|| self.strategies.iter().find(|s| s.matches("general")).cloned());
+            match target {
+                Some(s) => {
+                    self.phone.gw_live_at = None;
+                    self.spawn(ctx, move |p, tx| {
+                        super::result_msg(tx, crate::core::service::install(p, &s), "Не удалось установить службу");
+                    });
+                }
+                None => self.toast(ctx, Lvl::Err, "Стратегия general не найдена в папке scripts"),
+            }
+        }
+        if let Some(v) = toggle {
+            settings::set_ray_gateway(v);
+            self.phone.gw_on = Some(v);
+            self.phone.gw_at = None;
+            self.phone.gw_page = false;
+            let installed = self.status.as_ref().is_some_and(|s| s.service != crate::core::service::ServiceState::NotInstalled);
+            let strategy = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
+            self.spawn(ctx, move |p, tx| {
+                match gateway::apply(v) {
+                    Ok(m) => super::notify(tx, Lvl::Ok, m),
+                    Err(e) => super::notify(tx, Lvl::Err, format!("Пересылка на сетевой карте не изменилась: {e}")),
+                }
+                if let (true, Some(s)) = (installed, strategy) {
+                    super::result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
+                }
+            });
+        }
+    }
+
     pub(super) fn phone_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.phone.loaded {
             self.phone.port = control::load().port.to_string();
@@ -239,6 +437,32 @@ impl App {
                             }
                         });
                     });
+                    let devices = control::devices();
+                    if !devices.is_empty() {
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new(RichText::new(format!("Что запрашивают устройства: {}", devices.len())).size(14.0))
+                            .id_salt("lan_devices")
+                            .show(ui, |ui| {
+                                for (ip, d) in &devices {
+                                    ui.label(RichText::new(control::device_title(ip, d)).size(14.0).strong());
+                                    if let Some(a) = d.agents.first() {
+                                        ui.add(egui::Label::new(muted(format!("Программа: {a}"))).truncate());
+                                    }
+                                    for e in d.errors.iter().take(2) {
+                                        ui.add(egui::Label::new(RichText::new(format!("Ошибка запроса: {e}")).color(RED).size(12.5)).wrap());
+                                    }
+                                    for v in d.visits.iter().take(12) {
+                                        let text = control::visit_line(v);
+                                        let label = if v.error.is_some() { RichText::new(text).color(YELLOW).size(12.5) } else { muted(text) };
+                                        ui.add(egui::Label::new(label).truncate());
+                                    }
+                                    if d.visits.len() > 12 {
+                                        ui.label(muted(format!("и ещё {}, все — в отчёте для разработчика", d.visits.len() - 12)));
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    }
                 }
                 ui.add_space(6.0);
                 theme::row(ui, 36.0, |ui| {
@@ -282,6 +506,8 @@ impl App {
                     }
                 });
             }
+            ui.add_space(10.0);
+            self.gateway_card(ui, ctx);
             ui.add_space(10.0);
             theme::card(ui, |ui| {
                 theme::row(ui, 32.0, |ui| {

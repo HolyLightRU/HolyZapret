@@ -27,6 +27,7 @@ fn kind(k: CheckKind) -> &'static str {
         CheckKind::Tls12 => "TLS 1.2",
         CheckKind::Tls13 => "TLS 1.3",
         CheckKind::Freeze => "загрузка",
+        CheckKind::Quic => "QUIC",
     }
 }
 
@@ -67,6 +68,9 @@ fn outcome_block(out: &mut String, place: Option<usize>, o: &Outcome, input: &In
         .flatten()
         .collect();
     let _ = writeln!(out, "{}", cats.join(" | "));
+    if let Some(r) = &o.ray {
+        let _ = writeln!(out, "{r}");
+    }
     let skipped: Vec<String> = input.targets.iter().zip(&o.checks).filter(|(_, c)| !c.counted()).map(|(t, _)| t.name.clone()).collect();
     if !skipped.is_empty() {
         let _ = writeln!(out, "Не обходит (не открываются и без обхода): {}", skipped.join(", "));
@@ -100,7 +104,7 @@ pub fn build(input: &Input) -> String {
     let _ = writeln!(out, "HolyZapret: {} (лаунчер {}{build})", input.version, input.launcher);
     let _ = writeln!(out, "Flowseal: {}", input.flowseal.as_deref().unwrap_or("не установлен"));
     let _ = writeln!(out, "Windows: {}", windows_name());
-    let _ = writeln!(out, "TLS 1.3 в проверках: {}", if picker::tls13_supported() { "да" } else { "нет, Windows не поддерживает" });
+    let _ = writeln!(out, "TLS 1.3 в проверках: {}", if picker::tls13_supported() { "да" } else { "по ответу сайта (в curl этой Windows нет TLS 1.3)" });
     let _ = writeln!(out, "Игровой фильтр: {}", input.game);
     let or_blank = |s: &str| if s.trim().is_empty() { "(впишите сами)".to_string() } else { s.trim().to_string() };
     let _ = writeln!(out, "Провайдер: {}", or_blank(&input.isp));
@@ -200,15 +204,16 @@ mod tests {
     fn report_lists_failures_by_target() {
         let targets = parse_targets("### Discord\nDiscordMain = \"https://discord.com\"\n");
         let c = |ok, exit, code| Check { ok, frozen: false, ms: 100, code, exit, skipped: false };
-        let base = Outcome { name: "Без обхода".into(), path: None, error: None, checks: vec![c(false, 28, 0), c(false, 35, 0)] };
+        let base = Outcome { name: "Без обхода".into(), path: None, error: None, checks: vec![c(false, 28, 0), c(false, 35, 0)], ray: None };
         let root = PathBuf::from(r"C:\hz");
         let best = Outcome {
             name: "general".into(),
             path: Some(root.join("general.bat")),
             error: None,
             checks: vec![c(true, 0, 200), c(false, 35, 0)],
+            ray: Some("RayOfLight: обработано 2".into()),
         };
-        let broken = Outcome { name: "x".into(), path: Some(root.join("x.bat")), error: Some("could not read".into()), checks: vec![] };
+        let broken = Outcome { name: "x".into(), path: Some(root.join("x.bat")), error: Some("could not read".into()), checks: vec![], ray: None };
         let input = Input {
             when: "22.11 01:10".into(),
             version: "3.0.0".into(),
@@ -229,6 +234,9 @@ mod tests {
         };
         let r = build(&input);
         assert!(r.contains("== Без обхода: 0/2"));
+        assert!(r.contains("Discord 1/2
+RayOfLight: обработано 2
+"));
         assert!(r.contains("(случайный успех): Хостинги / CDN77"));
         assert!(r.contains("Провайдер: Ростелеком\nГород: (впишите сами)\n"));
         assert!(r.contains("(голос Discord, игры, видео, сайты): голос Discord\n"));
