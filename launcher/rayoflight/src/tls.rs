@@ -99,6 +99,40 @@ pub fn with_sni(fake: &[u8], host: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+pub fn with_padding(hello: &[u8], total: usize) -> Option<Vec<u8>> {
+    if hello.len() >= total {
+        return Some(hello.to_vec());
+    }
+    let ext_total = extensions_at(hello)?;
+    let mut out = hello.to_vec();
+    let grow = match find_ext(hello, 0x15) {
+        Some(e) => {
+            let grow = total - hello.len();
+            let len = be16(&out, e.at - 2)? + grow;
+            out[e.at - 2..e.at].copy_from_slice(&u16::try_from(len).ok()?.to_be_bytes());
+            out.splice(e.at..e.at, std::iter::repeat_n(0u8, grow));
+            grow
+        }
+        None => {
+            let pad = total.checked_sub(hello.len() + 4)?;
+            out.extend_from_slice(&[0x00, 0x15]);
+            out.extend_from_slice(&u16::try_from(pad).ok()?.to_be_bytes());
+            out.resize(out.len() + pad, 0);
+            pad + 4
+        }
+    };
+    let bump16 = |b: &mut [u8], at: usize| -> Option<()> {
+        let v = u16::try_from(be16(b, at)? + grow).ok()?;
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        Some(())
+    };
+    bump16(&mut out, 3)?;
+    bump16(&mut out, ext_total)?;
+    let hs = u32::try_from(be24(&out, 6)? + grow).ok()?;
+    out[6..9].copy_from_slice(&hs.to_be_bytes()[1..]);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

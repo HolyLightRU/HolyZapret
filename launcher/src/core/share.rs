@@ -117,7 +117,7 @@ pub fn decode(text: &str) -> Result<Share, String> {
     let rules = rules::parse(&strs("r").join("\n"));
     let share = Share { strategy, game, lists: out, rules };
     if share.is_empty() {
-        return Err("В коде нет ни стратегии, ни списков, ни правил".into());
+        return Err("В коде нет ни варианта RayOfLight, ни списков, ни правил".into());
     }
     Ok(share)
 }
@@ -165,14 +165,8 @@ mod tests {
             game: Some(GameFilter::all()),
             lists: [vec!["rutracker.org".into(), "kinozal.tv".into()], vec![], vec!["104.16.0.0/13".into()], vec![]],
             rules: vec![
-                Rule { technique: "alt3-ts".into(), domains: vec!["example.com".into(), "cdn.example.com".into()], origin: "general".into(), ..Default::default() },
-                Rule {
-                    technique: "from:ALT 2".into(),
-                    domains: vec!["soundcloud.com".into()],
-                    origin: "general".into(),
-                    tcp: "--dpi-desync=fake --dpi-desync-fake-tls=\"{BIN}tls_clienthello_www_google_com.bin\"".into(),
-                    udp: String::new(),
-                },
+                Rule { technique: "general".into(), domains: vec!["example.com".into(), "cdn.example.com".into()], origin: "general".into(), ..Default::default() },
+                Rule { technique: "sni-split".into(), domains: vec!["soundcloud.com".into()], origin: "general".into(), ..Default::default() },
             ],
         }
     }

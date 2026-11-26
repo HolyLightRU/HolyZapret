@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 pub const PATTERN: &str = "tls_clienthello_www_google_com.bin";
@@ -39,6 +40,9 @@ pub struct Args {
     pub memory: Option<PathBuf>,
     pub forward_watch: bool,
     pub forward: bool,
+    pub warp: Option<u16>,
+    pub warp_force: Vec<String>,
+    pub dns: bool,
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -62,7 +66,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
     let mut experiment = "general".to_string();
     let mut memory = None;
     let mut forward_watch = false;
+    let mut dns = false;
     let mut forward = false;
+    let mut warp = None;
+    let mut warp_force = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let (k, inline) = match a.split_once('=') {
@@ -83,11 +90,14 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
             "--dry-run" => dry_run = true,
             "--forward-watch" => forward_watch = true,
             "--forward" => forward = true,
+            "--warp" => warp = Some(value()?.parse().map_err(|_| "--warp должен быть номером порта прокси WARP".to_string())?),
+            "--warp-force" => warp_force.push(value()?),
             "--app-all" => app_all.push(value()?),
             "--app-skip" => app_skip.push(value()?),
             "--verbose" => verbose = true,
             "--follow" => follow = Some(value()?),
             "--service" => service = true,
+            "--dns" => dns = true,
             "--live" => live = Some(PathBuf::from(value()?)),
             "--live-ms" => {
                 live_ms = value()?.parse().map_err(|_| "--live-ms должен быть числом миллисекунд".to_string())?;
@@ -115,7 +125,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
             other => return Err(format!("неизвестный параметр {other}")),
         }
     }
-    Ok(Args { bin: bin.ok_or("не указан --bin")?, lists: lists.ok_or("не указан --lists")?, priority, log, dry_run, app_all, app_skip, verbose, follow, service, live, live_ms, quic, autolist, own, game_tcp, game_udp, experiment, memory, forward_watch, forward })
+    Ok(Args { bin: bin.ok_or("не указан --bin")?, lists: lists.ok_or("не указан --lists")?, priority, log, dry_run, app_all, app_skip, verbose, follow, service, live, live_ms, quic, autolist, own, game_tcp, game_udp, experiment, memory, forward_watch, forward, warp, warp_force, dns })
 }
 
 pub fn load_lists(dir: &Path) -> Lists {
@@ -254,10 +264,13 @@ pub fn stats_line(s: &Stats, flows: usize) -> String {
         "обработано {}, пропущено {}, без TCP timestamps {}, запасной приём {}, отпущено без изменений {}, потоков {}",
         s.handled, s.skipped, s.no_ts, s.fallback, s.flushed, flows
     );
-    if s.answered + s.reset + s.silent > 0 {
+    if s.answered + s.reset + s.silent + s.frozen > 0 {
         l.push_str(&format!("; итоги: ответ {}, сброс {}, тишина {}", s.answered, s.reset, s.silent));
+        if s.frozen > 0 {
+            l.push_str(&format!(", заморозка {}", s.frozen));
+        }
         for (name, t) in &s.by_tech {
-            l.push_str(&format!("; {name}: {} из {}", t.answered, t.answered + t.reset + t.silent));
+            l.push_str(&format!("; {name}: {} из {}", t.answered, t.answered + t.reset + t.silent + t.frozen));
         }
     }
     if s.voice + s.game_udp > 0 {
@@ -307,10 +320,10 @@ pub fn live_json(s: &Stats, flows: usize, recent: &std::collections::VecDeque<cr
     let techs: Vec<String> = s
         .by_tech
         .iter()
-        .map(|(n, t)| format!("{{\"name\":\"{}\",\"used\":{},\"answered\":{},\"reset\":{},\"silent\":{}}}", esc(n), t.used, t.answered, t.reset, t.silent))
+        .map(|(n, t)| format!("{{\"name\":\"{}\",\"used\":{},\"answered\":{},\"reset\":{},\"silent\":{},\"frozen\":{}}}", esc(n), t.used, t.answered, t.reset, t.silent, t.frozen))
         .collect();
     format!(
-        "{{\"running\":{running},\"gateway\":{gateway},\"time\":\"{}\",\"mode\":\"{}\",\"handled\":{},\"skipped\":{},\"no_ts\":{},\"fallback\":{},\"voice\":{},\"game_udp\":{},\"auto_added\":{},\"flushed\":{},\"flows\":{flows},\"answered\":{},\"reset\":{},\"silent\":{},\"techniques\":[{}],\"recent\":[{}]}}",
+        "{{\"running\":{running},\"gateway\":{gateway},\"time\":\"{}\",\"mode\":\"{}\",\"handled\":{},\"skipped\":{},\"no_ts\":{},\"fallback\":{},\"voice\":{},\"game_udp\":{},\"auto_added\":{},\"flushed\":{},\"flows\":{flows},\"answered\":{},\"reset\":{},\"silent\":{},\"frozen\":{},\"techniques\":[{}],\"recent\":[{}]}}",
         esc(&sys::clock()),
         esc(mode),
         s.handled,
@@ -324,18 +337,35 @@ pub fn live_json(s: &Stats, flows: usize, recent: &std::collections::VecDeque<cr
         s.answered,
         s.reset,
         s.silent,
+        s.frozen,
         techs.join(","),
         items.join(",")
     )
 }
 
-pub fn inbound_filter(quic: bool) -> String {
+pub fn inbound_filter(quic: bool, game_udp: Option<&Ports>) -> String {
     let tcp = "tcp and tcp.SrcPort == 443 and ((tcp.Syn and tcp.Ack) or tcp.Rst or (tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x02))";
+    let mut parts = vec![format!("({tcp})")];
     if quic {
-        format!("inbound and !loopback and (({tcp}) or (udp and udp.SrcPort == 443 and udp.PayloadLength > 6 and udp.Payload[0] >= 0xC0))")
-    } else {
-        format!("inbound and !loopback and {tcp}")
+        parts.push("(udp and udp.SrcPort == 443 and udp.PayloadLength > 6 and udp.Payload[0] >= 0xC0)".into());
     }
+    if let Some(ports) = game_udp.filter(|p| !p.is_empty()) {
+        let (v4, v6) = local_parts();
+        let (v4, v6) = (v4.replace("DstAddr", "SrcAddr"), v6.replace("DstAddr", "SrcAddr"));
+        parts.push(format!(
+            "(udp and udp.PayloadLength > 0 and ({}) and ((ip and {v4}) or (ipv6 and {v6})))",
+            port_clause("udp.SrcPort", ports.ranges()).join(" or ")
+        ));
+    }
+    if parts.len() == 1 {
+        format!("inbound and !loopback and {tcp}")
+    } else {
+        format!("inbound and !loopback and ({})", parts.join(" or "))
+    }
+}
+
+pub fn udp_auto(args: &Args) -> bool {
+    args.own.game_udp && !args.game_udp.is_empty() && Mode::is_adaptive(&args.experiment)
 }
 
 fn append_lines(path: &Path, lines: &[String]) {
@@ -462,7 +492,10 @@ fn run_logged(args: &Args, log: &Arc<Log>) -> Result<(), String> {
     }
     if args.dry_run {
         lib.check(&filter_for(args.quic.is_some(), &args.own, &args.game_tcp, &args.game_udp), windivert::LAYER_NETWORK)?;
-        lib.check(&inbound_filter(args.quic.is_some()), windivert::LAYER_NETWORK)?;
+        lib.check(&inbound_filter(args.quic.is_some(), udp_auto(args).then_some(&args.game_udp)), windivert::LAYER_NETWORK)?;
+        if args.dns {
+            lib.check(crate::dns::FILTER, windivert::LAYER_NETWORK)?;
+        }
         if args.forward {
             lib.check(&forward_filter(args.quic.is_some(), &args.own, &args.game_tcp, &args.game_udp), windivert::LAYER_NETWORK_FORWARD)?;
             lib.check(crate::watch::REDIRECT_FILTER, windivert::LAYER_NETWORK)?;
@@ -524,7 +557,7 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     } else {
         None
     };
-    let inbound = match lib.open(&inbound_filter(args.quic.is_some()), windivert::LAYER_NETWORK, args.priority, windivert::FLAG_SNIFF | windivert::FLAG_RECV_ONLY) {
+    let inbound = match lib.open(&inbound_filter(args.quic.is_some(), udp_auto(args).then_some(&args.game_udp)), windivert::LAYER_NETWORK, args.priority, windivert::FLAG_SNIFF | windivert::FLAG_RECV_ONLY) {
         Ok(i) => Some(Arc::new(i)),
         Err(e) => {
             log.line(&format!("итоги соединений не отслеживаются: {e}"));
@@ -594,6 +627,7 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     };
     let mode = Mode::parse(&args.experiment).unwrap_or(Mode::Fixed(crate::desync::GENERAL));
     let mut eng = Engine::new(cfg, lists, Box::new(sys::random)).with_clock(sys::clock).with_mode(mode);
+    eng.dns_alt = args.dns;
     if let Some(q) = quic {
         eng = eng.with_quic(q);
     }
@@ -607,10 +641,28 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
         }
     }
     if sockets.is_some() {
-        let procmap = procmap.clone();
-        eng = eng.with_apps(Box::new(move |c, now| procmap.lock().ok()?.as_mut()?.owner(c, now)));
+        let (tcp_map, udp_map) = (procmap.clone(), procmap.clone());
+        eng = eng.with_apps(Box::new(move |c, now| tcp_map.lock().ok()?.as_mut()?.owner(c, now)));
+        eng = eng.with_udp_apps(Box::new(move |port, now| udp_map.lock().ok()?.as_mut()?.udp_owner(port, now)));
+    }
+    let warp = args.warp.map(|port| crate::warp::Shared::new(port, args.warp_force.clone()));
+    if let Some(w) = &warp {
+        eng = eng.with_warp(w.clone());
     }
     let engine: Arc<Mutex<Engine<Address>>> = Arc::new(Mutex::new(eng));
+    if let Some(w) = &warp {
+        if let Err(e) = crate::warp::start(*lib, args.priority.saturating_add(10), w.clone(), engine.clone(), ended.clone(), log.clone()) {
+            log.line(&e);
+        }
+    }
+    let _dns = args.dns.then(|| {
+        let e = engine.clone();
+        let wanted: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |h: &str| e.lock().is_ok_and(|e| e.wants_dns(h)));
+        let e = engine.clone();
+        let avoid: Arc<dyn Fn(&str) -> Vec<IpAddr> + Send + Sync> = Arc::new(move |h: &str| e.lock().map(|e| e.avoid(h, Instant::now())).unwrap_or_default());
+        crate::dns::start(*lib, args.priority.saturating_add(5), wanted, avoid, ended.clone(), log.clone()).map_err(|e| log.line(&e)).ok()
+    });
+    let _bg = crate::bgcheck::spawn(engine.clone(), ended.clone());
     let inbound_thread = inbound.clone().map(|i| {
         let engine = engine.clone();
         std::thread::spawn(move || {
@@ -624,6 +676,7 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     });
     let ticker = {
         let gw = gateway.clone();
+        let warp_live = warp.clone();
         let (h, engine, log, procmap, ended, live, memory, live_every, autolist) = (
             h.clone(),
             engine.clone(),
@@ -635,15 +688,22 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             Duration::from_millis(args.live_ms),
             args.autolist.clone(),
         );
+        let dns_on = args.dns;
         std::thread::spawn(move || {
             let mut act = crate::activity::Activity::new(Instant::now());
             let mut last = Instant::now();
             let mut saved = Instant::now();
             let mut written = Instant::now() - Duration::from_secs(10);
             let mut cleaned = Instant::now();
+            let mut flushed = Instant::now() - Duration::from_secs(60);
             while !ended.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
-                let (out, notes, added) = engine.lock().map(|mut e| (e.expire(Instant::now()), std::mem::take(&mut e.notes), e.take_auto_new())).unwrap_or_default();
+                let (out, notes, added, flush) =
+                    engine.lock().map(|mut e| (e.expire(Instant::now()), std::mem::take(&mut e.notes), e.take_auto_new(), e.take_flush())).unwrap_or_default();
+                if flush && dns_on && flushed.elapsed() >= Duration::from_secs(30) {
+                    flushed = Instant::now();
+                    crate::dns::flush_cache();
+                }
                 if let Some(p) = autolist.as_deref().filter(|_| !added.is_empty()) {
                     append_lines(p, &added);
                     log.line(&format!("в автосписок добавлены: {}", added.join(", ")));
@@ -659,13 +719,19 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
                     written = Instant::now();
                     let extra = gw.as_ref().map(|g| g.recent());
                     let side = gw.as_ref().map(|g| g.totals()).unwrap_or_default();
-                    if let Ok(e) = engine.lock() {
+                    let mut redeemed = gw.as_ref().map(|g| g.take_redeemed()).unwrap_or_default();
+                    if let Ok(mut e) = engine.lock() {
+                        redeemed.extend(e.take_redeemed());
                         let s = &e.stats;
                         let now = Instant::now();
-                        act.update((s.handled + side.0, s.answered + side.1, s.reset + s.silent + side.2), now);
+                        act.update((s.handled + side.0, s.answered + side.1, s.reset + s.silent + s.frozen + side.2), now);
+                        for at in redeemed.drain(..) {
+                            act.redeem(at);
+                        }
                         act.load(sys::cpu_time(), sys::memory(), now);
                         let json = live_json(&e.stats, e.flows(), &crate::gateway::merge(&e.recent, extra), true, e.mode().name(), gw.is_some());
-                        write_live(p, &crate::activity::with_extra(&json, &act.json()));
+                        let warp_json = warp_live.as_ref().map(|w| w.json(now)).unwrap_or_default();
+                        write_live(p, &crate::activity::with_extra(&json, &(act.json() + &warp_json)));
                     }
                 }
                 if let Some(p) = memory.as_deref().filter(|_| saved.elapsed() >= Duration::from_secs(30)) {
@@ -710,6 +776,11 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             }
             Action::Hold | Action::Drop => {}
             Action::Send(out) => deliver(&h, log, out),
+            Action::Reject(rst, a) => {
+                if !h.send_built(&rst, &crate::warp::inbound(&a)) {
+                    log.line("не удалось сбросить соединение для WARP");
+                }
+            }
         }
     }
     ended.store(true, Ordering::SeqCst);
@@ -773,7 +844,7 @@ mod tests {
         let a = parse_args(s(&["--bin", "C:\\hz\\bin", "--lists=C:\\hz\\exp-list", "--dry-run"])).unwrap();
         assert_eq!(
             a,
-            Args { bin: "C:\\hz\\bin".into(), lists: "C:\\hz\\exp-list".into(), priority: -100, log: None, dry_run: true, app_all: vec![], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false }
+            Args { bin: "C:\\hz\\bin".into(), lists: "C:\\hz\\exp-list".into(), priority: -100, log: None, dry_run: true, app_all: vec![], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false, warp: None, warp_force: vec![], dns: false }
         );
         let b = parse_args(s(&["--bin", "b", "--lists", "l", "--app-all", "discord,chrome.exe", "--app-skip=steam", "--app-all", "curl", "--verbose"])).unwrap();
         assert_eq!((b.app_all, b.app_skip, b.verbose), (vec!["discord,chrome.exe".to_string(), "curl".to_string()], vec!["steam".to_string()], true));
@@ -809,11 +880,11 @@ mod tests {
             handled: true,
             why: "сайт в списке", parts: 2 });
         let mut s = Stats { handled: 3, reset: 1, ..Default::default() };
-        s.by_tech.insert("general", crate::flows::TechStats { used: 3, answered: 2, reset: 1, silent: 0 });
+        s.by_tech.insert("general", crate::flows::TechStats { used: 3, answered: 2, reset: 1, silent: 0, frozen: 0 });
         let j = live_json(&s, 2, &q, true, "adaptive", false);
         assert!(j.starts_with("{\"running\":true,"));
         assert!(j.contains("\"mode\":\"adaptive\"") && j.contains("\"handled\":3,") && j.contains("\"flows\":2,") && j.contains("\"reset\":1,"));
-        assert!(j.contains("\"techniques\":[{\"name\":\"general\",\"used\":3,\"answered\":2,\"reset\":1,\"silent\":0}]"));
+        assert!(j.contains("\"techniques\":[{\"name\":\"general\",\"used\":3,\"answered\":2,\"reset\":1,\"silent\":0,\"frozen\":0}]"));
         assert!(j.contains("{\"time\":\"12:00:00\",\"host\":\"a\\\"b.com\",\"app\":null,\"pid\":5,\"handled\":true,\"why\":\"сайт в списке\",\"technique\":\"general\",\"outcome\":\"reset\",\"parts\":2}"));
         assert_eq!(j.matches('{').count(), j.matches('}').count());
     }
@@ -830,9 +901,13 @@ mod tests {
         let q = filter(true);
         assert!(q.contains(" or (udp and udp.DstPort == 443 and udp.PayloadLength >= 1200"));
         assert_eq!(q.matches('(').count(), q.matches(')').count());
-        let i = inbound_filter(true);
-        assert!(i.contains("udp.SrcPort == 443") && !inbound_filter(false).contains("udp"));
+        let i = inbound_filter(true, None);
+        assert!(i.contains("udp.SrcPort == 443") && !inbound_filter(false, None).contains("udp"));
         assert_eq!(i.matches('(').count(), i.matches(')').count());
+        let g = inbound_filter(true, Some(&Ports::parse("1024-65535").unwrap()));
+        assert!(g.contains("(udp.SrcPort >= 1024 and udp.SrcPort <= 65535)") && g.contains("(ip.SrcAddr < 192.168.0.0 or ip.SrcAddr > 192.168.255.255)"));
+        assert!(!g.contains("DstAddr"));
+        assert_eq!(g.matches('(').count(), g.matches(')').count());
         assert!(f.contains("(ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255)"));
         assert!(f.contains("(ipv6 and ipv6.DstAddr > ::1 and (ipv6.DstAddr < fc00:: or"));
         assert_eq!(f.matches('(').count(), f.matches(')').count());
@@ -856,9 +931,37 @@ mod tests {
     #[test]
     fn dry_run_checks_files() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let base = Args { bin: root.join("bin"), lists: root.join("exp-list"), priority: -100, log: None, dry_run: true, app_all: vec!["curl".into()], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false };
+        let base = Args { bin: root.join("bin"), lists: root.join("exp-list"), priority: -100, log: None, dry_run: true, app_all: vec!["curl".into()], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false, warp: None, warp_force: vec![], dns: false };
         assert_eq!(run(base), Ok(()));
-        let a = Args { bin: root.join("bin"), lists: root.join("нет-такой-папки"), priority: -100, log: None, dry_run: true, app_all: vec![], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false };
+        let a = Args { bin: root.join("bin"), lists: root.join("нет-такой-папки"), priority: -100, log: None, dry_run: true, app_all: vec![], app_skip: vec![], verbose: false, follow: None, service: false, live: None, live_ms: 2000, quic: None, autolist: None, own: Own::default(), game_tcp: Ports::default(), game_udp: Ports::default(), experiment: "general".into(), memory: None, forward_watch: false, forward: false, warp: None, warp_force: vec![], dns: false };
         assert!(run(a).unwrap_err().contains("list-general.txt"));
+        let games = Args {
+            bin: root.join("bin"),
+            lists: root.join("exp-list"),
+            priority: -100,
+            log: None,
+            dry_run: true,
+            app_all: vec![],
+            app_skip: vec![],
+            verbose: false,
+            follow: None,
+            service: false,
+            live: None,
+            live_ms: 2000,
+            quic: Some("adaptive".into()),
+            autolist: None,
+            own: Own::parse("http,google,cf,myip-tcp,myip-quic,game-tcp,game-udp,voice").unwrap(),
+            game_tcp: Ports::parse("1024-65535").unwrap(),
+            game_udp: Ports::parse("1024-65535").unwrap(),
+            experiment: "adaptive".into(),
+            memory: None,
+            forward_watch: false,
+            forward: true,
+            warp: Some(40000),
+            warp_force: vec![],
+            dns: false,
+        };
+        assert!(udp_auto(&games));
+        assert_eq!(run(games), Ok(()));
     }
 }

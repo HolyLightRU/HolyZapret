@@ -98,23 +98,26 @@ pub fn status(paths: &Paths) -> Status {
 pub fn stop_engines() {
     kill_process("HolyZapret.exe");
     kill_process("winws.exe");
+    kill_process(super::ray::EXE);
 }
 
 
-fn engine_args(paths: &Paths, s: &Strategy) -> anyhow::Result<(String, bool)> {
-    let args = super::rules::with_rules(paths, s, &super::gamefilter::load(paths))?;
-    if super::ray::applies(paths, s, &args) {
-        let lists = super::ray::lists_arg(s, paths);
-        if let Some(t) = super::ray::takeover(&args, &lists, !super::settings::ray_quic().is_empty()) {
-            return Ok((t.args, true));
+pub fn apply_variant(s: &Strategy) {
+    let Some((name, _)) = &s.ray else { return };
+    super::settings::set_ray_experiment("adaptive");
+    match name.strip_prefix("quic-") {
+        Some(q) => super::settings::set_ray_quic(q),
+        None => {
+            super::settings::set_ray_start(if name == "adaptive" { "" } else { name });
+            if super::settings::ray_quic().is_empty() || name == "adaptive" {
+                super::settings::set_ray_quic("adaptive");
+            }
         }
     }
-    Ok((args, false))
 }
 
-fn command(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
-    let (args, _) = engine_args(paths, s)?;
-    Ok(format!("\"{}\" {}", s.engine.display(), args))
+fn command(paths: &Paths, _s: &Strategy) -> anyhow::Result<String> {
+    super::ray::command(paths).ok_or_else(|| anyhow::anyhow!("нет {}", paths.bin().join(super::ray::EXE).display()))
 }
 
 fn installed_command() -> Option<String> {
@@ -123,6 +126,13 @@ fn installed_command() -> Option<String> {
         .ok()?
         .get_value::<String, _>("ImagePath")
         .ok()
+}
+
+pub fn legacy_installed() -> bool {
+    installed_command().is_some_and(|c| {
+        let l = c.to_lowercase();
+        l.contains("holyzapret.exe") || l.contains("winws.exe")
+    }) || super::ray::installed()
 }
 
 fn same_command(a: &str, b: &str) -> bool {
@@ -150,37 +160,38 @@ pub fn resume(paths: &Paths, p: Paused) -> anyhow::Result<String> {
         if p.running {
             start()?;
         }
-        anyhow::bail!("стратегии «{}» больше нет, служба осталась на старой версии", p.strategy);
+        anyhow::bail!("варианта «{}» больше нет, служба осталась прежней", p.strategy);
     };
     let fresh = command(paths, &s)?;
     if installed_command().is_some_and(|old| same_command(&old, &fresh)) {
         if p.running {
             start()?;
-            return Ok(format!("Служба снова запущена, стратегия «{}» не изменилась", s.name));
+            return Ok(format!("Служба снова запущена с «{}»", s.name));
         }
-        return Ok(format!("Стратегия службы «{}» не изменилась", s.name));
+        return Ok(format!("Настройки службы («{}») не изменились", s.name));
     }
     install(paths, &s)?;
     if !p.running {
         run_hidden("net", &["stop", SERVICE]);
     }
-    Ok(format!("Стратегия «{}» обновилась, служба переустановлена", s.name))
+    Ok(format!("Служба переустановлена с «{}»", s.name))
 }
 
 pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
-    super::lists::ensure_user_files(&strategy::lists_dir(s, paths))?;
+    super::lists::ensure_user_files(&paths.exp_lists())?;
+    apply_variant(s);
     remove_quiet();
+    super::ray::remove();
     stop_engines();
+    super::rules::seed_memory(paths);
     let command = command(paths, s)?;
-    remove_quiet();
-
     let bin_path = command.replace('"', "\\\"");
-    let raw = format!("create {SERVICE} binPath= \"{bin_path}\" DisplayName= \"zapret\" start= auto");
+    let raw = format!("create {SERVICE} binPath= \"{bin_path}\" DisplayName= \"HolyZapret\" start= auto");
     let out = Command::new("sc").raw_arg(raw).creation_flags(CREATE_NO_WINDOW).output()?;
     if !out.status.success() {
         anyhow::bail!("sc create: {}", String::from_utf8_lossy(&out.stdout));
     }
-    run_hidden("sc", &["description", SERVICE, "Zapret DPI bypass software"]);
+    run_hidden("sc", &["description", SERVICE, "HolyZapret: обход блокировок, движок RayOfLight"]);
     let (ok, o) = run_hidden("sc", &["start", SERVICE]);
     if !ok {
         anyhow::bail!("служба создана, но не запустилась: {o}");
@@ -193,13 +204,7 @@ pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
         ],
     );
     super::settings::set_last_strategy(&s.id);
-    let ray = engine_args(paths, s).map(|(_, r)| r).unwrap_or(false);
-    let extra = match super::ray::sync(paths, s, ray) {
-        Ok(Some(m)) => format!(". {m}"),
-        Ok(None) => String::new(),
-        Err(e) => format!(". RayOfLight не запустился: {e}"),
-    };
-    Ok(format!("Служба установлена со стратегией «{}»{extra}", s.name))
+    Ok(format!("Служба установлена: {}", super::ray::install_label(s)))
 }
 
 pub fn start() -> anyhow::Result<()> {
@@ -234,7 +239,7 @@ fn remove_quiet() {
     run_hidden("sc", &["delete", SERVICE]);
 }
 
-pub fn remove() -> String {
+pub fn remove() -> Result<String, String> {
     let existed = query(SERVICE) != ServiceState::NotInstalled;
     remove_quiet();
     super::ray::remove();
@@ -244,7 +249,10 @@ pub fn remove() -> String {
     }
     kill_process("HolyZapret.exe");
     kill_process("winws.exe");
-    if existed { "Служба HolyZapret удалена".into() } else { "Служба не была установлена, процессы остановлены".into() }
+    if query(SERVICE) != ServiceState::NotInstalled || super::ray::installed() {
+        return Err("Не удалось удалить службу: нужны права администратора. Запустите лаунчер от имени администратора".into());
+    }
+    Ok(if existed { "Служба HolyZapret удалена".into() } else { "Служба не была установлена, процессы остановлены".into() })
 }
 
 #[cfg(test)]

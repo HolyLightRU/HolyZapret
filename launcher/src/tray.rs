@@ -246,21 +246,25 @@ fn toggle(paths: Paths) {
     std::thread::spawn(move || {
         let st = service::status(&paths);
         match st.service {
-            ServiceState::Running => report(true, format!("Из трея: {}", service::remove())),
+            ServiceState::Running => match service::remove() {
+                Ok(m) => report(true, format!("Из трея: {m}")),
+                Err(e) => report(false, format!("Из трея: {e}")),
+            },
             ServiceState::Stopped => match service::start() {
                 Ok(()) => report(true, "Из трея: служба запущена"),
                 Err(e) => report(false, format!("Из трея: не удалось запустить службу: {e}")),
             },
             ServiceState::NotInstalled => {
                 let last = settings::last_strategy();
-                let found = last.and_then(|id| strategy::discover(&paths).into_iter().find(|s| s.matches(&id)));
+                let all = strategy::discover(&paths);
+                let found = last.and_then(|id| all.iter().find(|s| s.matches(&id)).cloned()).or_else(|| all.iter().find(|s| s.id == crate::core::ray::DEFAULT_ID).cloned());
                 match found {
                     Some(s) => match service::install(&paths, &s) {
                         Ok(m) => report(true, format!("Из трея: {m}")),
                         Err(e) => report(false, format!("Из трея: ошибка установки: {e}")),
                     },
                     None => {
-                        report(false, "Выберите стратегию: из трея включается только последняя установленная");
+                        report(false, "Нет файла bin\\RayOfLight.exe: откройте HolyZapret и скачайте его заново");
                         show_window();
                     }
                 }
@@ -356,9 +360,9 @@ mod tests {
 
     #[test]
     fn views() {
-        let v = View::from_status(&status(ServiceState::Running, Some("flowseal\\general")));
+        let v = View::from_status(&status(ServiceState::Running, Some("additional\\general")));
         assert!(v.on);
-        assert_eq!(v.label, "Защита активна · flowseal\\general");
+        assert_eq!(v.label, "Защита активна · additional\\general");
         let v = View::from_status(&status(ServiceState::NotInstalled, None));
         assert!(!v.on);
         assert_eq!(v.label, "Защита выключена");

@@ -51,13 +51,7 @@ pub fn last_strategy() -> Option<String> {
 }
 
 pub fn ray_enabled() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_none_or(|k| read(&k, "RayOfLight", true))
-}
-
-pub fn set_ray_enabled(on: bool) {
-    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
-        let _ = k.set_value("RayOfLight", &(on as u32));
-    }
+    true
 }
 
 pub const DEFAULT_EXPERIMENT: &str = "adaptive";
@@ -77,6 +71,24 @@ pub fn set_ray_experiment(v: &str) {
     }
 }
 
+pub fn ray_start() -> String {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().and_then(|k| k.get_value::<String, _>("RayStart").ok()).unwrap_or_default()
+}
+
+pub fn set_ray_start(v: &str) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayStart", &v);
+    }
+}
+
+pub fn take_start_migration() -> bool {
+    let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) else { return false };
+    if read(&k, "RayStartMigrated", false) {
+        return false;
+    }
+    k.set_value("RayStartMigrated", &1u32).is_ok()
+}
+
 pub const DEFAULT_QUIC: &str = "adaptive";
 
 pub fn ray_quic() -> String {
@@ -91,8 +103,37 @@ pub fn ray_autolist() -> bool {
     RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_none_or(|k| read(&k, "RayAutoList", true))
 }
 
+pub fn ray_dns() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_none_or(|k| read(&k, "RayDns", true))
+}
+
+pub fn set_ray_dns(on: bool) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayDns", &(on as u32));
+    }
+}
+
 pub fn ray_gateway() -> bool {
     RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_some_and(|k| read(&k, "RayGateway", false))
+}
+
+pub fn ray_warp() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok().is_some_and(|k| read(&k, "RayWarp", false))
+}
+
+pub fn set_ray_warp(on: bool) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = k.set_value("RayWarp", &(on as u32));
+    }
+}
+
+pub fn ray_warp_force() -> Vec<String> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(KEY)
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("RayWarpForce").ok())
+        .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default()
 }
 
 pub fn set_ray_gateway(on: bool) {

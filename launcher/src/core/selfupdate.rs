@@ -7,7 +7,7 @@ use std::time::Duration;
 
 const API: &str = "https://api.github.com/repos/HolyLightRU/HolyZapret/releases/latest";
 const TMP_DIR: &str = ".update.tmp";
-const SKIP_DIRS: [&str; 5] = ["launcher", super::flowseal::DIR, ".git", ".idea", TMP_DIR];
+const SKIP_DIRS: [&str; 4] = ["launcher", ".git", ".idea", TMP_DIR];
 const LOCKING: [&str; 2] = ["HolyZapret.exe", "winws.exe"];
 const MAX_DOWNLOAD: u64 = 200 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
@@ -205,7 +205,7 @@ pub(crate) fn extract(bytes: &[u8], target: &Path) -> anyhow::Result<usize> {
 }
 
 fn is_release_root(dir: &Path) -> bool {
-    dir.join("bin").join("HolyZapret.exe").is_file()
+    ["RayOfLight.exe", "HolyZapret.exe"].iter().any(|f| dir.join("bin").join(f).is_file())
 }
 
 pub(crate) fn release_root(tmp: &Path) -> anyhow::Result<PathBuf> {
@@ -219,7 +219,7 @@ pub(crate) fn release_root(tmp: &Path) -> anyhow::Result<PathBuf> {
         .collect();
     match found.as_slice() {
         [one] => Ok(one.clone()),
-        _ => anyhow::bail!("в архиве нет bin\\HolyZapret.exe — это не похоже на сборку HolyZapret"),
+        _ => anyhow::bail!("в архиве нет bin\\RayOfLight.exe — это не похоже на сборку HolyZapret"),
     }
 }
 
@@ -340,7 +340,19 @@ fn install_zip(paths: &Paths, bytes: &[u8], version: &str) -> anyhow::Result<Sum
 }
 
 const LEGACY_DIRS: [&str; 2] = ["additional", "experimental"];
-const RETIRED: [&str; 1] = ["auto_update.bat"];
+const RETIRED: [&str; 3] = ["auto_update.bat", "general.bat", "MAX.bat"];
+const RETIRED_PATHS: [&str; 10] = [
+    "utils/optimal_strategies.txt",
+    "utils/test zapret.ps1",
+    "bin/4pda.bin",
+    "bin/dht_get_peers.bin",
+    "bin/http_iana_org.bin",
+    "bin/quic_initial_dbankcloud_ru.bin",
+    "bin/stun.bin",
+    "bin/tls_clienthello_4pda_to.bin",
+    "bin/tls_clienthello_max_ru.bin",
+    "bin/wireguard_initiation.bin",
+];
 
 fn tidy_root(src: &Path, root: &Path) -> usize {
     let scripts = src.join("scripts");
@@ -365,6 +377,27 @@ fn tidy_root(src: &Path, root: &Path) -> usize {
             if e.path().is_file() && old.is_file() && fs::remove_file(&old).is_ok() {
                 n += 1;
             }
+        }
+    }
+    for rel in RETIRED_PATHS {
+        let old = root.join(rel);
+        if !src.join(rel).exists() && old.is_file() && fs::remove_file(&old).is_ok() {
+            n += 1;
+        }
+    }
+    for d in LEGACY_DIRS {
+        if scripts.join(d).is_dir() {
+            continue;
+        }
+        for dir in [root.join("scripts").join(d), root.join(d)] {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("bat")) && fs::remove_file(&p).is_ok() {
+                    n += 1;
+                }
+            }
+            let _ = fs::remove_dir(&dir);
         }
     }
     for d in LEGACY_DIRS {
@@ -489,6 +522,26 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn winws_leftovers_are_removed_on_update() {
+        let base = std::env::temp_dir().join(format!("hz-winws-{}", std::process::id()));
+        let (src, root) = (base.join("src"), base.join("root"));
+        put_file(&src, "scripts/manager.bat", "new");
+        put_file(&src, "bin/RayOfLight.exe", "new");
+        for f in ["scripts/general.bat", "scripts/MAX.bat", "scripts/experimental/R08 general, SNI vk.com.bat", "scripts/additional/additional (ALT 1).bat", "bin/4pda.bin", "utils/optimal_strategies.txt"] {
+            put_file(&root, f, "old");
+        }
+        put_file(&root, "scripts/my own.bat", "mine");
+        put_file(&root, "bin/tls_clienthello_www_google_com.bin", "keep");
+        assert_eq!(tidy_root(&src, &root), 6);
+        assert!(!root.join("scripts/experimental").exists() && !root.join("scripts/additional").exists());
+        assert!(!root.join("scripts/general.bat").exists() && !root.join("bin/4pda.bin").exists() && !root.join("utils/optimal_strategies.txt").exists());
+        assert_eq!(read(&root, "scripts/my own.bat"), "mine");
+        assert_eq!(read(&root, "bin/tls_clienthello_www_google_com.bin"), "keep");
+        assert!(is_release_root(&src));
+        let _ = fs::remove_dir_all(&base);
+    }
+
     fn put_file(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -562,8 +615,6 @@ mod tests {
             "lists/zapret-hosts-user.txt",
             "Lists/My-Sites.txt",
             "bin/game_filter.enabled",
-            "flowseal/bin/winws.exe",
-            "flowseal/general.bat",
             "launcher/src/main.rs",
             ".git/config",
             ".idea/misc.xml",
@@ -581,7 +632,6 @@ mod tests {
             "general.bat",
             "lists/list-general.txt",
             "lists/check_list.txt",
-            "flowseal_strat/general.bat",
             "bin/HolyZapret-old.exe",
             "HolyZapret Launcher.exe",
         ] {
@@ -611,7 +661,6 @@ mod tests {
             ("lists/list-general-user.txt", "release-user"),
             ("lists/my-sites.txt", "release-sites"),
             ("exp-list/list-exclude-user.txt", ""),
-            ("flowseal/bin/winws.exe", "release-flowseal"),
             ("launcher/src/main.rs", "release-src"),
             (".gitignore", "release-ignore"),
             ("bin/stale.old", "x"),
@@ -627,7 +676,6 @@ mod tests {
         put_file(root, "lists/list-general.txt", "new-list");
         put_file(root, "lists/list-general-user.txt", "mine");
         put_file(root, "lists/my-sites.txt", "my-sites");
-        put_file(root, "flowseal/bin/winws.exe", "my-flowseal");
         put_file(root, "launcher/src/main.rs", "my-src");
         put_file(root, ".gitignore", "my-ignore");
         put_file(root, "utils/mine.txt", "only-local");
@@ -654,7 +702,6 @@ mod tests {
         assert_eq!(read(&root, "exp-list/list-exclude-user.txt"), "");
         assert_eq!(read(&root, "lists/list-general-user.txt"), "mine");
         assert_eq!(read(&root, "lists/my-sites.txt"), "my-sites");
-        assert_eq!(read(&root, "flowseal/bin/winws.exe"), "my-flowseal");
         assert_eq!(read(&root, "launcher/src/main.rs"), "my-src");
         assert_eq!(read(&root, ".gitignore"), "my-ignore");
         assert_eq!(read(&root, "utils/mine.txt"), "only-local");
@@ -684,10 +731,10 @@ mod tests {
         assert_eq!(read(&root, "lists/list-general-user.txt"), "mine");
         assert!(!root.join("Holy-Zapret-9.9.9").exists());
         drop(lock);
-        put_file(&root, "flowseal/keep.old", "x");
+        put_file(&root, "launcher/keep.old", "x");
         assert_eq!(cleanup_old(&paths), 1);
         assert!(!root.join("bin/WinDivert.dll.old").exists());
-        assert!(root.join("flowseal/keep.old").exists());
+        assert!(root.join("launcher/keep.old").exists());
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -6,7 +6,6 @@ pub mod crash;
 pub mod diagnostics;
 pub mod discover;
 pub mod fetch;
-pub mod flowseal;
 pub mod gamefilter;
 pub mod gateway;
 pub mod health;
@@ -38,6 +37,7 @@ pub mod unpack;
 pub mod update;
 pub mod voice;
 pub mod warp;
+pub mod warpauto;
 
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -45,7 +45,6 @@ use std::process::Command;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const TEST_BUILD: bool = option_env!("HZ_CHANNEL").is_some();
-pub const EXPERIMENTAL: &str = "experimental";
 
 pub fn run_hidden(program: &str, args: &[&str]) -> (bool, String) {
     match Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW).output() {

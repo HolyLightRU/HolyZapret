@@ -84,7 +84,7 @@ impl Check {
 
     pub fn detail(&self) -> String {
         if self.skipped {
-            "стратегия не обходит этот сайт".into()
+            "обход не трогает этот сайт".into()
         } else if self.frozen {
             "заморозка 16-20 КБ".into()
         } else if self.code > 0 && !self.ok {
@@ -438,18 +438,13 @@ pub fn add_to_user_lists(dirs: &[PathBuf], domains: &[String]) -> anyhow::Result
     Ok(added)
 }
 
-pub fn optimal(paths: &Paths, strategies: &[Strategy]) -> Vec<usize> {
-    let text = fs::read_to_string(paths.root.join("utils").join("optimal_strategies.txt")).unwrap_or_default();
-    let mut out = Vec::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let want = paths.root.join(line.replace('/', "\\"));
-        if let Some(i) = strategies.iter().position(|s| s.path == want) {
-            if !out.contains(&i) {
-                out.push(i);
-            }
-        }
-    }
-    out
+pub fn optimal(_paths: &Paths, strategies: &[Strategy]) -> Vec<usize> {
+    strategies
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.id.starts_with("rayoflight:quic-") && !super::ray::EXTRA.iter().any(|e| s.id.strip_prefix("rayoflight:") == Some(*e)))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 pub fn curl_available() -> bool {
@@ -667,46 +662,26 @@ pub fn log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join("holyzapret-picker").join(format!("{safe}.log"))
 }
 
-static COMPANION: std::sync::Mutex<Option<(Child, PathBuf)>> = std::sync::Mutex::new(None);
+static COMPANION: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 static RAY_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-fn start_engine(paths: &Paths, s: &Strategy, game_filter: &GameFilter, rules: bool) -> anyhow::Result<Child> {
-    super::lists::ensure_user_files(&strategy::lists_dir(s, paths))?;
-    let args = if rules { super::rules::with_rules(paths, s, game_filter)? } else { strategy::extract_args(s, paths, game_filter)? };
-    let Some((exp, _)) = &s.ray else { return start_raw(&s.engine, &s.bin, &args, &s.name) };
-    let lists = super::ray::lists_arg(s, paths);
-    let quic = exp.starts_with("quic-");
-    let take = super::ray::takeover(&args, &lists, quic).ok_or_else(|| anyhow::anyhow!("у general не найден профиль для сайтов из списка"))?;
-    if quic && !take.quic {
-        anyhow::bail!("у general не найден профиль QUIC для сайтов из списка");
-    }
-    let stripped = take.args.clone();
+fn start_engine(paths: &Paths, s: &Strategy, game_filter: &GameFilter, _rules: bool) -> anyhow::Result<Child> {
+    super::lists::ensure_user_files(&paths.exp_lists())?;
+    let exp = s.ray.as_ref().map(|r| r.0.clone()).unwrap_or_else(|| "adaptive".into());
     let ray = super::ray::exe(paths).ok_or_else(|| anyhow::anyhow!("нет RayOfLight.exe"))?;
-    let winws = start_raw(&s.engine, &s.bin, &stripped, &s.name)?;
-    std::thread::sleep(Duration::from_millis(300));
     let live = log_path(&format!("{}-ray", s.name)).with_extension("json");
     let _ = fs::remove_file(&live);
-    let cli = format!("{}{}", super::ray::cli_args(paths, s, exp, &live), take.cli());
-    match start_raw(&ray, &s.bin, &cli, &format!("{}-ray", s.name)) {
-        Ok(c) => {
-            if let Ok(mut g) = COMPANION.lock() {
-                *g = Some((c, live));
-            }
-            Ok(winws)
-        }
-        Err(e) => {
-            stop_engine(Some(winws));
-            Err(e)
-        }
+    let child = start_raw(&ray, &paths.bin(), &super::ray::cli_args(paths, &exp, &live, game_filter), &s.name)?;
+    if let Ok(mut g) = COMPANION.lock() {
+        *g = Some(live);
     }
+    Ok(child)
 }
 
 fn stop_companion() {
-    let Some((mut c, live)) = COMPANION.lock().ok().and_then(|mut g| g.take()) else { return };
+    let Some(live) = COMPANION.lock().ok().and_then(|mut g| g.take()) else { return };
     std::thread::sleep(Duration::from_millis(super::ray::PICK_LIVE_MS + 150));
     let summary = fs::read_to_string(&live).ok().and_then(|t| super::ray::parse_live(&t)).map(|l| super::ray::pick_summary(&l));
-    let _ = c.kill();
-    let _ = c.wait();
     if let Ok(mut g) = RAY_SUMMARY.lock() {
         *g = Some(summary.unwrap_or_else(|| "RayOfLight: сводки нет, движок не успел её записать".into()));
     }
@@ -771,22 +746,7 @@ pub(crate) fn warm_up(child: &mut Child, name: &str, cancel: &AtomicBool) -> Res
 }
 
 fn companion_exited() -> bool {
-    COMPANION.lock().ok().is_some_and(|mut g| g.as_mut().is_some_and(|(c, _)| matches!(c.try_wait(), Ok(Some(_)))))
-}
-
-pub fn start_trial(paths: &Paths, s: &Strategy, game_filter: &GameFilter) -> anyhow::Result<Child> {
-    let mut child = start_engine(paths, s, game_filter, true)?;
-    match warm_up(&mut child, &s.name, &AtomicBool::new(false)) {
-        Ok(()) => Ok(child),
-        Err(e) => {
-            stop_engine(Some(child));
-            anyhow::bail!("стратегия не запустилась: {e}")
-        }
-    }
-}
-
-pub fn stop_trial(child: Child) {
-    stop_engine(Some(child));
+    false
 }
 
 pub(crate) fn stop_engine(child: Option<Child>) {
@@ -955,7 +915,7 @@ mod tests {
         assert_eq!(unreachable_checks(&targets, &results), vec![false, false]);
         assert!(regressions(&[ok.clone(), ok.clone()], &general.checks).is_empty());
         assert!(!blackout(&[ok.clone(), ok.clone()], &[Check::skipped_from(&ok), Check::skipped_from(&dead)]));
-        assert_eq!(Check::skipped_from(&dead).detail(), "стратегия не обходит этот сайт");
+        assert_eq!(Check::skipped_from(&dead).detail(), "обход не трогает этот сайт");
     }
 
     #[test]

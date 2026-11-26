@@ -9,7 +9,6 @@ use eframe::egui::{self, Color32, CornerRadius, RichText};
 pub enum Confirm {
     PowerOff,
     RemoveService,
-    RemoveFlowseal,
     WarpWithoutZapret,
     ResetAll,
     MoveFolder,
@@ -40,12 +39,12 @@ impl App {
             ),
             Confirm::ResetAll => (
                 "Сбросить настройки и списки?",
-                "Вернутся настройки по умолчанию, очистятся «Мои домены», «Мои IP», исключения, мои сайты, правила для сайтов, игровой фильтр, результаты подбора и настройки Telegram-прокси. Стратегии, установленная служба и автозапуск останутся, служба перезапустится с чистыми списками.",
+                "Вернутся настройки по умолчанию, очистятся «Мои домены», «Мои IP», исключения, мои сайты, правила для сайтов, игровой фильтр, результаты подбора и настройки Telegram-прокси. Установленная служба и автозапуск останутся, служба перезапустится с чистыми списками.",
                 "Сбросить",
             ),
             Confirm::WarpBlocksCheck => (
                 "Сначала отключите WARP",
-                "Пока WARP пропускает весь трафик через Cloudflare, сайты открываются при любой стратегии, и подбор с проверками покажут, что подходит всё. Отключите WARP, запустите подбор, а после него включите WARP обратно.",
+                "Пока WARP пропускает весь трафик через Cloudflare, сайты открываются при любом приёме, и подбор с проверками покажут, что подходит всё. Отключите WARP, запустите подбор, а после него включите WARP обратно.",
                 "Отключить WARP",
             ),
             Confirm::StopSharing => ("Выключить раздачу на телефон?", "SHARE", "Выключить"),
@@ -60,17 +59,12 @@ impl App {
                 "Скопирую папку в новую без кириллицы на системном диске, переустановлю оттуда службу и автозапуск и перезапущу лаунчер. Старая папка останется, её можно будет удалить вручную. Ярлыки на рабочем столе нужно будет пересоздать.",
                 "Перенести",
             ),
-            Confirm::RemoveFlowseal => (
-                "Удалить стратегии Flowseal?",
-                "Папка flowseal со стратегиями, движком и списками будет удалена. Скачать её снова можно в Инструментах.",
-                "Удалить",
-            ),
         };
         let old_text;
         let text = if c == Confirm::DeleteOld {
             let old = self.old_folder.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
             old_text = format!(
-                "HolyZapret уже работает из новой папки. В корзину отправятся только файлы HolyZapret из {old}: стратегии, списки, движок и старый лаунчер. Ваши файлы в этой папке не тронутся, а пустая папка удалится."
+                "HolyZapret уже работает из новой папки. В корзину отправятся только файлы HolyZapret из {old}: списки, движок и старый лаунчер. Ваши файлы в этой папке не тронутся, а пустая папка удалится."
             );
             old_text.as_str()
         } else if matches!(c, Confirm::StopSharing | Confirm::QuitSharing) {
@@ -115,9 +109,11 @@ impl App {
                 self.confirm = None;
                 match c {
                     Confirm::PowerOff | Confirm::RemoveService => {
-                        self.spawn(ctx, |_, tx| notify(tx, Lvl::Ok, service::remove()));
+                        self.spawn(ctx, |_, tx| match service::remove() {
+                            Ok(m) => notify(tx, Lvl::Ok, m),
+                            Err(m) => notify(tx, Lvl::Err, m),
+                        });
                     }
-                    Confirm::RemoveFlowseal => self.flowseal_action(ctx, false),
                     Confirm::WarpWithoutZapret => self.warp_do(ctx, WarpAction::Connect),
                     Confirm::ResetAll => self.reset_all(ctx),
                     Confirm::MoveFolder => self.move_folder(ctx),

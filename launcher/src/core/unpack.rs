@@ -60,7 +60,7 @@ pub fn is_release_zip(p: &Path) -> bool {
     let Ok(z) = zip::ZipArchive::new(f) else { return false };
     let names: Vec<String> = z.file_names().filter_map(Result::ok).map(|n| n.replace('\\', "/").to_lowercase()).collect();
     let has = |tail: &str| names.iter().any(|n| n == tail || n.ends_with(&format!("/{tail}")));
-    has("bin/holyzapret.exe") && has(&LAUNCHER.to_lowercase())
+    (has("bin/rayoflight.exe") || has("bin/holyzapret.exe")) && has(&LAUNCHER.to_lowercase())
 }
 
 pub fn pick(candidates: &[(PathBuf, std::time::SystemTime)], hint: Option<&str>, version: &str) -> Option<PathBuf> {
@@ -106,8 +106,8 @@ pub fn copy_from(source: &Path, target: &Path) -> anyhow::Result<(PathBuf, PathB
         if !launcher.is_file() {
             fs::copy(&exe, &launcher)?;
         }
-        if !target.join("bin").join("HolyZapret.exe").is_file() {
-            anyhow::bail!("в {} не оказалось bin\\HolyZapret.exe", target.display());
+        if !super::paths::is_root(target) {
+            anyhow::bail!("в {} не оказалось папки bin с движком", target.display());
         }
         Ok((target.to_path_buf(), launcher))
     })();

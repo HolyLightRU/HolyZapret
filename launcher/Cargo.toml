@@ -1,6 +1,6 @@
 [package]
 name = "holyzapret-launcher"
-version = "3.2.0"
+version = "3.2.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 

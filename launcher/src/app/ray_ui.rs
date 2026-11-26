@@ -1,8 +1,8 @@
-use super::{App, Lvl, notify, result_msg};
+use super::{App, Lvl, result_msg};
 use crate::core::ray;
 use crate::core::service::{self, ServiceState};
 use crate::core::settings;
-use crate::theme::{self, CYAN, GREEN, RED, YELLOW};
+use crate::theme::{self, CYAN, GREEN, ORANGE, RED, YELLOW};
 use eframe::egui::{self, Color32, CornerRadius, RichText};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -14,19 +14,18 @@ const SYSTEM: [&str; 12] = [
 #[derive(Default)]
 pub struct RayState {
     loaded: bool,
-    on: bool,
     lists: [Vec<String>; 2],
     input: [String; 2],
     dirty: bool,
     running: Vec<String>,
     checked_at: Option<Instant>,
     service: Option<ServiceState>,
-    compatible: Option<bool>,
     last: Option<String>,
     live: Option<(ray::Live, Duration)>,
     experiment: String,
     quic: String,
     auto: bool,
+    dns: bool,
     auto_count: usize,
     live_at: Option<Instant>,
     pub(super) icons: HashMap<String, (Option<egui::TextureHandle>, Instant)>,
@@ -132,8 +131,8 @@ enum Act {
     Experiment(String),
     Quic(String),
     Auto(bool),
+    Dns(bool),
     ClearAuto,
-    Toggle(bool),
     Add(usize, String),
     Remove(usize, String),
     Apply,
@@ -145,12 +144,15 @@ impl App {
         let st = &mut self.ray;
         if !st.loaded {
             st.loaded = true;
-            st.on = settings::ray_enabled();
             let (all, skip) = settings::ray_apps();
             st.lists = [split(&all), split(&skip)];
             st.experiment = settings::ray_experiment();
             st.quic = settings::ray_quic();
+            if st.quic.is_empty() {
+                st.quic = "general".into();
+            }
             st.auto = settings::ray_autolist();
+            st.dns = settings::ray_dns();
         }
         if st.checked_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
             if st.live_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
@@ -165,7 +167,7 @@ impl App {
         if let Some(p) = &self.paths {
             st.auto_count = ray::auto_sites(p).len();
         }
-        st.service = Some(service::query(ray::SERVICE));
+        st.service = Some(service::query(service::SERVICE));
         let mut names: Vec<String> = crate::core::procs::names().into_values().map(|n| n.to_lowercase()).filter(|n| !SYSTEM.contains(&n.as_str())).collect();
         names.sort();
         names.dedup();
@@ -175,9 +177,6 @@ impl App {
         self.ray.last = ray::last_line(&p);
         self.ray.live = ray::read_live(&p);
         self.ray.live_at = Some(Instant::now());
-        self.ray.compatible = self.rules_strategy().map(|s| {
-            crate::core::rules::with_rules(&p, &s, &crate::core::gamefilter::load(&p)).is_ok_and(|a| ray::strip(&a, &ray::lists_arg(&s, &p)).is_some())
-        });
     }
 
     fn ray_list(&mut self, ui: &mut egui::Ui, idx: usize, title: &str, hint: &str, act: &mut Option<Act>) {
@@ -231,29 +230,19 @@ impl App {
                 if crate::core::TEST_BUILD {
                     theme::chip(ui, "тестовая сборка", YELLOW);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut on = self.ray.on;
-                    ui.add_enabled_ui(!self.busy && exe.is_some(), |ui| {
-                        if theme::toggle(ui, &mut on).changed() {
-                            act = Some(Act::Toggle(on));
-                        }
-                    });
-                });
             });
             ui.add(
                 egui::Label::new(muted(
-                    "Собственный движок HolyZapret. Обрабатывает сайты из списка так же, как стратегия general, и умеет обходить программы целиком или не трогать их. Работает вместе со службой: пока она запущена, запущен и он.",
+                    "Движок обхода HolyZapret. Сам подбирает приём для каждого сайта и запоминает рабочий, умеет обходить программы целиком или не трогать их. Работает, пока запущена служба HolyZapret.",
                 ))
                 .wrap(),
             );
             ui.add_space(4.0);
-            let state = match (&exe, self.ray.compatible, &self.ray.service) {
-                (None, _, _) => ("Нет файла bin\\RayOfLight.exe".to_string(), RED),
-                (_, Some(false), _) if self.ray.on => ("Работает только со стратегией general: с текущей стратегией движок не включится".to_string(), YELLOW),
-                (_, _, Some(ServiceState::Running)) => ("Движок работает".to_string(), GREEN),
-                (_, _, Some(ServiceState::Stopped)) => ("Движок установлен, ждёт запуска службы".to_string(), Color32::from_gray(170)),
-                _ if self.ray.on => ("Включится при следующей установке службы".to_string(), Color32::from_gray(170)),
-                _ => ("Выключен".to_string(), Color32::from_gray(150)),
+            let state = match (&exe, &self.ray.service) {
+                (None, _) => ("Нет файла bin\\RayOfLight.exe".to_string(), RED),
+                (_, Some(ServiceState::Running)) => ("Движок работает".to_string(), GREEN),
+                (_, Some(ServiceState::Stopped)) => ("Служба остановлена, движок ждёт её запуска".to_string(), Color32::from_gray(170)),
+                _ => ("Заработает, когда вы включите защиту на Главной".to_string(), Color32::from_gray(170)),
             };
             theme::row(ui, 26.0, |ui| {
                 ui.label(RichText::new("●").color(state.1).size(13.0));
@@ -268,9 +257,10 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(l).monospace().size(11.5).color(Color32::from_gray(150))).wrap());
             }
             ui.add_space(6.0);
-            let label_w = ui.painter().layout_no_wrap("Эксперимент".into(), egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE).size().x;
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let label_w = ["Приём", "QUIC"].iter().map(|t| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x).fold(0.0, f32::max);
             theme::row(ui, 34.0, |ui| {
-                let w = ui.label(RichText::new("Эксперимент").strong()).rect.width();
+                let w = ui.label(RichText::new("Приём").strong()).rect.width();
                 ui.add_space(6.0 + (label_w - w).max(0.0));
                 egui::ComboBox::from_id_salt("ray_experiment").selected_text(ray::experiment_label(&self.ray.experiment)).width(280.0).show_ui(ui, |ui| {
                     for (name, label, hint) in ray::EXPERIMENTS {
@@ -282,13 +272,13 @@ impl App {
             });
             let hint = ray::EXPERIMENTS.iter().find(|e| e.0 == self.ray.experiment).map(|e| e.2).unwrap_or("");
             ui.label(muted(hint));
+            if let Some(t) = ray::start_technique().filter(|_| self.ray.experiment == "adaptive") {
+                ui.label(muted(format!("Первым шагом идёт «{}»: его выбрал подбор", ray::experiment_label(&t))));
+            }
             theme::row(ui, 34.0, |ui| {
                 let w = ui.label(RichText::new("QUIC").strong()).rect.width();
                 ui.add_space(6.0 + (label_w - w).max(0.0));
                 egui::ComboBox::from_id_salt("ray_quic").selected_text(ray::quic_label(&self.ray.quic)).width(280.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(self.ray.quic.is_empty(), "На обычном движке").on_hover_text("QUIC остаётся на обычном движке, как раньше").clicked() && !self.ray.quic.is_empty() {
-                        act = Some(Act::Quic(String::new()));
-                    }
                     for (name, label, hint) in ray::QUIC_EXPERIMENTS {
                         if ui.selectable_label(self.ray.quic == name, label).on_hover_text(hint).clicked() && self.ray.quic != name {
                             act = Some(Act::Quic(name.to_string()));
@@ -296,7 +286,7 @@ impl App {
                     }
                 });
             });
-            let qhint = ray::QUIC_EXPERIMENTS.iter().find(|e| e.0 == self.ray.quic).map(|e| e.2).unwrap_or("QUIC (UDP 443) для сайтов из списка обрабатывает обычный движок");
+            let qhint = ray::QUIC_EXPERIMENTS.iter().find(|e| e.0 == self.ray.quic).map(|e| e.2).unwrap_or("");
             ui.label(muted(qhint));
             ui.add_space(4.0);
             theme::row(ui, 30.0, |ui| {
@@ -314,9 +304,14 @@ impl App {
                 }
             });
             ui.label(muted("Сайт не из списков, который дважды не ответил, дальше обходится сам. Если обход ему не нужен, самоподстройка это заметит"));
-            if self.ray.on {
-                self.ray_live(ui, &mut act);
-            }
+            theme::row(ui, 30.0, |ui| {
+                let mut dns = self.ray.dns;
+                if ui.checkbox(&mut dns, "Чинить DNS для сайтов из списков").changed() {
+                    act = Some(Act::Dns(dns));
+                }
+            });
+            ui.label(muted("Если провайдер прячет адрес заблокированного сайта (пишет, что такого сайта нет, или подсовывает пустышку), RayOfLight узнаёт настоящий адрес у шифрованного DNS Google или Cloudflare. Обычные ответы не трогаются"));
+            self.ray_live(ui, &mut act);
             self.ray_list(ui, 0, "Обходить целиком", "Весь HTTPS этих программ идёт через обход, даже сайты не из списков", &mut act);
             self.ray_list(ui, 1, "Не трогать", "Эти программы обход не трогает никогда, даже на сайтах из списков", &mut act);
             if self.ray.dirty {
@@ -338,6 +333,10 @@ impl App {
                 self.ray.auto = on;
                 self.ray.dirty = true;
             }
+            Some(Act::Dns(on)) => {
+                self.ray.dns = on;
+                self.ray.dirty = true;
+            }
             Some(Act::ClearAuto) => {
                 if let Some(p) = &self.paths {
                     ray::clear_autolist(p);
@@ -348,11 +347,6 @@ impl App {
             Some(Act::Quic(name)) => {
                 self.ray.quic = name;
                 self.ray.dirty = true;
-            }
-            Some(Act::Toggle(on)) => {
-                self.ray.on = on;
-                settings::set_ray_enabled(on);
-                self.ray_apply(ctx);
             }
             Some(Act::Add(idx, raw)) => match norm(&raw) {
                 Some(n) => {
@@ -395,11 +389,15 @@ impl App {
             l.skipped,
             age.as_secs()
         )));
-        if l.answered + l.reset + l.silent > 0 {
+        if l.answered + l.reset + l.silent + l.frozen > 0 {
             theme::row(ui, 24.0, |ui| {
                 ui.label(RichText::new(format!("ответ {}", l.answered)).color(GREEN).size(12.5));
                 ui.label(RichText::new(format!("сброс {}", l.reset)).color(RED).size(12.5));
                 ui.label(RichText::new(format!("тишина {}", l.silent)).color(YELLOW).size(12.5));
+                if l.frozen > 0 {
+                    ui.label(RichText::new(format!("заморозка {}", l.frozen)).color(ORANGE).size(12.5))
+                        .on_hover_text("Сервер ответил, но после 12–32 КБ замолчал: так провайдер режет загрузку с некоторых хостингов. Движок пробует другой адрес сервера, потом WARP");
+                }
                 if l.techniques.len() > 1 {
                     let per: Vec<String> = l
                         .techniques
@@ -456,6 +454,7 @@ impl App {
                         Some("answered") => GREEN,
                         Some("reset") => RED,
                         Some("silent") => YELLOW,
+                        Some("frozen") => ORANGE,
                         _ if i.handled => CYAN,
                         _ => Color32::from_gray(130),
                     };
@@ -480,25 +479,22 @@ impl App {
         settings::set_ray_experiment(&self.ray.experiment);
         settings::set_ray_quic(&self.ray.quic);
         settings::set_ray_autolist(self.ray.auto);
+        settings::set_ray_dns(self.ray.dns);
         self.ray.dirty = false;
         self.ray.checked_at = None;
-        let installed = self.status.as_ref().is_some_and(|s| s.service != ServiceState::NotInstalled);
-        let strategy = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
-        match (installed, strategy) {
+        let installed = self.status.as_ref().is_some_and(|s| s.active_strategy().is_some());
+        match (installed, self.ray_current()) {
             (true, Some(s)) => self.spawn(ctx, move |p, tx| {
                 result_msg(tx, service::install(p, &s), "Не удалось переустановить службу");
             }),
-            _ => {
-                let on = self.ray.on;
-                let (tx, ctx2) = (self.tx.clone(), ctx.clone());
-                std::thread::spawn(move || {
-                    if !on {
-                        ray::remove();
-                    }
-                    notify(&tx, Lvl::Info, if on { "RayOfLight включится при следующей установке службы" } else { "RayOfLight выключен" });
-                    ctx2.request_repaint();
-                });
-            }
+            _ => self.toast(ctx, Lvl::Info, "Настройки сохранены: они заработают, когда вы включите защиту на Главной"),
         }
+    }
+
+    pub(super) fn ray_current(&self) -> Option<crate::core::strategy::Strategy> {
+        let id = format!("rayoflight:{}", settings::ray_experiment());
+        let mut s = self.strategies.iter().find(|s| s.id == id).or_else(|| self.strategies.iter().find(|s| s.id == ray::DEFAULT_ID)).cloned()?;
+        s.ray = None;
+        Some(s)
     }
 }

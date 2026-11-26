@@ -81,7 +81,7 @@ jobs:
           }
           Copy-Item "launcher/target/release/holyzapret-launcher.exe" (Join-Path $stage "HolyZapret Launcher.exe")
           Copy-Item "launcher/target/release/RayOfLight.exe" (Join-Path $stage "bin/RayOfLight.exe")
-          if (-not (Test-Path (Join-Path $stage "bin/HolyZapret.exe"))) { throw "В пакете нет bin/HolyZapret.exe" }
+          if (-not (Test-Path (Join-Path $stage "bin/WinDivert64.sys"))) { throw "В пакете нет bin/WinDivert64.sys" }
           if (-not (Test-Path (Join-Path $stage "bin/RayOfLight.exe"))) { throw "В пакете нет bin/RayOfLight.exe" }
           $zip = Join-Path $env:RUNNER_TEMP "Holy-Zapret-$version.zip"
           Push-Location $stage

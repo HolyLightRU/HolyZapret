@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const MOVED_ARG: &str = "--moved-from";
-const DIRS: [&str; 7] = ["bin", "lists", "exp-list", "utils", "additional", "experimental", super::flowseal::DIR];
+const DIRS: [&str; 7] = ["bin", "lists", "exp-list", "utils", "scripts", "additional", "experimental"];
+const ENGINES: [&str; 2] = ["RayOfLight.exe", "HolyZapret.exe"];
 
 pub fn target_dir() -> PathBuf {
     let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
@@ -19,7 +20,7 @@ pub fn installed() -> Option<PathBuf> {
     let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let dir = PathBuf::from(format!("{drive}\\HolyZapret"));
     let exe = dir.join("HolyZapret Launcher.exe");
-    (exe.is_file() && dir.join("bin").join("HolyZapret.exe").is_file()).then_some(exe)
+    (exe.is_file() && ENGINES.iter().any(|e| dir.join("bin").join(e).is_file())).then_some(exe)
 }
 
 fn mentions_zapret(p: &Path) -> bool {
@@ -34,11 +35,11 @@ fn has_strategy(dir: &Path) -> bool {
 
 fn signed_dir(dir: &Path, name: &str) -> bool {
     match name {
-        "bin" => dir.join("HolyZapret.exe").is_file(),
+        "bin" => ENGINES.iter().any(|e| dir.join(e).is_file()),
+        "scripts" => dir.join("manager.bat").is_file() || has_strategy(dir),
         "lists" => dir.join("hosts-list.txt").is_file() || dir.join("ipset-all.txt").is_file(),
         "exp-list" => dir.join("ipset-all.txt").is_file() || dir.join("list-general.txt").is_file(),
         "utils" => dir.join("targets.txt").is_file(),
-        n if n == super::flowseal::DIR => super::flowseal::version_in(dir).is_some() || has_strategy(dir),
         _ => has_strategy(dir),
     }
 }
@@ -101,8 +102,8 @@ pub fn run(paths: &Paths, target: PathBuf) -> anyhow::Result<(PathBuf, PathBuf)>
         if !new_exe.is_file() {
             fs::copy(&exe, &new_exe)?;
         }
-        if !moved.engine().is_file() {
-            anyhow::bail!("в {} не оказалось bin\\HolyZapret.exe", target.display());
+        if !super::paths::is_root(&moved.root) {
+            anyhow::bail!("в {} не оказалось папки bin с движком", target.display());
         }
         Ok(())
     })();
@@ -116,9 +117,9 @@ pub fn run(paths: &Paths, target: PathBuf) -> anyhow::Result<(PathBuf, PathBuf)>
             let find = |p: &Paths| super::strategy::discover(p).into_iter().find(|s| s.matches(id));
             let Some(new) = find(&moved) else {
                 let _ = fs::remove_dir_all(&target);
-                anyhow::bail!("в новой папке не нашлась стратегия службы {id}, перенос отменён");
+                anyhow::bail!("в новой папке нет RayOfLight для службы ({id}), перенос отменён");
             };
-            service::remove();
+            let _ = service::remove();
             if let Err(e) = service::install(&moved, &new) {
                 if let Some(old) = find(paths) {
                     let _ = service::install(paths, &old);
@@ -156,8 +157,8 @@ fn same(a: &Path, b: &Path) -> bool {
 }
 
 pub fn can_remove_old(old: &Path, current: &Path) -> bool {
-    old.join("bin").join("HolyZapret.exe").is_file()
-        && current.join("bin").join("HolyZapret.exe").is_file()
+    ENGINES.iter().any(|e| old.join("bin").join(e).is_file())
+        && ENGINES.iter().any(|e| current.join("bin").join(e).is_file())
         && !same(old, current)
         && !current.starts_with(old)
         && old.parent().is_some()
@@ -197,7 +198,9 @@ mod tests {
         fs::create_dir_all(src.join("exp-list")).unwrap();
         fs::create_dir_all(src.join("Фото с отпуска")).unwrap();
         fs::create_dir_all(src.join("utils")).unwrap();
-        fs::write(src.join("bin").join("HolyZapret.exe"), "x").unwrap();
+        fs::create_dir_all(src.join("scripts")).unwrap();
+        fs::write(src.join("scripts").join("manager.bat"), "set \"LOCAL_VERSION=3.2.1\"").unwrap();
+        fs::write(src.join("bin").join("RayOfLight.exe"), "x").unwrap();
         fs::write(src.join("exp-list").join("ipset-all.txt"), "1.1.1.1").unwrap();
         fs::write(src.join("exp-list").join("list-general-user.txt"), "a.com").unwrap();
         fs::write(src.join("general.bat"), "\"%BIN%HolyZapret.exe\" --wf-tcp=443").unwrap();
@@ -207,8 +210,8 @@ mod tests {
         fs::write(src.join("HolyZapret Launcher.exe"), "z").unwrap();
         fs::write(src.join("диплом.docx"), "важно").unwrap();
         fs::write(src.join("Фото с отпуска").join("1.jpg"), "p").unwrap();
-        assert_eq!(copy_ours(&src, &dst, None).unwrap(), 5);
-        assert!(dst.join("bin").join("HolyZapret.exe").is_file());
+        assert_eq!(copy_ours(&src, &dst, None).unwrap(), 6);
+        assert!(dst.join("bin").join("RayOfLight.exe").is_file() && dst.join("scripts").join("manager.bat").is_file());
         assert_eq!(fs::read_to_string(dst.join("exp-list").join("list-general-user.txt")).unwrap(), "a.com");
         assert!(!dst.join("диплом.docx").exists() && !dst.join("Фото с отпуска").exists());
         assert!(!dst.join("backup.bat").exists() && !dst.join("README.md").exists() && !dst.join("utils").exists());

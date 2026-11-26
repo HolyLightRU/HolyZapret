@@ -62,7 +62,7 @@ impl App {
     }
 
     fn warp_connect(&mut self, ctx: &egui::Context) {
-        let protected = self.trial.is_some() || self.status.as_ref().is_some_and(|s| s.service == ServiceState::Running);
+        let protected = self.status.as_ref().is_some_and(|s| s.service == ServiceState::Running);
         if protected {
             self.warp_do(ctx, WarpAction::Connect);
         } else {

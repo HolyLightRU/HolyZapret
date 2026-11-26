@@ -33,10 +33,10 @@ fn batch_line(v: &Verdict) -> (String, Color32) {
     let host = super::sites_tab::host_of(&v.url);
     match &v.advice {
         Advice::Fine => (format!("{host}: открывается и без обхода, правило не нужно"), Color32::from_gray(170)),
-        Advice::Works(s) => (format!("{host}: открывается со стратегией «{s}», правило не нужно"), Color32::from_gray(170)),
-        Advice::Exclude => (format!("{host}: стратегия ломает сайт, не обходить"), YELLOW),
+        Advice::Works(s) => (format!("{host}: открывается с «{s}», правило не нужно"), Color32::from_gray(170)),
+        Advice::Exclude => (format!("{host}: обход ломает сайт, не обходить"), YELLOW),
         Advice::Use(r) => match r.technique.strip_prefix(rules::BORROW) {
-            Some(name) => (format!("{host}: поможет профиль из «{name}»"), GREEN),
+            Some(name) => (format!("{host}: поможет приём из «{name}»"), GREEN),
             None => (format!("{host}: поможет приём «{}»", rules::label(&r.technique)), GREEN),
         },
         Advice::Nothing if host.contains("telegram") => (
@@ -95,7 +95,7 @@ impl App {
         let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
         match installed {
             Some(id) => self.strategies.iter().find(|s| s.matches(&id)).cloned(),
-            None => self.selected.and_then(|i| self.strategies.get(i)).cloned(),
+            None => self.selected.and_then(|i| self.strategies.get(i)).or_else(|| self.strategies.iter().find(|s| s.id == crate::core::ray::DEFAULT_ID)).cloned(),
         }
     }
 
@@ -137,7 +137,6 @@ impl App {
     fn apply_rules(&mut self, ctx: &egui::Context, msg: String) {
         let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
         let strategy = installed.and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
-        let trial = self.trial.is_some();
         match strategy {
             Some(s) => self.spawn(ctx, move |p, tx| {
                 match crate::core::service::install(p, &s) {
@@ -145,7 +144,6 @@ impl App {
                     Err(e) => super::notify(tx, Lvl::Err, format!("{msg}, но службу не удалось перезапустить: {e}")),
                 }
             }),
-            None if trial => self.toast(ctx, Lvl::Ok, format!("{msg}. Перезапустите пробный запуск, чтобы применить")),
             None => self.toast(ctx, Lvl::Ok, format!("{msg}. Применится при установке службы")),
         }
     }
@@ -154,12 +152,12 @@ impl App {
         if self.warp_blocks_checks() {
             return;
         }
-        if self.trial.is_some() || self.picker.running {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let Some(current) = self.rules_strategy() else {
-            self.toast(ctx, Lvl::Info, "Выберите или установите стратегию, чтобы проверить правила с ней");
+            self.toast(ctx, Lvl::Info, "RayOfLight недоступен: нет bin\\RayOfLight.exe");
             return;
         };
         let Some(p) = self.paths.clone() else { return };
@@ -191,8 +189,8 @@ impl App {
         if self.busy || self.rules.running() || self.warp_blocks_checks() || urls.is_empty() {
             return;
         }
-        if self.trial.is_some() || self.picker.running {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let Some(p) = self.paths.clone() else { return };
@@ -217,8 +215,8 @@ impl App {
         if self.busy || self.rules.running() || self.warp_blocks_checks() {
             return;
         }
-        if self.trial.is_some() || self.picker.running {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let url = match checks::normalize_url(&self.rules.input) {
@@ -317,16 +315,16 @@ impl App {
                 }
                 let (advice, rule) = match &v.advice {
                     Advice::Fine => ("Сайт открывается, правило не нужно. Если не работает приложение, а не сайт, проверка этого не видит".to_string(), None),
-                    Advice::Works(s) => (format!("Сайт открывается со стратегией «{s}», правило не нужно"), None),
+                    Advice::Works(s) => (format!("Сайт открывается с «{s}», правило не нужно"), None),
                     Advice::Exclude => (
-                        format!("Стратегия ломает сайт, который работает и без обхода. Не обходить: {}", v.domains.join(", ")),
+                        format!("Обход ломает сайт, который работает и без него. Не обходить: {}", v.domains.join(", ")),
                         Some(Rule { technique: rules::NONE.into(), domains: v.domains.clone(), origin: v.origin.clone(), ..Default::default() }),
                     ),
                     Advice::Use(rule) => {
                         let best = v.techniques.iter().find(|t| t.rule.as_ref() == Some(rule));
                         let ms = best.map(|t| t.ms).unwrap_or(0);
                         let what = if rule.borrowed() {
-                            format!("Помогает профиль стратегии: {}", rules::label(&rule.technique).to_lowercase())
+                            format!("Помогает приём: {}", rules::label(&rule.technique).to_lowercase())
                         } else {
                             format!("Помогает приём «{}»", rules::label(&rule.technique))
                         };
@@ -353,7 +351,7 @@ impl App {
                 }
                 if matches!(v.advice, Advice::Nothing) {
                     ui.add_space(6.0);
-                    if ui.add_enabled(enabled, egui::Button::new("Подобрать стратегию под сайт")).clicked() {
+                    if ui.add_enabled(enabled, egui::Button::new("Открыть подбор для сайта")).clicked() {
                         act = Some(Act::Picker);
                     }
                 }
@@ -390,7 +388,7 @@ impl App {
             let wide = ui.available_width() >= 640.0;
             theme::row(ui, 38.0, |ui| {
                 ui.label(RichText::new("Правила для сайтов").size(17.0).strong()).on_hover_text(
-                    "Если сайт не работает, лаунчер проверит его без обхода и со стратегией и подскажет: не обходить его или подобрать отдельный приём",
+                    "Если сайт не работает, лаунчер проверит его без обхода и с приёмами RayOfLight по очереди и подскажет: не обходить его или какой приём ему подходит. Самоподстройка начнёт с этого приёма и сменит его, если сайт перестанет отвечать",
                 );
                 if !self.rules.list.is_empty() {
                     let n = self.rules.list.len();
@@ -455,7 +453,7 @@ impl App {
             if self.rules.expanded && !self.rules.list.is_empty() {
                 ui.add_space(6.0);
                 theme::row(ui, 30.0, |ui| {
-                    ui.label(muted("Проверить с текущей стратегией, какие правила помогают, а какие больше не нужны"));
+                    ui.label(muted("Проверить с RayOfLight, какие правила помогают, а какие больше не нужны"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can = !self.busy && !self.rules.running();
                         if ui.add_enabled(can, egui::Button::new("Перепроверить все")).clicked() {
@@ -490,9 +488,6 @@ impl App {
                                         ui.label(RichText::new("не помогает").color(RED).size(12.5));
                                     }
                                     None => {}
-                                }
-                                if !r.origin.is_empty() {
-                                    ui.label(muted(format!("для {}", theme::ellipsize(&r.origin, 24)))).on_hover_text(&r.origin);
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                     ui.add_space(4.0);

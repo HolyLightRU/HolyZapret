@@ -77,8 +77,8 @@ fn describe(g: Group) -> (Color32, &'static str, &'static str) {
         Group::ByName => (CYAN, "Зависит от имени сайта", "Обход сработает, если сайт есть в списках. Проверить сайт можно на вкладке «Сайты»"),
         Group::ByContent => (CYAN, "Зависит от содержимого", "Обход тронет только голос Discord и похожий на него трафик"),
         Group::Excluded => (Color32::from_gray(150), "В исключениях", "Адрес в исключениях IP, обход его пропускает"),
-        Group::Passed => (Color32::from_gray(150), "Обход пропускает", "Порт перехватывается, но правила для такого трафика в стратегии нет"),
-        Group::Unseen => (Color32::from_gray(150), "Обход не трогает", "Стратегия не перехватывает эти порты"),
+        Group::Passed => (Color32::from_gray(150), "Обход пропускает", "Порт перехватывается, но RayOfLight такой трафик не обрабатывает"),
+        Group::Unseen => (Color32::from_gray(150), "Обход не трогает", "RayOfLight не перехватывает эти порты"),
     }
 }
 
@@ -108,8 +108,8 @@ impl App {
         let s = self.rules_strategy()?;
         let gf = gamefilter::load(p);
         let all = GameFilter { mode: Mode::All, ..gf.clone() };
-        let now = crate::core::rules::with_rules(p, &s, &gf).ok()?;
-        let games = crate::core::rules::with_rules(p, &s, &all).ok()?;
+        let now = crate::core::ray::profile_args(p, &gf);
+        let games = crate::core::ray::profile_args(p, &all);
         Some(Target { strategy: s, now, games })
     }
 
@@ -263,16 +263,16 @@ impl App {
                 Some(t) if !seen.is_empty() => {
                     let off = self.status.as_ref().is_some_and(|s| !s.engine_running);
                     let text = if off {
-                        format!("Сверяю со стратегией «{}». Обход сейчас выключен", t.strategy.name)
+                        format!("Сверяю с «{}». Обход сейчас выключен", t.strategy.name)
                     } else {
-                        format!("Сверяю со стратегией «{}»", t.strategy.name)
+                        format!("Сверяю с «{}»", t.strategy.name)
                     };
                     ui.add_space(2.0);
                     ui.label(muted(text));
                 }
                 None if !seen.is_empty() => {
                     ui.add_space(2.0);
-                    ui.label(RichText::new("Стратегия не выбрана, сверять не с чем").color(YELLOW).size(12.5));
+                    ui.label(RichText::new("Нет bin\\RayOfLight.exe, сверять не с чем").color(YELLOW).size(12.5));
                 }
                 _ => {}
             }

@@ -95,6 +95,7 @@ pub fn start(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCf
                     }
                     Action::Hold | Action::Drop => {}
                     Action::Send(out) => send_all(&h, out, &failed),
+                    Action::Reject(..) => {}
                 }
             }
         }));
@@ -131,6 +132,10 @@ impl Gateway {
 
     pub fn totals(&self) -> (u64, u64, u64) {
         self.engine.lock().map(|e| (e.stats.handled, e.stats.answered, e.stats.reset + e.stats.silent)).unwrap_or_default()
+    }
+
+    pub fn take_redeemed(&self) -> Vec<Instant> {
+        self.engine.lock().map(|mut e| e.take_redeemed()).unwrap_or_default()
     }
 
     pub fn recent(&self) -> VecDeque<Decision> {

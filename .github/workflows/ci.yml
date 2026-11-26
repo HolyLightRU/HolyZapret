@@ -47,6 +47,6 @@ jobs:
 
       - name: Проверить пакет
         run: |
-          if (-not (Test-Path "bin/HolyZapret.exe")) { throw "В репозитории нет bin/HolyZapret.exe" }
+          if (-not (Test-Path "bin/WinDivert.dll")) { throw "В репозитории нет bin/WinDivert.dll" }
           if (-not (Test-Path "launcher/target/release/holyzapret-launcher.exe")) { throw "Лаунчер не собрался" }
           if (-not (Test-Path "launcher/target/release/RayOfLight.exe")) { throw "RayOfLight не собрался" }

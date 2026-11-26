@@ -205,24 +205,9 @@ pub fn touches(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> boo
     first(profiles(args), host, ips, false, cache).is_some_and(|p| p.desync)
 }
 
-pub fn borrow(args: &str, host: &str, ips: &[IpAddr], cache: &mut Cache) -> [Option<Vec<String>>; 2] {
-    let pick = |udp: bool, cache: &mut Cache| first(profiles(args), host, ips, udp, cache).filter(|p| p.desync).map(|p| p.rest);
-    [pick(false, cache), pick(true, cache)]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn borrow_takes_first_matching_profile() {
-        let args = "--wf-tcp=443 --wf-udp=443 --filter-udp=443 --hostlist-domains=a.com --dpi-desync=fake --dpi-desync-repeats=11 --new --filter-tcp=443 --hostlist-domains=a.com --ipset-exclude=\"x\" --dpi-desync=multisplit --dpi-desync-split-pos=1 --comment=test --new --filter-tcp=443 --dpi-desync=fake";
-        let mut c = Cache::default();
-        let v = |s: &[&str]| Some(s.iter().map(|x| x.to_string()).collect::<Vec<_>>());
-        assert_eq!(borrow(args, "www.a.com", &[], &mut c), [v(&["--dpi-desync=multisplit", "--dpi-desync-split-pos=1"]), v(&["--dpi-desync=fake", "--dpi-desync-repeats=11"])]);
-        assert_eq!(borrow(args, "b.com", &[], &mut c), [v(&["--dpi-desync=fake"]), None]);
-        assert_eq!(borrow("--filter-tcp=443 --hostlist-domains=a.com", "a.com", &[], &mut c), [None, None]);
-    }
 
     #[test]
     fn ports() {

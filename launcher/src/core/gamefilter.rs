@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ranges_validated_like_flowseal() {
+    fn ranges_validated() {
         assert_eq!(validate("1024-65535").as_deref(), Some("1024-65535"));
         assert_eq!(validate(" 1024-1934, 1936-65535 ").as_deref(), Some("1024-1934,1936-65535"));
         assert_eq!(validate("443").as_deref(), Some("443"));

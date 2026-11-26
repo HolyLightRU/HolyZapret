@@ -1,4 +1,3 @@
-use super::flowseal;
 use super::paths::Paths;
 use super::service::{self, ServiceState};
 use super::{kill_process, process_running, run_hidden};
@@ -199,7 +198,7 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
         Some(true) => ok("TCP timestamps включены"),
         Some(false) => issue(Level::Bad,
             "TCP timestamps выключены",
-            "Стратегии с --dpi-desync-fooling=ts без них не работают",
+            "Без них основные приёмы RayOfLight работают хуже: движку приходится брать запасной приём",
         )
         .fix(Fix::EnableTimestamps),
         None => issue(Level::Warn, "Не удалось узнать состояние TCP timestamps", "Проверьте вручную: netsh interface tcp show global"),
@@ -218,10 +217,12 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
 
     v.push(if doh > 0 {
         ok("Защищённый DNS настроен")
+    } else if super::settings::ray_dns() {
+        ok("RayOfLight сам чинит DNS для сайтов из списков")
     } else {
         issue(Level::Warn,
             "Защищённый DNS не настроен",
-            "Включите DNS через HTTPS в браузере или в параметрах сети Windows 11 у стороннего DNS-провайдера",
+            "Включите «Чинить DNS для сайтов из списков» в карточке RayOfLight во вкладке «Инструменты» или DNS через HTTPS в браузере",
         )
     });
 
@@ -249,10 +250,7 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
         ok("Папка не в OneDrive")
     });
 
-    let mut sys_dirs = vec![paths.bin()];
-    if flowseal::installed(paths).is_some() {
-        sys_dirs.push(flowseal::dir(paths).join("bin"));
-    }
+    let sys_dirs = [paths.bin()];
     let missing: Vec<String> = sys_dirs
         .iter()
         .filter(|d| !d.join("WinDivert64.sys").is_file())
@@ -326,7 +324,7 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
             issue(
                 Level::Warn,
                 format!("Служба zapret установлена из другой папки: {}", d.display()),
-                "Скорее всего это оригинальный Flowseal. Удалите её, чтобы поставить стратегию HolyZapret, или оставьте, если пользуетесь им",
+                "Скорее всего это другая сборка zapret. Удалите её, чтобы включить защиту HolyZapret, или оставьте, если пользуетесь ей",
             )
             .fix(Fix::RemoveZapret),
         );
@@ -366,7 +364,7 @@ pub fn run(paths: &Paths) -> Vec<Finding> {
             issue(
                 Level::Warn,
                 format!("В «Моих доменах» есть {}", super::known::names(&all).join(", ")),
-                "Эти сервисы обычно работают без обхода, и стратегия может их сломать. Если какой-то из них не открывается, проверьте его в «Правилах для сайтов» на вкладке «Сайты»",
+                "Эти сервисы обычно работают без обхода, и обход может их сломать. Если какой-то из них не открывается, проверьте его в «Правилах для сайтов» на вкладке «Сайты»",
             )
             .fix(Fix::RemoveKnown(known)),
         );
@@ -384,7 +382,7 @@ pub fn apply(fix: &Fix) -> anyhow::Result<String> {
             Ok("TCP timestamps включены".into())
         }
         Fix::UnloadWinDivert => service::unload_windivert().map(|_| "Драйвер WinDivert выгружен".into()),
-        Fix::RemoveZapret => Ok(service::remove()),
+        Fix::RemoveZapret => service::remove().map_err(|e| anyhow::anyhow!(e)),
         Fix::StopEngines => {
             service::stop_engines();
             Ok("Движки остановлены".into())

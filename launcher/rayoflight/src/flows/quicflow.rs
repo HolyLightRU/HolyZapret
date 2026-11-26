@@ -156,6 +156,8 @@ impl<A: Clone> Engine<A> {
             seen.0 += 1;
             self.stats.game_udp += 1;
             (self.cfg.fake_game_udp.clone(), profiles::GAME_UDP_REPEATS)
+        } else if self.udp_auto() && self.lists.game_udp.contains(u.dport) && !self.lists.ip_excludes.contains(&u.dst) {
+            return self.auto_udp(raw, meta, now);
         } else {
             return Action::Pass;
         };
@@ -281,7 +283,7 @@ impl<A: Clone> Engine<A> {
                 }
             }
         }
-        self.pending.insert(key, Pending { host, tech, since: now, id, ack0: None, dcid });
+        self.pending.insert(key, Pending { host, tech, since: now, id, ack0: None, dcid, bg: false });
         Action::Send(out)
     }
 
@@ -340,6 +342,9 @@ impl<A: Clone> Engine<A> {
 
     pub(super) fn observe_udp(&mut self, raw: &[u8]) {
         let Some(u) = packet::parse_udp(raw) else { return };
+        if self.observe_game_udp(&u) {
+            return;
+        }
         if !quic::is_long_header(u.payload()) {
             return;
         }

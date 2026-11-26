@@ -153,8 +153,8 @@ impl App {
             return;
         }
         let only_service = self.status.as_ref().is_some_and(|s| s.active_strategy().is_some() && s.foreign_engines.is_empty());
-        if self.trial.is_some() || (self.status.as_ref().is_some_and(|s| s.engine_running) && !only_service) {
-            self.update.error = Some("Сначала выключите пробный запуск: движок держит файлы, которые нужно обновить".into());
+        if self.status.as_ref().is_some_and(|s| s.engine_running) && !only_service {
+            self.update.error = Some("Сначала остановите подбор или другой обход: движок держит файлы, которые нужно обновить".into());
             self.update.open = true;
             return;
         }

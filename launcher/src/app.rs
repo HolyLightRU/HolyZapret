@@ -14,7 +14,6 @@ mod tools_tab;
 mod unpack_ui;
 mod update_ui;
 mod tg_ui;
-mod trial;
 mod warp_ui;
 mod whats_new;
 mod wizard;
@@ -26,7 +25,6 @@ use crate::core::service::{self, ServiceState, Status};
 use crate::core::strategy::{self, Strategy};
 use crate::core::discover::Found;
 use crate::core::selfupdate::{self, Release as UpdateRelease};
-use crate::core::flowseal::{self, Release};
 use crate::core::picker;
 use crate::core::settings::{self, Settings};
 use crate::core::{gamefilter, update};
@@ -52,10 +50,8 @@ enum Msg {
     CheckChanged,
     Version(Result<UpdateRelease, String>),
     Found(Result<Found, String>),
-    FlowsealLatest(Result<Release, String>),
     Pick(picker::Event),
     Rules(crate::core::rules::Event),
-    Rescan,
     Updated,
     UpdateStage(String),
     UpdateFailed(String),
@@ -65,7 +61,6 @@ enum Msg {
     TgForeign(Vec<String>),
     TgClient(Option<crate::core::tgproxy::control::Client>),
     PostInstallCheck,
-    TrialStarted(Result<trial::Trial, String>),
     ResetDone,
     Shared,
     WhatsNew(String, String),
@@ -80,7 +75,7 @@ fn auto_repick_now(p: &Paths, current: Option<&str>, tx: &Sender<Msg>, ctx: &egu
     use std::sync::atomic::{AtomicBool, Ordering};
     let strategies = strategy::discover(p);
     let cur = current.and_then(|id| strategies.iter().find(|s| s.matches(id)));
-    let _ = tx.send(Msg::AutoPick(true, "Обход перестал работать, а компьютером сейчас не пользуются: подбираю стратегию в фоне".into()));
+    let _ = tx.send(Msg::AutoPick(true, "Обход перестал работать, а компьютером сейчас не пользуются: подбираю приём в фоне".into()));
     ctx.request_repaint();
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     let done = std::sync::Arc::new(AtomicBool::new(false));
@@ -106,7 +101,7 @@ fn auto_repick_now(p: &Paths, current: Option<&str>, tx: &Sender<Msg>, ctx: &egu
                         Some((old, was)) => format!("Поставлена «{name}» вместо «{old}»: открывает {score} сайтов против {was}"),
                         None => format!("Поставлена «{name}»"),
                     };
-                    tray::notify("HolyZapret сменил стратегию", &text);
+                    tray::notify("HolyZapret сменил приём обхода", &text);
                     text
                 }
                 Err(e) => format!("Подбор нашёл «{name}», но поставить не удалось: {e}"),
@@ -114,8 +109,8 @@ fn auto_repick_now(p: &Paths, current: Option<&str>, tx: &Sender<Msg>, ctx: &egu
             None => format!("Подбор нашёл «{name}», но её файл не найден"),
         },
         Ok(crate::core::picker::Choice::Keep(Some(name))) => format!("Автоподбор: лучше «{name}» в быстром наборе нет, оставил её"),
-        Ok(crate::core::picker::Choice::Keep(None)) => "Автоподбор не нашёл рабочей стратегии. Попробуйте полный подбор".into(),
-        Ok(crate::core::picker::Choice::NoBlocks) => "Автоподбор: без обхода всё открывается, стратегию оставил".into(),
+        Ok(crate::core::picker::Choice::Keep(None)) => "Автоподбор не нашёл рабочего приёма. Попробуйте полный подбор".into(),
+        Ok(crate::core::picker::Choice::NoBlocks) => "Автоподбор: без обхода всё открывается, приём оставил прежним".into(),
         Err(e) => format!("Автоподбор остановлен: {e}"),
     };
     let _ = tx.send(Msg::AutoPick(false, msg));
@@ -186,7 +181,7 @@ fn health_loop(
             if !failing.is_empty() {
                 tray::notify(
                     "Обход перестал работать",
-                    &format!("Не открываются {}. Откройте HolyZapret, чтобы подобрать стратегию заново", failing.join(", ")),
+                    &format!("Не открываются {}. Откройте HolyZapret, чтобы подобрать приём заново", failing.join(", ")),
                 );
             }
             if tx.send(Msg::Health(failing)).is_err() {
@@ -205,18 +200,30 @@ fn notify(tx: &Sender<Msg>, lvl: Lvl, text: impl Into<String>) {
     let _ = tx.send(Msg::Toast(lvl, text.into()));
 }
 
+fn hero_toggle(ui: &mut egui::Ui, title: &str, sub: &str, on: bool, tip: &str) -> Option<bool> {
+    let mut v = on;
+    let changed = ui
+        .allocate_ui_with_layout(egui::vec2(230.0, 38.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let c = theme::toggle(ui, &mut v).changed();
+            ui.add_space(4.0);
+            let r = ui.allocate_ui_with_layout(egui::vec2(180.0, 38.0), egui::Layout::top_down(egui::Align::Max), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(title);
+                ui.add(egui::Label::new(RichText::new(sub).weak().size(12.5)).truncate());
+            });
+            if !tip.is_empty() {
+                r.response.on_hover_text(tip);
+            }
+            c
+        })
+        .inner;
+    changed.then_some(v)
+}
+
 fn result_msg(tx: &Sender<Msg>, r: anyhow::Result<String>, err_prefix: &str) {
     match r {
         Ok(m) => notify(tx, Lvl::Ok, m),
         Err(e) => notify(tx, Lvl::Err, format!("{err_prefix}: {e}")),
-    }
-}
-
-fn category_label(c: &str) -> String {
-    match c {
-        "additional" => "Additional".into(),
-        "experimental" => "Эксперимент".into(),
-        other => other.to_string(),
     }
 }
 
@@ -265,13 +272,11 @@ pub struct App {
     paths: Option<Paths>,
     strategies: Vec<Strategy>,
     selected: Option<usize>,
-    filter: String,
     status: Option<Status>,
     tab: Tab,
     log: Vec<Entry>,
     log_filter: usize,
     toasts: Vec<Toast>,
-    category: usize,
     preselected: bool,
     busy: bool,
     sites: Vec<SiteResult>,
@@ -280,7 +285,6 @@ pub struct App {
     sites_announce: Option<&'static str>,
     sites_retry: u8,
     home: home_ray::RayHome,
-    trial: Option<trial::Trial>,
     wizard: wizard::WizardState,
     wizard_done: bool,
     autostart: Option<bool>,
@@ -324,13 +328,11 @@ pub struct App {
     health_force: std::sync::Arc<std::sync::atomic::AtomicBool>,
     health_alert: Vec<String>,
     old_folder: Option<std::path::PathBuf>,
+    reinstall_later: bool,
     unpack: Option<unpack_ui::UnpackState>,
     share: share_ui::ShareState,
     update: update_ui::UpdateUi,
     phone: phone_tab::PhoneState,
-    flowseal_version: Option<String>,
-    flowseal_latest: Option<Release>,
-    flowseal_checking: bool,
     window_ready: bool,
     tray: bool,
     tx: Sender<Msg>,
@@ -349,20 +351,17 @@ impl App {
         let renamed = paths.as_ref().map(|p| crate::core::names::repair_tree(&p.root)).unwrap_or_default();
         let strategies = paths.as_ref().map(strategy::discover).unwrap_or_default();
         let local_version = paths.as_ref().and_then(update::local_version);
-        let flowseal_version = paths.as_ref().and_then(flowseal::installed);
         let tray = icon.is_some_and(|i| tray::create(i.rgba, i.width, i.height, paths.clone()));
         let saved = settings::load();
         let mut app = Self {
             paths,
             strategies,
             selected: None,
-            filter: String::new(),
             status: None,
             tab: Tab::Main,
             log: Vec::new(),
             log_filter: 0,
             toasts: Vec::new(),
-            category: 0,
             preselected: false,
             busy: false,
             sites: Vec::new(),
@@ -371,7 +370,6 @@ impl App {
             sites_announce: None,
             sites_retry: 0,
             home: Default::default(),
-            trial: None,
             wizard: Default::default(),
             wizard_done: saved.wizard_done,
             autostart: None,
@@ -418,13 +416,11 @@ impl App {
             health_force: Default::default(),
             health_alert: Vec::new(),
             old_folder: None,
+            reinstall_later: false,
             unpack: None,
             share: Default::default(),
             update: Default::default(),
             phone: Default::default(),
-            flowseal_version,
-            flowseal_latest: None,
-            flowseal_checking: false,
             window_ready: false,
             tray,
             tx,
@@ -524,6 +520,48 @@ impl App {
             let (tx, ctx) = (app.tx.clone(), cc.egui_ctx.clone());
             let (auto, ui_busy) = (app.auto_update_flag.clone(), app.ui_busy.clone());
             std::thread::spawn(move || update_ui::update_loop(p, auto, ui_busy, tx, ctx));
+        }
+        if let Some(p) = app.paths.clone() {
+            let tx = app.tx.clone();
+            crate::core::warpauto::spawn(p, move |m| notify(&tx, Lvl::Info, m));
+        }
+        let migrated = crate::core::ray::migrate_fixed_technique();
+        if let (Some(p), Some(t)) = (app.paths.clone().filter(|_| !crate::core::service::legacy_installed()), migrated) {
+            let tx = app.tx.clone();
+            std::thread::spawn(move || {
+                let st = crate::core::service::status(&p);
+                if st.owner != crate::core::service::Owner::Ours || st.service == ServiceState::NotInstalled {
+                    return;
+                }
+                let Some(s) = crate::core::ray::variants(&p).into_iter().find(|s| s.id == crate::core::ray::DEFAULT_ID) else { return };
+                let label = crate::core::ray::experiment_label(&t).to_string();
+                match crate::core::service::install(&p, &s) {
+                    Ok(_) => notify(&tx, Lvl::Ok, format!("Служба переведена на самоподстройку: первым шагом идёт «{label}», а если сайт на нём не откроется, RayOfLight попробует другие приёмы")),
+                    Err(e) => notify(&tx, Lvl::Err, format!("Не удалось перевести службу на самоподстройку: {e}")),
+                }
+            });
+        }
+        if let Some(p) = app.paths.clone().filter(|_| crate::core::service::legacy_installed()) {
+            let tx = app.tx.clone();
+            std::thread::spawn(move || {
+                let st = crate::core::service::status(&p);
+                if st.service == ServiceState::NotInstalled {
+                    if crate::core::ray::installed() {
+                        crate::core::ray::remove();
+                        notify(&tx, Lvl::Info, "Удалена служба rayoflight от прошлой версии: теперь RayOfLight работает внутри службы HolyZapret");
+                    }
+                    return;
+                }
+                if st.owner != crate::core::service::Owner::Ours {
+                    return;
+                }
+                let id = st.installed_strategy.clone().unwrap_or_default();
+                let Some(s) = crate::core::ray::variants(&p).into_iter().find(|s| s.matches(&id)) else { return };
+                match crate::core::service::install(&p, &s) {
+                    Ok(_) => notify(&tx, Lvl::Ok, "Служба переведена на движок RayOfLight, старый движок больше не нужен"),
+                    Err(e) => notify(&tx, Lvl::Err, format!("Не удалось перевести службу на RayOfLight: {e}")),
+                }
+            });
         }
         if std::env::args().any(|a| a == crate::core::unpack::UPDATED_ARG) {
             let v = env!("CARGO_PKG_VERSION");
@@ -673,13 +711,6 @@ impl App {
                     self.sites_retry = 0;
                     self.start_site_check(ctx);
                 }
-                Msg::TrialStarted(Ok(t)) => {
-                    self.toast(ctx, Lvl::Ok, format!("Пробный запуск «{}»: проверяю сайты…", t.name));
-                    self.trial = Some(t);
-                    self.sites_announce = Some("Пробный запуск");
-                    self.start_site_check(ctx);
-                }
-                Msg::TrialStarted(Err(e)) => self.toast(ctx, Lvl::Err, format!("Пробный запуск: {e}")),
                 Msg::CheckChanged => self.check_changed(),
                 Msg::Diag(d) => {
                     self.diag.findings = d;
@@ -710,13 +741,7 @@ impl App {
                         self.busy = false;
                         self.refresh(ctx);
                         self.finish_auto(ctx, completed);
-                    }
-                }
-                Msg::FlowsealLatest(r) => {
-                    self.flowseal_checking = false;
-                    match r {
-                        Ok(rel) => self.flowseal_latest = Some(rel),
-                        Err(e) => self.note(Lvl::Err, format!("Flowseal: не удалось узнать последнюю версию: {e}")),
+                        self.finish_full_report(ctx, completed);
                     }
                 }
                 Msg::Autostart(on) => self.autostart = Some(on),
@@ -728,7 +753,6 @@ impl App {
                     }
                     self.tg.client = c;
                 }
-                Msg::Rescan => self.rescan(),
                 Msg::Updated => {
                     self.update.running = false;
                     self.update.open = false;
@@ -818,18 +842,73 @@ impl App {
         }
     }
 
+    fn warp_sub(&self, on: bool) -> (String, &'static str) {
+        let tip = "Если сайт не открылся ни одним приёмом, движок отправляет его через WARP. WARP включается сам, пока такие сайты открыты, и выключается через 5 минут без них. Пинг через WARP выше, поэтому это последний способ";
+        if !on {
+            return ("Выключено".into(), tip);
+        }
+        if self.warp.as_ref().is_some_and(|w| !w.installed) {
+            return ("Нужен Cloudflare WARP".into(), "Установите Cloudflare WARP: карточка WARP ниже");
+        }
+        match self.home.warp() {
+            Some(w) if w.ips > 0 => (format!("Через WARP: адресов {}", w.ips), tip),
+            Some(_) => ("Ждёт: всё открывается и так".into(), tip),
+            None => ("Включится после переустановки".into(), tip),
+        }
+    }
+
+    fn installed_variant(&self) -> Option<strategy::Strategy> {
+        self.status
+            .as_ref()
+            .filter(|s| s.foreign_dir().is_none())
+            .and_then(|s| s.active_strategy().map(String::from))
+            .and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned())
+    }
+
+    fn apply_to_service(&mut self, ctx: &egui::Context, done: String) {
+        match self.installed_variant().filter(|_| self.service_installed()) {
+            Some(s) if !self.busy && !tray::busy() => {
+                self.toast(ctx, Lvl::Info, format!("{done}. Переустанавливаю службу, чтобы применить"));
+                self.spawn(ctx, move |p, tx| {
+                    result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
+                });
+            }
+            Some(_) => {
+                self.reinstall_later = true;
+                self.toast(ctx, Lvl::Info, format!("{done}. Служба переустановится, как только закончится текущее действие"));
+            }
+            None if self.service_installed() => self.toast(ctx, Lvl::Info, format!("{done}. Переустановите службу, чтобы применить")),
+            None => self.toast(ctx, Lvl::Info, done),
+        }
+    }
+
+    fn reinstall_if_waiting(&mut self, ctx: &egui::Context) {
+        if !self.reinstall_later || self.busy || tray::busy() {
+            return;
+        }
+        self.reinstall_later = false;
+        if let Some(s) = self.installed_variant().filter(|_| self.service_installed()) {
+            self.toast(ctx, Lvl::Info, "Применяю новые настройки: переустанавливаю службу");
+            self.spawn(ctx, move |p, tx| {
+                result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
+            });
+        }
+    }
+
+    fn set_warp_fallback(&mut self, ctx: &egui::Context, on: bool) {
+        settings::set_ray_warp(on);
+        let what = if on { "включён" } else { "выключен" };
+        self.apply_to_service(ctx, format!("WARP как последний способ {what}"));
+    }
+
     fn save_game_filter(&mut self, ctx: &egui::Context, gf: gamefilter::GameFilter) {
         let Some(p) = &self.paths else { return };
         match gamefilter::save(p, &gf) {
             Ok(()) => {
                 self.game_edit = Some((gf.clone(), gf.tcp.clone(), gf.udp.clone()));
                 self.game_err = None;
-                let msg = if self.service_installed() {
-                    format!("Игровой фильтр: {}. Переустановите службу, чтобы применить", gf.summary().to_lowercase())
-                } else {
-                    format!("Игровой фильтр: {}", gf.summary().to_lowercase())
-                };
-                self.toast(ctx, Lvl::Info, msg);
+                let summary = gf.summary().to_lowercase();
+                self.apply_to_service(ctx, format!("Игровой фильтр: {summary}"));
             }
             Err(e) => self.toast(ctx, Lvl::Err, format!("Игровой фильтр: {e}")),
         }
@@ -838,45 +917,25 @@ impl App {
 
     fn rescan(&mut self) {
         self.picker.invalidate();
-        self.flowseal_version = self.paths.as_ref().and_then(flowseal::installed);
         let keep = self.selected.and_then(|i| self.strategies.get(i)).map(|s| s.name.clone());
         self.strategies = self.paths.as_ref().map(strategy::discover).unwrap_or_default();
         self.selected = keep.and_then(|n| self.strategies.iter().position(|s| s.name == n));
     }
 
-    fn categories(&self) -> Vec<String> {
-        let mut v: Vec<String> = Vec::new();
-        for s in &self.strategies {
-            if !v.contains(&s.category) {
-                v.push(s.category.clone());
-            }
-        }
-        v
-    }
-
     fn install_selected(&mut self, ctx: &egui::Context) {
         let Some(s) = self.selected.and_then(|i| self.strategies.get(i)).cloned() else {
-            self.toast(ctx, Lvl::Info, "Выберите стратегию в списке");
+            self.install_general(ctx);
             return;
         };
+        self.install_strategy(ctx, s);
+    }
+
+    fn install_strategy(&mut self, ctx: &egui::Context, s: strategy::Strategy) {
         self.spawn(ctx, move |p, tx| {
-            send(tx, Lvl::Info, format!("Устанавливаю службу: {}", s.name));
+            send(tx, Lvl::Info, format!("Устанавливаю службу: {}", crate::core::ray::install_label(&s)));
             match service::install(p, &s) {
                 Ok(m) => {
                     notify(tx, Lvl::Ok, m);
-                    let mut others: Vec<String> = crate::core::rules::load(p)
-                        .into_iter()
-                        .map(|r| r.origin)
-                        .filter(|o| !o.is_empty() && !s.matches(o))
-                        .collect();
-                    others.dedup();
-                    if !others.is_empty() {
-                        notify(
-                            tx,
-                            Lvl::Info,
-                            format!("Часть правил для сайтов подобрана под «{}»: перепроверьте их кнопкой «Перепроверить» на вкладке «Сайты»", others.join("», «")),
-                        );
-                    }
                     match crate::core::ray::wait_ready(p, std::time::Duration::from_secs(15)) {
                         Some(true) => std::thread::sleep(std::time::Duration::from_secs(1)),
                         Some(false) => {
@@ -898,8 +957,7 @@ impl App {
             ServiceState::Stopped => self.spawn(ctx, |_, tx| {
                 result_msg(tx, service::start().map(|_| "Служба запущена".to_string()), "Не удалось запустить службу")
             }),
-            ServiceState::NotInstalled if self.home.on => self.install_general(ctx),
-            ServiceState::NotInstalled => self.install_selected(ctx),
+            ServiceState::NotInstalled => self.install_general(ctx),
         }
     }
 
@@ -968,20 +1026,25 @@ impl App {
             });
             return;
         };
-        let running = s.service == ServiceState::Running;
-        let extra = if s.foreign_dir().is_none() && s.active_strategy().is_some() { self.rules_summary() } else { None };
+        let foreign = s.foreign_dir().is_some();
+        let running = s.service == ServiceState::Running && !foreign;
+        let extra = if !foreign && s.active_strategy().is_some() { self.rules_summary() } else { None };
         let mut to_sites = false;
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 let tip = match s.service {
+                    _ if foreign => "Поставить службу из этой папки вместо службы из другой папки",
                     ServiceState::Running => "Выключить: удалить службу",
                     ServiceState::Stopped => "Запустить службу",
-                    ServiceState::NotInstalled if self.home.on => "Включить защиту с RayOfLight",
-                    ServiceState::NotInstalled => "Установить выбранную стратегию",
+                    ServiceState::NotInstalled => "Включить защиту с RayOfLight",
                 };
                 let resp = theme::power_button(ui, running, self.busy || tray::busy()).on_hover_text(tip);
                 if resp.clicked() && !self.busy && !tray::busy() && self.paths.is_some() {
-                    self.power(ctx, s.service.clone());
+                    if foreign {
+                        self.install_general(ctx);
+                    } else {
+                        self.power(ctx, s.service.clone());
+                    }
                 }
                 ui.add_space(10.0);
                 let text_w = (ui.available_width() - 230.0).max(180.0);
@@ -989,30 +1052,27 @@ impl App {
                     ui.set_max_width(text_w);
                     ui.add_space(8.0);
                     let title = match s.service {
+                        _ if foreign => "Служба из другой папки",
                         ServiceState::Running => "Защита активна",
                         ServiceState::Stopped => "Служба остановлена",
                         ServiceState::NotInstalled => "Защита выключена",
                     };
                     ui.label(RichText::new(title).size(22.0).strong().color(Color32::WHITE));
-                    let ray_sub = (self.home.on && s.foreign_dir().is_none()).then(|| {
+                    let ray_sub = || {
                         let (q, e) = (settings::ray_quic(), settings::ray_experiment());
                         if q == "adaptive" && e == "adaptive" {
-                            return "RayOfLight · самоподстройка".to_string();
+                            return match crate::core::ray::start_technique() {
+                                Some(t) => format!("RayOfLight · самоподстройка, первым шагом «{}»", crate::core::ray::experiment_label(&t)),
+                                None => "RayOfLight · самоподстройка".to_string(),
+                            };
                         }
-                        let quic = if q.is_empty() { "QUIC на обычном движке".to_string() } else { crate::core::ray::quic_label(&q).to_string() };
-                        format!("RayOfLight · {} · {quic}", crate::core::ray::experiment_label(&e))
-                    });
+                        format!("RayOfLight · {} · {}", crate::core::ray::experiment_label(&e), crate::core::ray::quic_label(&q))
+                    };
                     let sub = match (s.foreign_dir(), s.active_strategy()) {
-                        (None, Some(n)) if ray_sub.is_some() && !n.eq_ignore_ascii_case("general") => format!("Стратегия: {n}"),
-                        (None, Some(_)) if ray_sub.is_some() => ray_sub.clone().unwrap_or_default(),
-                        (None, None) if self.home.on => "Нажмите кнопку: включится RayOfLight с самоподстройкой".to_string(),
-                        (Some(d), _) => format!(
-                            "Служба из другой папки: {}{}",
-                            d.display(),
-                            s.installed_strategy.as_deref().map(|n| format!(" · {n}")).unwrap_or_default()
-                        ),
-                        (None, Some(n)) => format!("Стратегия: {n}"),
-                        _ => "Выберите стратегию и нажмите на кнопку старта".to_string(),
+                        (Some(d), _) => format!("Нажмите кнопку, чтобы поставить службу из этой папки · сейчас она из {}", d.display()),
+                        (None, Some(n)) if !n.to_lowercase().starts_with("rayoflight:") => format!("Служба от старой версии HolyZapret: {n}"),
+                        (None, Some(_)) => ray_sub(),
+                        (None, None) => format!("Нажмите кнопку: включится {}", ray_sub()),
                     };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1034,7 +1094,7 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         if s.foreign_dir().is_some() {
                             theme::chip(ui, "Чужая служба", YELLOW)
-                                .on_hover_text("Скорее всего это оригинальный Flowseal. Её можно удалить кнопкой старта или в Диагностике");
+                                .on_hover_text("Служба установлена из другой папки. Кнопка старта поставит вместо неё службу из этой папки");
                         } else if !s.foreign_engines.is_empty() {
                             theme::chip(ui, "Запущен другой обход", YELLOW).on_hover_text(
                                 s.foreign_engines.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join("\n"),
@@ -1068,20 +1128,32 @@ impl App {
                         }
                     });
                 });
+                let warp_row = settings::ray_experiment() == "adaptive" && s.foreign_dir().is_none();
+                let mut game_on = None;
+                let mut warp_on = None;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut on = s.game.enabled();
-                    if theme::toggle(ui, &mut on).changed() {
-                        let mut gf = s.game.clone();
-                        gf.mode = if on { gamefilter::Mode::All } else { gamefilter::Mode::Disabled };
-                        self.save_game_filter(ctx, gf);
-                    }
-                    ui.add_space(4.0);
-                    ui.allocate_ui_with_layout(egui::vec2(140.0, 40.0), egui::Layout::top_down(egui::Align::Max), |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label("Игровой фильтр");
-                        ui.label(RichText::new(s.game.summary()).weak().size(12.5));
+                    ui.allocate_ui_with_layout(egui::vec2(230.0, if warp_row { 92.0 } else { 44.0 }), egui::Layout::top_down(egui::Align::Max), |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        if let Some(v) = hero_toggle(ui, "Игровой фильтр", &s.game.summary(), s.game.enabled(), "") {
+                            game_on = Some(v);
+                        }
+                        if warp_row {
+                            let on = settings::ray_warp();
+                            let (sub, tip) = self.warp_sub(on);
+                            if let Some(v) = hero_toggle(ui, "WARP, если не открылось", &sub, on, tip) {
+                                warp_on = Some(v);
+                            }
+                        }
                     });
                 });
+                if let Some(on) = game_on {
+                    let mut gf = s.game.clone();
+                    gf.mode = if on { gamefilter::Mode::All } else { gamefilter::Mode::Disabled };
+                    self.save_game_filter(ctx, gf);
+                }
+                if let Some(on) = warp_on {
+                    self.set_warp_fallback(ctx, on);
+                }
             });
         });
         if to_sites {
@@ -1092,133 +1164,9 @@ impl App {
     fn main_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.home.refresh(self.paths.as_ref());
         self.health_card(ui, ctx);
-        self.trial_card(ui, ctx);
         self.hero(ui, ctx);
         self.warp_row(ui, ctx);
-        if self.home.on {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.ray_home(ui, ctx));
-            return;
-        }
-        let cats = self.categories();
-        let pick_tab = self.last_pick.as_ref().is_some_and(|p| self.strategies.iter().any(|s| p.scores.contains_key(&s.path)));
-        let offset = if pick_tab { 2 } else { 1 };
-        let mut labels = vec!["Все".to_string()];
-        if pick_tab {
-            labels.push("По подбору".to_string());
-        }
-        labels.extend(cats.iter().map(|c| category_label(c)));
-        if self.category >= labels.len() {
-            self.category = 0;
-        }
-        let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
-        theme::card(ui, |ui| {
-            theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Стратегии").size(17.0).strong());
-                ui.label(RichText::new(format!("{}", self.strategies.len())).weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Поиск").desired_width(190.0));
-                });
-            });
-            theme::segmented(ui, &labels, &mut self.category);
-            let pick_view = pick_tab && self.category == 1;
-            if pick_view {
-                let when = self.last_pick.as_ref().map(|p| p.when.clone()).unwrap_or_default();
-                ui.label(RichText::new(format!("Лучшие сверху, по подбору от {when}")).color(Color32::from_gray(150)).size(12.5));
-            }
-            ui.add_space(2.0);
-            let filter = self.filter.to_lowercase();
-            let cat = if self.category < offset { None } else { cats.get(self.category - offset).cloned() };
-            let scores = self.last_pick.as_ref().map(|p| p.scores.clone()).unwrap_or_default();
-            let mut order: Vec<usize> = (0..self.strategies.len()).collect();
-            if pick_view {
-                order.retain(|&i| scores.contains_key(&self.strategies[i].path));
-                order.sort_by_key(|&i| scores[&self.strategies[i].path].key());
-            }
-            let mut chosen = self.selected;
-            let mut install_now = false;
-            let h = (ui.available_height() - 58.0).max(80.0);
-            egui::ScrollArea::vertical().max_height(h).auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                let mut shown = 0;
-                for &i in &order {
-                    let s = &self.strategies[i];
-                    if cat.as_ref().is_some_and(|c| c != &s.category) {
-                        continue;
-                    }
-                    if !filter.is_empty() && !s.name.to_lowercase().contains(&filter) {
-                        continue;
-                    }
-                    shown += 1;
-                    let mut meta = format!("{} · {} {}", s.lists_label, s.blocks, plural(s.blocks, "блок", "блока", "блоков"));
-                    if s.game_filter {
-                        meta.push_str(" · игры");
-                    }
-                    let active = installed.as_deref().is_some_and(|n| s.matches(n));
-                    let score = scores.get(&s.path).map(|sc| {
-                        if sc.failed {
-                            ("не запустилась".to_string(), RED)
-                        } else {
-                            let color = if sc.ok == sc.total {
-                                GREEN
-                            } else if sc.ok * 5 >= sc.total * 4 {
-                                YELLOW
-                            } else {
-                                RED
-                            };
-                            (format!("{}/{}", sc.ok, sc.total), color)
-                        }
-                    });
-                    let resp = theme::strategy_row(ui, &s.name, &meta, chosen == Some(i), active, score);
-                    if resp.clicked() {
-                        chosen = Some(i);
-                    }
-                    if resp.double_clicked() && !self.busy {
-                        chosen = Some(i);
-                        install_now = true;
-                    }
-                }
-                if shown == 0 {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Ничего не найдено").weak());
-                    });
-                }
-            });
-            self.selected = chosen;
-            if install_now {
-                self.install_selected(ctx);
-            }
-            ui.add_space(4.0);
-            let bar = egui::vec2(ui.available_width(), 40.0);
-            ui.allocate_ui_with_layout(bar, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let sel_s = self.selected.and_then(|i| self.strategies.get(i)).cloned();
-                let sel = sel_s.as_ref().map(|s| s.name.clone());
-                let has_service = self.status.as_ref().is_some_and(|s| s.service != ServiceState::NotInstalled);
-                if ui.add_enabled(has_service && !self.busy, egui::Button::new("Удалить службу")).clicked() {
-                    self.confirm = Some(confirm::Confirm::RemoveService);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let reinstall = sel_s.as_ref().is_some_and(|s| installed.as_deref().is_some_and(|n| s.matches(n)));
-                    let label = if reinstall { "Переустановить" } else { "Установить службу" };
-                    ui.add_enabled_ui(sel.is_some() && !self.busy && self.paths.is_some(), |ui| {
-                        if ui.add(theme::Primary(label.into())).clicked() {
-                            self.install_selected(ctx);
-                        }
-                    });
-                    let can_try = sel_s.is_some() && !self.busy && self.trial.is_none() && self.paths.is_some();
-                    if ui
-                        .add_enabled(can_try, egui::Button::new("Попробовать"))
-                        .on_hover_text("Запустить стратегию без установки службы и проверить сайты")
-                        .clicked()
-                    {
-                        self.start_trial(ctx);
-                    }
-                    if ui.button("Подобрать").on_hover_text("Проверить стратегии по очереди и найти лучшую").clicked() {
-                        self.tab = Tab::Picker;
-                    }
-                });
-            });
-        });
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.ray_home(ui, ctx));
     }
 
     fn log_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1460,7 +1408,6 @@ fn resize_edges(ctx: &egui::Context) {
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         tray::clear_notice();
-        self.stop_trial_now();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1471,6 +1418,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.setup_window(frame);
         self.poll(&ctx);
+        self.reinstall_if_waiting(&ctx);
         if tray::take_phone() && self.paths.is_some() {
             self.tab = Tab::Phone;
         }
@@ -1585,7 +1533,7 @@ impl eframe::App for App {
         if self.confirm.is_none() && self.tab != Tab::Wizard && self.unpack.is_none() {
             self.draw_whats_new(&ctx);
         }
-        self.ui_busy.store(self.busy || self.picker.running || self.trial.is_some() || self.update.running, std::sync::atomic::Ordering::Relaxed);
+        self.ui_busy.store(self.busy || self.picker.running || self.update.running, std::sync::atomic::Ordering::Relaxed);
         let now = Settings {
             advanced: self.advanced,
             close_to_tray: self.close_to_tray,

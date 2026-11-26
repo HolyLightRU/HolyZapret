@@ -171,13 +171,13 @@ impl App {
         let problem: Option<(String, Option<&str>)> = if !on || ray_ok {
             None
         } else if let Some(d) = &foreign {
-            Some((format!("Служба zapret сейчас установлена из другой папки: {d}. Шлюз работает только со службой из этой папки, поэтому устройства выходят в интернет без обхода."), Some("Установить general отсюда")))
+            Some((format!("Служба zapret сейчас установлена из другой папки: {d}. Шлюз работает только со службой из этой папки, поэтому устройства выходят в интернет без обхода."), Some("Установить службу отсюда")))
         } else if !installed {
-            Some(("Служба не установлена: устройства выходят в интернет через компьютер, но без обхода. Шлюз работает вместе с RayOfLight и стратегией general.".into(), Some("Установить general")))
+            Some(("Служба не установлена: устройства выходят в интернет через компьютер, но без обхода. Шлюз работает, пока включена защита.".into(), Some("Включить защиту")))
         } else if running {
             Some(("RayOfLight работает, но без шлюза: служба установлена до того, как режим включили. Переустановите её, и обход заработает для устройств.".into(), Some("Переустановить службу")))
         } else {
-            Some(("Обход для устройств работает вместе с RayOfLight и стратегией general. Сейчас RayOfLight не работает: устройства выходят в интернет через компьютер, но без обхода.".into(), None))
+            Some(("Обход для устройств работает вместе с RayOfLight. Сейчас RayOfLight не работает: устройства выходят в интернет через компьютер, но без обхода.".into(), None))
         };
         let mut fix = false;
         let mut toggle = None;
@@ -276,16 +276,14 @@ impl App {
             self.toast(ctx, Lvl::Ok, "Скопировано");
         }
         if fix {
-            let own = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
-            let target = own.or_else(|| self.strategies.iter().find(|s| s.matches("general")).cloned());
-            match target {
+            match self.ray_current() {
                 Some(s) => {
                     self.phone.gw_live_at = None;
                     self.spawn(ctx, move |p, tx| {
                         super::result_msg(tx, crate::core::service::install(p, &s), "Не удалось установить службу");
                     });
                 }
-                None => self.toast(ctx, Lvl::Err, "Стратегия general не найдена в папке scripts"),
+                None => self.toast(ctx, Lvl::Err, "Нет файла bin\\RayOfLight.exe: скачайте HolyZapret заново"),
             }
         }
         if let Some(v) = toggle {

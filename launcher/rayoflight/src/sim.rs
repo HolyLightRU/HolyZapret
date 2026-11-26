@@ -1,5 +1,5 @@
 use crate::desync::{Config, FAKE_DEFAULT};
-use crate::flows::{Action, Engine, Lists, Mode, Outcome, REASM_WAIT, SILENT};
+use crate::flows::{Action, BG_APP, BG_EVERY, BG_IDLE, Engine, Lists, Mode, Outcome, REASM_WAIT, SILENT};
 use crate::lists::{Hosts, Nets};
 use crate::packet::{self, Tcp};
 use crate::tls;
@@ -438,6 +438,8 @@ fn adaptive_moves_to_next_technique_after_failure() {
     packet::fix_checksums(&mut ok);
     e.observe(&ok, t0);
     assert_eq!(e.memory_of("www.youtube.com").map(|(t, m)| (t, m.ok, m.fails)), Some(("sni-split", 1, 2)));
+    assert_eq!(e.take_redeemed(), vec![t0, t0]);
+    assert!(e.take_redeemed().is_empty());
     let third = sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), 50004), 0, t0));
     assert_eq!(first_cut(&third), at + len / 2);
     let mut rst3 = reply(&tpl, 0x04, b"");
@@ -453,6 +455,15 @@ fn adaptive_moves_to_next_technique_after_failure() {
     rst4[22..24].copy_from_slice(&50005u16.to_be_bytes());
     packet::fix_checksums(&mut rst4);
     e.observe(&rst4, t0);
+    assert_eq!(e.memory_of("www.youtube.com").map(|(t, _)| t), Some("sni-max"));
+    for port in [50010u16, 50011] {
+        let out = sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), port), 0, t0));
+        assert_eq!(dpi_first(&out).as_deref(), Some("max.ru"));
+        let mut rst = reply(&tpl, 0x04, b"");
+        rst[22..24].copy_from_slice(&port.to_be_bytes());
+        packet::fix_checksums(&mut rst);
+        e.observe(&rst, t0);
+    }
     assert_eq!(e.memory_of("www.youtube.com").map(|(t, _)| t), Some("none"));
     let raw = with_port(&seg(&tpl, 1000, 1, &h), 50006);
     assert_eq!(e.handle(&raw, 0, t0), Action::Pass);
@@ -461,6 +472,7 @@ fn adaptive_moves_to_next_technique_after_failure() {
     packet::fix_checksums(&mut ok2);
     e.observe(&ok2, t0);
     assert_eq!(e.memory_of("www.youtube.com").map(|(t, m)| (t, m.ok, m.streak)), Some(("none", 2, 0)));
+    assert_eq!(e.take_redeemed().len(), 4);
     assert_eq!(e.stats.by_tech["none"].answered, 1);
     let mut fresh = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap());
     assert_eq!(fresh.load_memory(&e.memory_text()), 1);
@@ -476,7 +488,7 @@ fn adaptive_moves_to_next_technique_after_failure() {
 
 #[test]
 fn every_technique_keeps_the_server_stream_intact() {
-    for name in ["general", "sni-split", "random", "badseq", "md5sig", "ttl", "badsum", "disorder"] {
+    for name in ["general", "sni-split", "random", "badseq", "md5sig", "ttl", "badsum", "disorder", "overlap", "fake-only", "sni-vk", "sni-fonts", "sni-max", "fakedsplit", "fakedsplit-ttl", "overlap-max", "overlap-2", "overlap-sld", "fake-ts"] {
         for pad in [0usize, 1300] {
             let tpl = template(true);
             let h = hello("rr1.googlevideo.com", pad);
@@ -493,15 +505,29 @@ fn every_technique_keeps_the_server_stream_intact() {
                 .iter()
                 .filter(|p| {
                     let t = packet::parse(p).unwrap();
-                    let fake_badseq = t.seq == 1000u32.wrapping_sub(10000);
+                    let fake_badseq = t.ack == 7777u32.wrapping_sub(66000);
                     let fake_md5 = p.len() > 41 && p[40] == 19;
                     !fake_badseq && !fake_md5
                 })
                 .cloned()
                 .collect();
             assert_eq!(server(&kept, 1000, Some(0x1000)), h, "{name} pad {pad}");
-            assert!(dpi_first(&out).is_some_and(|s| s != "rr1.googlevideo.com"), "{name} pad {pad}");
+            assert!(dpi_first(&out).is_none_or(|s| s != "rr1.googlevideo.com"), "{name} pad {pad}");
+            assert!(out.iter().all(|p| packet::parse(p).unwrap().payload().len() <= 1400 + 681), "{name} pad {pad}");
         }
+    }
+}
+
+#[test]
+fn server_without_paws_needs_a_technique_without_ts_fakes() {
+    let tpl = template(true);
+    let h = hello("soundcloud.com", 0);
+    for (name, intact) in [("general", false), ("overlap", true), ("fake-only", true)] {
+        let mut e = engine("soundcloud.com", "").with_mode(Mode::parse(name).unwrap());
+        let out = sent(e.handle(&seg(&tpl, 1000, 0x1234, &h), 0, Instant::now()));
+        let kept: Vec<Vec<u8>> = out.iter().filter(|p| packet::parse(p).unwrap().ack != 7777u32.wrapping_sub(66000)).cloned().collect();
+        assert_eq!(server(&kept, 1000, None) == h, intact, "{name}");
+        assert!(dpi_first(&out).is_some_and(|s| s != "soundcloud.com"), "{name}");
     }
 }
 
@@ -951,4 +977,353 @@ mod general_profiles {
         let mut far = eng("game-udp", "", "", "10.0.0.0/8");
         assert_eq!(far.handle(&d, 0, now), Action::Pass);
     }
+
+    fn from_port(port: u16) -> Vec<u8> {
+        let mut d = to_port(&packet::tests::sample_udp(&[7u8; 50]), 27015);
+        d[20..22].copy_from_slice(&port.to_be_bytes());
+        packet::fix_checksums(&mut d);
+        d
+    }
+
+    fn answer(out: &[u8]) -> Vec<u8> {
+        let mut r = out.to_vec();
+        let (src, dst) = (r[12..16].to_vec(), r[16..20].to_vec());
+        r[12..16].copy_from_slice(&dst);
+        r[16..20].copy_from_slice(&src);
+        let (sp, dp) = (r[20..22].to_vec(), r[22..24].to_vec());
+        r[20..22].copy_from_slice(&dp);
+        r[22..24].copy_from_slice(&sp);
+        packet::fix_checksums(&mut r);
+        r
+    }
+
+    #[test]
+    fn game_udp_adapts_per_program_without_my_ip() {
+        use crate::flows::{Mode, SILENT, udp_key};
+        use crate::procs::{Owner, Source};
+        let now = Instant::now();
+        let mut e = eng("game-udp", "", "", "10.0.0.0/8")
+            .with_mode(Mode::parse("adaptive").unwrap())
+            .with_udp_apps(Box::new(|_, _| Some(Owner { pid: 7, name: Some("game.exe".into()), source: Source::Table })));
+        e.track = true;
+        let key = udp_key(Some("game.exe"));
+        for i in 0..3u32 {
+            let at = now + SILENT * (2 * i);
+            assert_eq!(e.handle(&from_port(40001 + i as u16), 0, at), Action::Pass);
+            let _ = e.expire(at + SILENT);
+        }
+        assert_eq!(e.stats.silent, 3);
+        assert_eq!(e.udp_memory_of(&key).map(|(t, m)| (t, m.fails)), Some(("udp-fake", 3)));
+        let at = now + SILENT * 10;
+        let d = from_port(40010);
+        let out = sent(e.handle(&d, 0, at));
+        assert_eq!(out.len(), 11);
+        assert!(payloads(&out[..10]).iter().all(|p| p == &vec![0xBB; 32]));
+        e.observe(&answer(&d), at);
+        assert_eq!(e.udp_memory_of(&key).map(|(t, m)| (t, m.ok)), Some(("udp-fake", 1)));
+        assert_eq!(e.take_redeemed().len(), 3);
+        assert_eq!(sent(e.handle(&d, 0, at)).len(), 11);
+        assert_eq!(e.handle(&d, 0, at), Action::Pass);
+        assert_eq!(e.recent.back().map(|r| (r.host.clone(), r.technique)), Some((Some(key.clone()), Some("udp-fake"))));
+        assert!(e.memory_text().contains("udp:game.exe\tudp-fake\t1\t3\n"));
+        let mut fresh = eng("game-udp", "", "", "10.0.0.0/8").with_mode(Mode::parse("adaptive").unwrap());
+        assert_eq!(fresh.load_memory(&e.memory_text()), 1);
+        assert_eq!(fresh.udp_memory_of(&key).map(|(t, _)| t), Some("udp-fake"));
+        let mut fixed = eng("game-udp", "", "", "10.0.0.0/8");
+        assert_eq!(fixed.handle(&from_port(40020), 0, at), Action::Pass);
+        assert!(fixed.udp_memory_of(&key).is_none());
+    }
+
+    #[test]
+    fn silent_relays_do_not_switch_while_others_answer() {
+        use crate::flows::{Mode, SILENT, UDP_WINDOW, udp_key};
+        use crate::procs::{Owner, Source};
+        let now = Instant::now();
+        let mut e = eng("game-udp", "", "", "10.0.0.0/8")
+            .with_mode(Mode::parse("adaptive").unwrap())
+            .with_udp_apps(Box::new(|_, _| Some(Owner { pid: 7, name: Some("dota2.exe".into()), source: Source::Table })));
+        let key = udp_key(Some("dota2.exe"));
+        let d = from_port(40100);
+        assert_eq!(e.handle(&d, 0, now), Action::Pass);
+        e.observe(&answer(&d), now);
+        for i in 0..4u32 {
+            let at = now + SILENT * (2 * i + 1);
+            assert_eq!(e.handle(&from_port(40101 + i as u16), 0, at), Action::Pass);
+            let _ = e.expire(at + SILENT);
+        }
+        assert_eq!(e.udp_memory_of(&key).map(|(t, m)| (t, m.fails)), Some(("udp-none", 4)));
+        let later = now + UDP_WINDOW + SILENT * 10;
+        assert_eq!(e.handle(&from_port(40200), 0, later), Action::Pass);
+        let _ = e.expire(later + SILENT);
+        assert_eq!(e.udp_memory_of(&key).map(|(t, _)| t), Some("udp-fake"));
+        assert_eq!(sent(e.handle(&from_port(40201), 0, later + SILENT * 2)).len(), 11);
+    }
+
+    #[test]
+    fn noisy_program_is_left_alone() {
+        use crate::flows::{Mode, SILENT};
+        let now = Instant::now();
+        let mut e = eng("game-udp", "", "", "10.0.0.0/8").with_mode(Mode::parse("adaptive").unwrap());
+        e.track = true;
+        for i in 0..40u16 {
+            assert_eq!(e.handle(&from_port(41000 + i), 0, now), Action::Pass);
+        }
+        let _ = e.expire(now + SILENT);
+        assert_eq!((e.stats.silent, e.recent.len()), (2, 2));
+        let later = now + SILENT * 2;
+        for i in 0..200u16 {
+            assert_eq!(e.handle(&from_port(42000 + i), 0, later), Action::Pass);
+        }
+        let _ = e.expire(later + SILENT);
+        assert_eq!((e.stats.silent, e.recent.len()), (4, 4));
+        let _ = e.expire(later + SILENT * 2);
+        assert_eq!(e.handle(&from_port(45000), 0, later + SILENT * 2), Action::Pass);
+        let _ = e.expire(later + SILENT * 4);
+        assert_eq!(e.recent.len(), 4);
+    }
+}
+
+#[test]
+fn background_check_tries_next_technique_without_touching_stats() {
+    let tpl = template(true);
+    let h = hello("www.youtube.com", 0);
+    let mut e = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap());
+    e.track = true;
+    let t0 = Instant::now();
+    for port in [50021u16, 50022] {
+        sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), port), 0, t0));
+        let mut rst = reply(&tpl, 0x04, b"");
+        rst[22..24].copy_from_slice(&port.to_be_bytes());
+        packet::fix_checksums(&mut rst);
+        e.observe(&rst, t0);
+    }
+    assert_eq!(e.memory_of("www.youtube.com").map(|(t, _)| t), Some("sni-split"));
+    assert!(e.bg_targets(t0 + Duration::from_secs(5)).is_empty());
+    let later = t0 + BG_IDLE;
+    let targets = e.bg_targets(later);
+    assert_eq!(targets.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), vec!["www.youtube.com"]);
+    assert!(e.bg_targets(later + Duration::from_secs(1)).is_empty());
+    let (handled, reset) = (e.stats.handled, e.stats.reset);
+    e.add_bg_port(50030);
+    let probe = sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), 50030), 0, later));
+    assert!(probe.len() > 1);
+    let mut ok = reply(&tpl, 0x18, &server_hello());
+    ok[22..24].copy_from_slice(&50030u16.to_be_bytes());
+    packet::fix_checksums(&mut ok);
+    e.observe(&ok, later);
+    assert_eq!((e.stats.handled, e.stats.reset, e.stats.answered), (handled, reset, 0));
+    assert_eq!(e.take_redeemed().len(), 2);
+    assert_eq!(e.recent.back().and_then(|d| d.app.clone()).as_deref(), Some(BG_APP));
+    assert_eq!(e.memory_of("www.youtube.com").map(|(t, m)| (t, m.ok)), Some(("sni-split", 1)));
+    assert!(e.bg_targets(later + BG_EVERY * 2).is_empty());
+}
+
+#[test]
+fn background_check_takes_turns_between_sites() {
+    let tpl = template(true);
+    let mut e = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap());
+    e.track = true;
+    let t0 = Instant::now();
+    for (i, name) in ["a.youtube.com", "b.youtube.com", "c.youtube.com"].iter().enumerate() {
+        let port = 50050 + i as u16;
+        sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &hello(name, 0)), port), 0, t0));
+        let mut rst = reply(&tpl, 0x04, b"");
+        rst[22..24].copy_from_slice(&port.to_be_bytes());
+        packet::fix_checksums(&mut rst);
+        e.observe(&rst, t0);
+    }
+    let first: Vec<String> = e.bg_targets(t0 + BG_IDLE).into_iter().map(|t| t.0).collect();
+    assert_eq!(first.len(), 2);
+    let second: Vec<String> = e.bg_targets(t0 + BG_IDLE + BG_EVERY).into_iter().map(|t| t.0).collect();
+    let missed = ["a.youtube.com", "b.youtube.com", "c.youtube.com"].into_iter().find(|n| !first.iter().any(|f| f == n)).unwrap();
+    assert_eq!(second.first().map(String::as_str), Some(missed));
+}
+
+fn answered_flow(e: &mut Engine<u8>, tpl: &[u8], port: u16, site: &str, t0: Instant) -> u32 {
+    let h = hello(site, 0);
+    e.handle(&with_port(&syn(tpl), port), 0, t0);
+    e.observe(&with_port_in(&syn_ack(tpl, 52), port), t0);
+    sent(e.handle(&with_port(&seg(tpl, 1000, 1, &h), port), 0, t0));
+    let mut ok = reply(tpl, 0x18, &server_hello());
+    ok[22..24].copy_from_slice(&port.to_be_bytes());
+    packet::fix_checksums(&mut ok);
+    e.observe(&ok, t0);
+    1000 + h.len() as u32
+}
+
+fn with_port_in(pkt: &[u8], port: u16) -> Vec<u8> {
+    let mut p = pkt.to_vec();
+    p[22..24].copy_from_slice(&port.to_be_bytes());
+    packet::fix_checksums(&mut p);
+    p
+}
+
+fn client_data(tpl: &[u8], port: u16, seq: u32, received: u32, data: &[u8]) -> Vec<u8> {
+    with_ack(&with_port(&seg(tpl, seq, 7, data), port), 5001u32.wrapping_add(received))
+}
+
+#[test]
+fn frozen_download_is_noticed_and_sends_the_site_to_warp() {
+    use crate::warp::Shared;
+    let tpl = template(true);
+    let mut e = engine("rbxcdn.com", "").with_mode(Mode::parse("adaptive").unwrap()).with_warp(Shared::new(40000, vec![]));
+    e.track = true;
+    e.dns_alt = true;
+    let t0 = Instant::now();
+    let next = answered_flow(&mut e, &tpl, 50060, "tr.rbxcdn.com", t0);
+    assert_eq!((e.stats.answered, e.stats.frozen), (1, 0));
+    let req = b"GET /image";
+    e.handle(&client_data(&tpl, 50060, next, 3000, req), 0, t0);
+    let stuck = 17 * 1024;
+    let more = next + req.len() as u32;
+    e.handle(&client_data(&tpl, 50060, more, stuck, req), 0, t0 + Duration::from_millis(500));
+    for ms in [800u64, 1600, 2900] {
+        e.handle(&client_data(&tpl, 50060, more, stuck, req), 0, t0 + Duration::from_millis(500 + ms));
+        assert_eq!(e.stats.frozen, 0, "рано: {ms} мс");
+    }
+    e.handle(&client_data(&tpl, 50060, more, stuck, req), 0, t0 + Duration::from_millis(4000));
+    assert_eq!((e.stats.answered, e.stats.frozen), (0, 1));
+    assert_eq!(e.stats.by_tech["general"].frozen, 1);
+    assert_eq!(e.recent.back().and_then(|d| d.outcome), Some(Outcome::Frozen));
+    let dst = packet::parse(&tpl).unwrap().dst;
+    assert_eq!(e.avoid("tr.rbxcdn.com", t0), vec![dst]);
+    assert!(e.avoid("other.rbxcdn.com", t0).is_empty());
+    assert!(e.take_flush());
+    assert!(!e.take_flush());
+    assert!(e.notes.iter().any(|n| n.contains("заморозка: tr.rbxcdn.com") && n.contains("17 КБ") && n.contains("другой адрес")));
+    assert_eq!(e.memory_of("tr.rbxcdn.com").map(|(t, _)| t), Some("general"));
+    e.handle(&client_data(&tpl, 50060, more, stuck, req), 0, t0 + Duration::from_secs(6));
+    assert_eq!(e.stats.frozen, 1);
+
+    let t1 = t0 + Duration::from_secs(10);
+    let next = answered_flow(&mut e, &tpl, 50061, "tr.rbxcdn.com", t1);
+    e.handle(&client_data(&tpl, 50061, next, 20 * 1024, b"x"), 0, t1);
+    let mut fin = client_data(&tpl, 50061, next + 1, 20 * 1024, b"");
+    let ihl = ((fin[0] & 0x0f) as usize) * 4;
+    fin[ihl + 13] = 0x11;
+    packet::fix_checksums(&mut fin);
+    e.handle(&fin, 0, t1 + Duration::from_secs(1));
+    e.handle(&fin, 0, t1 + Duration::from_secs(2));
+    assert_eq!(e.stats.frozen, 1);
+    e.handle(&fin, 0, t1 + Duration::from_secs(5));
+    assert_eq!(e.stats.frozen, 2);
+    assert_eq!(e.memory_of("tr.rbxcdn.com").map(|(t, _)| t), Some("warp"));
+    assert!(e.notes.iter().any(|n| n.contains("через WARP")));
+}
+
+#[test]
+fn normal_download_and_lost_packet_are_not_a_freeze() {
+    let tpl = template(true);
+    let mut e = engine("rbxcdn.com", "").with_mode(Mode::parse("adaptive").unwrap());
+    e.track = true;
+    let t0 = Instant::now();
+    let next = answered_flow(&mut e, &tpl, 50070, "tr.rbxcdn.com", t0);
+    let req = b"GET /a";
+    e.handle(&client_data(&tpl, 50070, next, 3000, req), 0, t0);
+    e.handle(&client_data(&tpl, 50070, next, 15 * 1024, req), 0, t0 + Duration::from_millis(300));
+    e.handle(&client_data(&tpl, 50070, next + req.len() as u32, 26 * 1024, req), 0, t0 + Duration::from_secs(4));
+    e.handle(&client_data(&tpl, 50070, next + 2 * req.len() as u32, 26 * 1024, req), 0, t0 + Duration::from_secs(9));
+    assert_eq!(e.stats.frozen, 0);
+
+    let next = answered_flow(&mut e, &tpl, 50071, "tr.rbxcdn.com", t0);
+    e.handle(&client_data(&tpl, 50071, next, 4000, req), 0, t0);
+    e.handle(&client_data(&tpl, 50071, next, 4000, req), 0, t0 + Duration::from_secs(5));
+    assert_eq!(e.stats.frozen, 0, "до 12 КБ это не заморозка");
+
+    let next = answered_flow(&mut e, &tpl, 50072, "tr.rbxcdn.com", t0);
+    e.handle(&client_data(&tpl, 50072, next, 64 * 1024, req), 0, t0);
+    e.handle(&client_data(&tpl, 50072, next + req.len() as u32, 17 * 1024, req), 0, t0 + Duration::from_secs(1));
+    e.handle(&client_data(&tpl, 50072, next + req.len() as u32, 17 * 1024, req), 0, t0 + Duration::from_secs(5));
+    assert_eq!(e.stats.frozen, 0, "после 32 КБ соединение больше не проверяется");
+    assert_eq!(e.stats.answered, 3);
+}
+
+#[test]
+fn warp_step_resets_once_then_settles_through_proxy() {
+    use crate::warp::Shared;
+    let tpl = template(true);
+    let h = hello("www.youtube.com", 0);
+    let shared = Shared::new(40000, vec!["youtube.com".into()]);
+    let mut e = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap()).with_warp(shared.clone());
+    e.track = true;
+    let t0 = Instant::now();
+    let off = sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), 50040), 0, t0));
+    assert!(off.len() > 1);
+    assert!(shared.wanted(t0));
+    shared.set_listen(40400);
+    shared.set_ready(true);
+    let raw = with_port(&seg(&tpl, 1000, 1, &h), 50041);
+    let dst = packet::parse(&raw).unwrap().dst;
+    match e.handle(&raw, 0, t0) {
+        Action::Reject(rst, _) => {
+            let r = packet::parse(&rst).unwrap();
+            assert_eq!((r.sport, r.dport, r.flags), (443, 50041, 0x14));
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+    assert!(shared.has_ip(&dst));
+    assert!(sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), 50042), 0, t0)).len() > 1);
+    e.warp_settle(Some("www.youtube.com".into()), 50043, dst, 443, Outcome::Answered, t0);
+    assert_eq!(e.recent.back().map(|d| (d.technique, d.outcome)), Some((Some("warp"), Some(Outcome::Answered))));
+    assert_eq!(e.stats.by_tech["warp"].answered, 1);
+    let mut plain = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap()).with_warp(Shared::new(40000, vec![]));
+    assert!(plain.memory_text().is_empty());
+    assert!(plain.load_memory("www.youtube.com\twarp\t3\t16\n") == 1);
+    assert_eq!(plain.memory_of("www.youtube.com").map(|(t, _)| t), Some("warp"));
+    let mut fixed = engine("youtube.com", "").with_warp(Shared::new(40000, vec![]));
+    assert_eq!(fixed.load_memory("www.youtube.com\twarp\t3\t16\n"), 0);
+}
+
+#[test]
+fn subdomain_inherits_seeded_parent_technique() {
+    let tpl = template(true);
+    let h = hello("www.youtube.com", 0);
+    let mut e = engine("youtube.com", "").with_mode(Mode::parse("adaptive").unwrap());
+    assert_eq!(e.load_memory("youtube.com\tsni-split\t0\t0\n"), 1);
+    let t0 = Instant::now();
+    let out = sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &h), 50060), 0, t0));
+    let (at, len) = tls::sni_range(&h).unwrap();
+    assert_eq!(first_cut(&out), at + len / 2);
+    let mut ok = reply(&tpl, 0x18, &server_hello());
+    ok[22..24].copy_from_slice(&50060u16.to_be_bytes());
+    packet::fix_checksums(&mut ok);
+    e.observe(&ok, t0);
+    assert_eq!(e.memory_of("www.youtube.com").map(|(t, m)| (t, m.ok)), Some(("sni-split", 1)));
+}
+
+#[test]
+fn new_subdomain_starts_from_what_works_for_its_siblings() {
+    assert_eq!(crate::flows::site_base("style.sndcdn.com"), Some("sndcdn.com"));
+    assert_eq!(crate::flows::site_base("kws5.lovetrue.co.uk"), Some("lovetrue.co.uk"));
+    assert_eq!(crate::flows::site_base("sndcdn.com"), Some("sndcdn.com"));
+    assert_eq!(crate::flows::site_base("localhost"), None);
+    let tpl = template(true);
+    let mut e = engine("sndcdn.com\nsoundcloud.com\nco.uk", "").with_mode(Mode::parse("adaptive").unwrap());
+    let memory = "al.sndcdn.com\tsni-max\t18\t32\na-v2.sndcdn.com\tsni-split\t2\t0\napi-v2.soundcloud.com\tnone\t125\t27\nkws5.lovetrue.co.uk\tsni-max\t3\t0\n";
+    assert_eq!(e.load_memory(memory), 4);
+    let t0 = Instant::now();
+    let fresh = |e: &mut Engine<u8>, host: &str, port: u16| dpi_first(&sent(e.handle(&with_port(&seg(&tpl, 1000, 1, &hello(host, 0)), port), 0, t0)));
+    assert_eq!(fresh(&mut e, "style.sndcdn.com", 50070).as_deref(), Some("max.ru"));
+    assert_eq!(fresh(&mut e, "m.soundcloud.com", 50071).as_deref(), Some("www.google.com"));
+    assert_eq!(fresh(&mut e, "kws5.sadnews.co.uk", 50072).as_deref(), Some("www.google.com"));
+}
+
+#[test]
+fn adaptive_can_start_from_the_picked_technique() {
+    let names = |m: Mode| match m {
+        Mode::Adaptive(list) => list.iter().map(|t| t.name).collect::<Vec<_>>(),
+        Mode::Fixed(_) => vec![],
+    };
+    let plain = names(Mode::parse("adaptive").unwrap());
+    let max = names(Mode::parse("adaptive:sni-max").unwrap());
+    assert_eq!((max[0], max.len(), max[1]), ("sni-max", plain.len(), "general"));
+    let extra = names(Mode::parse("adaptive:fakedsplit").unwrap());
+    assert_eq!((extra[0], extra.len()), ("fakedsplit", plain.len() + 1));
+    assert_eq!(names(Mode::parse("adaptive:").unwrap()), plain);
+    assert!(Mode::parse("adaptive:nope").is_none() && Mode::parse("general:ttl").is_none());
+    assert!(Mode::is_adaptive("adaptive:ttl") && Mode::is_adaptive("Adaptive") && !Mode::is_adaptive("ttl"));
+    let tpl = template(true);
+    let mut e = engine("youtube.com", "").with_mode(Mode::parse("adaptive:sni-max").unwrap());
+    let out = sent(e.handle(&seg(&tpl, 1000, 1, &hello("www.youtube.com", 0)), 0, Instant::now()));
+    assert_eq!(dpi_first(&out).as_deref(), Some("max.ru"));
 }

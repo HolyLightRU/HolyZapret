@@ -121,7 +121,7 @@ fn tile(ui: &mut egui::Ui, w: f32, s: &SiteResult, can_pick: bool) -> Option<Til
         let fill = if br.hovered() { CYAN.gamma_multiply(0.35) } else { CYAN.gamma_multiply(0.18) };
         ui.painter().rect_filled(b, CornerRadius::same(7), fill);
         ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, "Подобрать", FontId::proportional(12.5), Color32::WHITE);
-        if br.on_hover_text("Подобрать правило для этого сайта: лаунчер проверит приёмы обхода и профили других стратегий").clicked() {
+        if br.on_hover_text("Подобрать правило для этого сайта: лаунчер по очереди проверит приёмы RayOfLight").clicked() {
             act = Some(TileAct::Pick);
         }
     }
@@ -159,7 +159,7 @@ impl App {
         use crate::core::{ray, settings};
         let Some(p) = &self.paths else { return false };
         let adapts = settings::ray_experiment() == "adaptive" || settings::ray_autolist();
-        settings::ray_enabled() && adapts && ray::read_live(p).is_some_and(|(l, age)| l.running && age.as_secs() < 10)
+        adapts && ray::read_live(p).is_some_and(|(l, age)| l.running && age.as_secs() < 10)
     }
 
     pub(super) fn start_site_recheck(&mut self, ctx: &egui::Context, urls: Vec<String>) -> bool {

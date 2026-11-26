@@ -7,7 +7,6 @@ pub struct Input<'a> {
     pub when: String,
     pub version: String,
     pub launcher: String,
-    pub flowseal: Option<String>,
     pub game: String,
     pub root: &'a Path,
     pub targets: &'a [Target],
@@ -102,7 +101,6 @@ pub fn build(input: &Input) -> String {
     let _ = writeln!(out, "Дата: {}", input.when);
     let build = if super::TEST_BUILD { ", тестовая сборка" } else { "" };
     let _ = writeln!(out, "HolyZapret: {} (лаунчер {}{build})", input.version, input.launcher);
-    let _ = writeln!(out, "Flowseal: {}", input.flowseal.as_deref().unwrap_or("не установлен"));
     let _ = writeln!(out, "Windows: {}", windows_name());
     let _ = writeln!(out, "TLS 1.3 в проверках: {}", if picker::tls13_supported() { "да" } else { "по ответу сайта (в curl этой Windows нет TLS 1.3)" });
     let _ = writeln!(out, "Игровой фильтр: {}", input.game);
@@ -121,7 +119,7 @@ pub fn build(input: &Input) -> String {
         .map(|(t, _)| format!("{} / {} ({})", t.category, t.name, kind(t.kind)))
         .collect();
     if !dead.is_empty() {
-        let _ = writeln!(out, "Недоступны и без обхода, и со всеми стратегиями (похоже на блокировку по IP): {}", dead.join(", "));
+        let _ = writeln!(out, "Недоступны и без обхода, и со всеми приёмами (похоже на блокировку по IP): {}", dead.join(", "));
     }
     for (title, lines) in &input.sections {
         let _ = writeln!(out, "\n== {title} ==");
@@ -218,7 +216,6 @@ mod tests {
             when: "22.11 01:10".into(),
             version: "3.0.0".into(),
             launcher: "3.0.0".into(),
-            flowseal: None,
             game: "Выключен".into(),
             root: &root,
             targets: &targets,

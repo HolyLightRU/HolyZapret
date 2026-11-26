@@ -1,7 +1,6 @@
 use super::{App, Msg, Tab, notify, result_msg, send};
 use crate::core::gamefilter::{self, GameFilter, Mode};
-use crate::core::service::ServiceState;
-use crate::core::{flowseal, hosts};
+use crate::core::hosts;
 use crate::log::Lvl;
 use crate::theme::{self, CYAN, RED, YELLOW};
 use eframe::egui::{self, Color32, RichText};
@@ -68,24 +67,6 @@ fn setting_row(ui: &mut egui::Ui, value: &mut bool, enabled: bool, title: &str, 
 }
 
 impl App {
-    fn flowseal_in_use(&self) -> bool {
-        self.status.as_ref().is_some_and(|s| {
-            s.service != ServiceState::NotInstalled
-                && s.active_strategy().is_some_and(|n| n.to_lowercase().starts_with("flowseal\\"))
-        })
-    }
-
-    fn ensure_flowseal_latest(&mut self, ctx: &egui::Context) {
-        if self.flowseal_latest.is_none() && !self.flowseal_checking {
-            self.flowseal_checking = true;
-            let (tx, ctx2) = (self.tx.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(Msg::FlowsealLatest(flowseal::latest().map_err(|e| e.to_string())));
-                ctx2.request_repaint();
-            });
-        }
-    }
-
     fn run_hosts(&mut self, ctx: &egui::Context) {
         self.spawn(ctx, |p, tx| {
             send(tx, Lvl::Info, "Обновляю hosts-list…");
@@ -141,8 +122,8 @@ impl App {
     }
 
     pub(super) fn move_folder(&mut self, ctx: &egui::Context) {
-        if self.trial.is_some() || self.picker.running() {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running() {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let target = crate::core::relocate::target_dir();
@@ -158,8 +139,8 @@ impl App {
     }
 
     pub(super) fn reset_all(&mut self, ctx: &egui::Context) {
-        if self.trial.is_some() || self.picker.running() {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running() {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let installed = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from));
@@ -182,38 +163,10 @@ impl App {
         });
     }
 
-    pub(super) fn flowseal_action(&mut self, ctx: &egui::Context, install: bool) {
-        if self.flowseal_in_use() {
-            self.toast(ctx, Lvl::Err, "Служба сейчас использует стратегию Flowseal, сначала удалите службу");
-            return;
-        }
-        if install {
-            let cached = self.flowseal_latest.clone();
-            self.spawn(ctx, move |p, tx| {
-                let rel = match cached {
-                    Some(r) => Ok(r),
-                    None => flowseal::latest(),
-                };
-                let r = rel.and_then(|rel| {
-                    send(tx, Lvl::Info, format!("Скачиваю Flowseal {}…", rel.version));
-                    flowseal::install(p, &rel).map(|n| format!("Flowseal {} установлен, стратегий: {n}", rel.version))
-                });
-                result_msg(tx, r, "Не удалось установить Flowseal");
-                let _ = tx.send(Msg::Rescan);
-            });
-        } else {
-            self.spawn(ctx, |p, tx| {
-                result_msg(tx, flowseal::uninstall(p).map(|_| "Стратегии Flowseal удалены".to_string()), "Не удалось удалить Flowseal");
-                let _ = tx.send(Msg::Rescan);
-            });
-        }
-    }
-
     pub(super) fn tools_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.ensure_flowseal_latest(ctx);
         let free = !self.busy && self.paths.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut clicks = [None; 4];
+            let mut clicks = [None; 2];
             let mut update_offered = false;
             ui.columns(2, |cols| {
                 clicks[0] = tool_card(
@@ -247,41 +200,12 @@ impl App {
                     &mut cols[1],
                     theme::icon::REFRESH,
                     "Обновления HolyZapret",
-                    "Скачивает последний релиз с GitHub и обновляет стратегии, списки и бинарники",
+                    "Скачивает последний релиз с GitHub и обновляет движок, списки и лаунчер",
                     Some((ver_text, ver_color)),
                     &actions,
                 );
                 update_offered = newer.is_some();
             });
-            {
-                let inst = self.flowseal_version.clone();
-                let latest = self.flowseal_latest.as_ref().map(|r| r.version.clone());
-                let (fs_text, fs_color) = match (&inst, &latest) {
-                    (Some(i), Some(l)) if i == l => (format!("Установлена {i}, последняя"), Color32::from_gray(150)),
-                    (Some(i), Some(l)) => (format!("{i} → {l}"), YELLOW),
-                    (Some(i), None) => (format!("Установлена {i}"), Color32::from_gray(150)),
-                    (None, Some(l)) => (format!("Не установлены, на GitHub {l}"), Color32::from_gray(150)),
-                    (None, None) if self.flowseal_checking => ("Проверяю версию…".to_string(), Color32::from_gray(150)),
-                    (None, None) => ("Не установлены".to_string(), Color32::from_gray(150)),
-                };
-                let main = match (&inst, &latest) {
-                    (None, _) => "Скачать".to_string(),
-                    (Some(i), Some(l)) if i != l => "Обновить".to_string(),
-                    _ => "Переустановить".to_string(),
-                };
-                let mut actions = vec![act(main, inst.is_none() || inst != latest, free)];
-                if inst.is_some() {
-                    actions.push(act("Удалить", false, free));
-                }
-                clicks[3] = tool_card(
-                    ui,
-                    theme::icon::LISTS,
-                    "Стратегии Flowseal",
-                    "Оригинальные стратегии Flowseal со своим движком winws.exe в папке flowseal",
-                    Some((fs_text, fs_color)),
-                    &actions,
-                );
-            }
             self.warp_card(ui, ctx);
             if self.tg.client.is_none() {
                 self.tg_card(ui, ctx);
@@ -294,11 +218,6 @@ impl App {
             match (clicks[1], update_offered) {
                 (Some(0), true) => self.open_update(),
                 (Some(_), _) => self.check_version(ctx),
-                _ => {}
-            }
-            match clicks[3] {
-                Some(0) => self.flowseal_action(ctx, true),
-                Some(1) => self.confirm = Some(super::confirm::Confirm::RemoveFlowseal),
                 _ => {}
             }
         });
@@ -332,8 +251,8 @@ impl App {
                 ui,
                 &mut auto,
                 self.watch,
-                "Подбирать стратегию самому",
-                "Если обход сломался и 15 минут никто не трогает компьютер, подберёт стратегию получше",
+                "Подбирать приём самому",
+                "Если обход сломался и 15 минут никто не трогает компьютер, подберёт приём получше",
             ) {
                 self.auto_pick = auto;
             }
@@ -351,7 +270,7 @@ impl App {
             theme::row(ui, 44.0, |ui| {
                 ui.vertical(|ui| {
                     ui.label("Поделиться настройкой");
-                    ui.label(RichText::new("Стратегия, свои домены и IP, правила для сайтов и игровой фильтр одним кодом").weak().size(12.5));
+                    ui.label(RichText::new("Приём RayOfLight, свои домены и IP, правила для сайтов и игровой фильтр одним кодом").weak().size(12.5));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!self.busy, egui::Button::new("Код от друга")).clicked() {
@@ -376,7 +295,7 @@ impl App {
             theme::row(ui, 44.0, |ui| {
                 ui.vertical(|ui| {
                     ui.label("Мастер настройки");
-                    ui.label(RichText::new("Диагностика, подбор и установка стратегии за три шага").weak().size(12.5));
+                    ui.label(RichText::new("Диагностика, подбор и включение защиты за три шага").weak().size(12.5));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Открыть").clicked() {

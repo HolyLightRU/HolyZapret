@@ -11,6 +11,7 @@ pub const CYAN: Color32 = Color32::from_rgb(105, 205, 245);
 pub const GREEN: Color32 = Color32::from_rgb(98, 214, 142);
 pub const RED: Color32 = Color32::from_rgb(244, 100, 110);
 pub const YELLOW: Color32 = Color32::from_rgb(240, 196, 90);
+pub const ORANGE: Color32 = Color32::from_rgb(245, 150, 80);
 
 pub fn card_fill() -> Color32 {
     Color32::from_white_alpha(13)
@@ -496,44 +497,6 @@ pub fn paint_pill(painter: &egui::Painter, right_center: egui::Pos2, text: &str,
     painter.rect_stroke(rect, CornerRadius::same(20), Stroke::new(1.0, color.gamma_multiply(0.5)), egui::StrokeKind::Inside);
     painter.galley(rect.center() - galley.size() / 2.0, galley, color);
     rect
-}
-
-pub fn strategy_row(ui: &mut Ui, name: &str, meta: &str, selected: bool, active: bool, score: Option<(String, Color32)>) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
-    let p = ui.painter();
-    if selected {
-        gradient_rect(p, rect, 10.0, PINK, CYAN);
-        p.rect_filled(rect.shrink(1.5), CornerRadius::same(9), Color32::from_rgba_unmultiplied(24, 20, 32, 245));
-        p.rect_filled(rect.shrink(1.5), CornerRadius::same(9), Color32::from_white_alpha(8));
-    } else {
-        let a = if resp.hovered() { 14 } else { 6 };
-        p.rect_filled(rect, CornerRadius::same(10), Color32::from_white_alpha(a));
-    }
-    let dot_c = egui::pos2(rect.left() + 20.0, rect.center().y);
-    if selected {
-        gradient_rect(p, egui::Rect::from_center_size(dot_c, Vec2::splat(12.0)), 6.0, PINK, CYAN);
-    } else {
-        p.circle_stroke(dot_c, 5.5, Stroke::new(1.2, Color32::from_white_alpha(70)));
-    }
-    let col = if selected { Color32::WHITE } else { Color32::from_gray(215) };
-    p.text(
-        egui::pos2(rect.left() + 38.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        name,
-        FontId::new(15.0, FontFamily::Proportional),
-        col,
-    );
-    let mut right = egui::pos2(rect.right() - 14.0, rect.center().y);
-    if active {
-        let pill = paint_pill(p, right, "Активна", GREEN);
-        right.x = pill.left() - 10.0;
-    }
-    if let Some((text, color)) = &score {
-        let pill = paint_pill(p, right, text, *color);
-        right.x = pill.left() - 10.0;
-    }
-    p.text(right, egui::Align2::RIGHT_CENTER, meta, FontId::new(12.5, FontFamily::Proportional), Color32::from_gray(140));
-    resp
 }
 
 pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {

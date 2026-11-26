@@ -2,95 +2,49 @@ use super::gamefilter::GameFilter;
 use super::paths::Paths;
 use super::picker::{self, Check, CheckKind, Target};
 use super::service::{self, ServiceState};
-use super::strategy::{self, Strategy};
+use super::strategy::Strategy;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NONE: &str = "none";
 pub const BORROW: &str = "from:";
-const BORROW_OPTIONS: [&str; 4] = ["--dpi-desync", "--ip-id", "--dup", "--orig"];
 const FILE: &str = "site-rules-user.txt";
 const MAX_DOMAINS: usize = 16;
 
-pub struct Technique {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub args: &'static str,
-}
+pub const TECHNIQUES: [&str; 10] = ["general", "sni-split", "sni-max", "ttl", "disorder", "md5sig", "badseq", "overlap-max", "random", "badsum"];
 
-const PATTERN: &str = "--dpi-desync-split-seqovl-pattern=\"{BIN}tls_clienthello_www_google_com.bin\"";
-
-pub const TECHNIQUES: &[Technique] = &[
-    Technique {
-        id: "alt3-ts",
-        name: "ALT3, подмена ts",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 {PATTERN} --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "alt3-badseq",
-        name: "ALT3, подмена badseq",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-repeats=8 {PATTERN} --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "alt3-md5sig",
-        name: "ALT3, подмена md5sig",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=md5sig --dpi-desync-repeats=8 {PATTERN} --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "alt3-ts-badseq",
-        name: "ALT3, подмена ts и badseq",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts,badseq --dpi-desync-repeats=8 {PATTERN} --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "alt3-autottl",
-        name: "ALT3, подмена по TTL",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-autottl=2 --dpi-desync-repeats=8 {PATTERN} --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "seqovl",
-        name: "Только наложение seqovl",
-        args: "--dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 {PATTERN}",
-    },
-    Technique {
-        id: "seqovl-sniext",
-        name: "Наложение у SNI",
-        args: "--dpi-desync=multisplit --dpi-desync-split-seqovl=679 --dpi-desync-split-pos=2,sniext+1 {PATTERN}",
-    },
-    Technique {
-        id: "fakedsplit",
-        name: "fakedsplit, badseq",
-        args: "--dpi-desync=fake,fakedsplit --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-repeats=6 --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
-    Technique {
-        id: "multidisorder",
-        name: "multidisorder у домена",
-        args: "--dpi-desync=multidisorder --dpi-desync-split-pos=1,midsld",
-    },
-    Technique {
-        id: "fake-md5sig",
-        name: "Подмена и разрез у домена, md5sig",
-        args: "--dpi-desync=fake,multisplit --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=md5sig --dpi-desync-repeats=6 --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-    },
+const LEGACY: [(&str, &str); 10] = [
+    ("alt3-ts", "general"),
+    ("alt3-badseq", "badseq"),
+    ("alt3-md5sig", "md5sig"),
+    ("alt3-ts-badseq", "general"),
+    ("alt3-autottl", "ttl"),
+    ("seqovl", "general"),
+    ("seqovl-sniext", "sni-split"),
+    ("fakedsplit", "badseq"),
+    ("multidisorder", "disorder"),
+    ("fake-md5sig", "md5sig"),
 ];
 
-pub fn technique(id: &str) -> Option<&'static Technique> {
-    TECHNIQUES.iter().find(|t| t.id == id)
-}
+static FRESH: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn label(id: &str) -> String {
     if id == NONE {
         return "Не обходить".into();
     }
-    if let Some(name) = id.strip_prefix(BORROW) {
-        return format!("Как в «{name}»");
-    }
-    technique(id).map(|t| t.name.to_string()).unwrap_or_else(|| id.to_string())
+    super::ray::experiment_label(id).to_string()
 }
 
-pub fn technique_args(t: &Technique, bin: &Path) -> String {
-    let bin = format!("{}\\", bin.display());
-    t.args.replace("{PATTERN}", PATTERN).replace("{BIN}", &bin)
+fn known(id: &str) -> Option<String> {
+    if id == NONE || TECHNIQUES.contains(&id) {
+        return Some(id.to_string());
+    }
+    if id.starts_with(BORROW) {
+        return Some("general".into());
+    }
+    LEGACY.iter().find(|(old, _)| *old == id).map(|(_, new)| new.to_string())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -104,81 +58,12 @@ pub struct Rule {
 
 impl Rule {
     pub fn borrowed(&self) -> bool {
-        self.technique.starts_with(BORROW)
+        false
     }
 
     pub fn line(&self) -> String {
-        let base = format!("{} | {} | {}", self.technique, self.domains.join(", "), self.origin);
-        if self.borrowed() { format!("{base} | {} | {}", self.tcp, self.udp) } else { base }
+        format!("{} | {} | {}", self.technique, self.domains.join(", "), self.origin)
     }
-}
-
-fn split_args(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    for c in s.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                cur.push(c);
-            }
-            ' ' if !quoted => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-pub fn safe_args(s: &str) -> bool {
-    split_args(s).iter().all(|t| {
-        let (k, v) = t.split_once('=').unwrap_or((t.as_str(), ""));
-        let key_ok = BORROW_OPTIONS.iter().any(|p| k.starts_with(p)) && k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        let value_ok = match v.strip_prefix("\"{BIN}").and_then(|r| r.strip_suffix('"')) {
-            Some(file) => !file.is_empty() && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) && !file.contains(".."),
-            None => v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | '.' | ':' | '-' | '_' | '+' | '^' | '!' | '=' | '@' | '~' | '#')),
-        };
-        key_ok && value_ok
-    })
-}
-
-fn stored(tokens: &[String], bin: &Path) -> String {
-    let prefix = format!("{}\\", bin.display()).to_lowercase();
-    tokens
-        .iter()
-        .map(|t| {
-            let (k, v) = t.split_once('=').unwrap_or((t.as_str(), ""));
-            if v.to_lowercase().starts_with(&prefix) {
-                format!("{k}=\"{{BIN}}{}\"", &v[prefix.len()..])
-            } else {
-                t.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn borrow_rule(paths: &Paths, donor: &Strategy, domains: Vec<String>, origin: &str) -> anyhow::Result<Rule> {
-    let host = domains.first().cloned().ok_or_else(|| anyhow::anyhow!("нет доменов"))?;
-    let args = strategy::extract_args(donor, paths, &GameFilter::default())?;
-    let ips: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 443)).map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default();
-    let [tcp, udp] = super::coverage::borrow(&args, &host, &ips, &mut super::coverage::Cache::default());
-    let tcp = tcp.map(|t| stored(&t, &donor.bin)).unwrap_or_default();
-    let udp = udp.map(|t| stored(&t, &donor.bin)).unwrap_or_default();
-    if tcp.is_empty() && udp.is_empty() {
-        anyhow::bail!("стратегия «{}» не обходит {host}", donor.name);
-    }
-    if !safe_args(&tcp) || !safe_args(&udp) {
-        anyhow::bail!("настройки стратегии «{}» нельзя перенести в правило", donor.name);
-    }
-    Ok(Rule { technique: format!("{BORROW}{}", donor.name), domains, origin: origin.to_string(), tcp, udp })
 }
 
 pub fn path(paths: &Paths) -> PathBuf {
@@ -191,29 +76,16 @@ pub fn parse(text: &str) -> Vec<Rule> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| {
             let mut parts = l.splitn(5, '|').map(str::trim);
-            let technique = parts.next()?.to_string();
-            let domains: Vec<String> = parts
-                .next()?
-                .split([',', ' '])
-                .filter_map(|d| super::lists::normalize_domain(d).ok())
-                .collect();
+            let technique = known(parts.next()?)?;
+            let domains: Vec<String> = parts.next()?.split([',', ' ']).filter_map(|d| super::lists::normalize_domain(d).ok()).collect();
             let origin = parts.next().unwrap_or("").to_string();
-            let borrowed = technique.starts_with(BORROW) && technique.len() > BORROW.len();
-            let (tcp, udp) = if borrowed {
-                (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string())
-            } else {
-                (String::new(), String::new())
-            };
-            let known = technique == NONE
-                || self::technique(&technique).is_some()
-                || (borrowed && (!tcp.is_empty() || !udp.is_empty()) && safe_args(&tcp) && safe_args(&udp));
-            (known && !domains.is_empty()).then_some(Rule { technique, domains, origin, tcp, udp })
+            (!domains.is_empty()).then_some(Rule { technique, domains, origin, ..Default::default() })
         })
         .collect()
 }
 
 pub fn render(rules: &[Rule]) -> String {
-    let mut out = String::from("# Правила для сайтов HolyZapret: приём | домены | для какой стратегии подобрано\r\n");
+    let mut out = String::from("# Правила для сайтов HolyZapret: приём RayOfLight | домены | откуда\r\n");
     for r in rules {
         out.push_str(&r.line());
         out.push_str("\r\n");
@@ -241,6 +113,9 @@ pub fn save(paths: &Paths, rules: &[Rule]) -> anyhow::Result<()> {
 }
 
 pub fn upsert(rules: &mut Vec<Rule>, rule: Rule) {
+    if let Ok(mut f) = FRESH.lock() {
+        f.extend(rule.domains.iter().cloned());
+    }
     for r in rules.iter_mut() {
         r.domains.retain(|d| !rule.domains.iter().any(|n| n.eq_ignore_ascii_case(d)));
     }
@@ -248,46 +123,32 @@ pub fn upsert(rules: &mut Vec<Rule>, rule: Rule) {
     rules.push(rule);
 }
 
-pub fn profiles(rules: &[Rule], bin: &Path) -> String {
-    let mut out = Vec::new();
-    let dir = format!("{}\\", bin.display());
+pub fn seed_text(memory: &str, rules: &[Rule], fresh: &[String]) -> String {
+    let mut lines: Vec<String> = memory.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
     for r in rules {
-        let domains = r.domains.join(",");
-        let body = if r.borrowed() {
-            if r.tcp.is_empty() {
-                continue;
+        let tech = if r.technique == NONE { "none" } else { r.technique.as_str() };
+        for d in &r.domains {
+            let pos = lines.iter().position(|l| l.split('\t').next().is_some_and(|h| h.eq_ignore_ascii_case(d)));
+            let force = fresh.iter().any(|f| f.eq_ignore_ascii_case(d));
+            match pos {
+                Some(i) if force => lines[i] = format!("{d}\t{tech}\t0\t0"),
+                Some(_) => {}
+                None => lines.push(format!("{d}\t{tech}\t0\t0")),
             }
-            format!(" {}", r.tcp.replace("{BIN}", &dir))
-        } else {
-            match technique(&r.technique) {
-                Some(t) => format!(" {}", technique_args(t, bin)),
-                None => String::new(),
-            }
-        };
-        out.push(format!("--filter-tcp=80,443 --hostlist-domains={domains}{body}"));
+        }
     }
-    for r in rules.iter().filter(|r| r.borrowed() && !r.udp.is_empty()) {
-        out.push(format!("--filter-udp=443 --hostlist-domains={} {}", r.domains.join(","), r.udp.replace("{BIN}", &dir)));
-    }
-    let all: Vec<String> = rules.iter().flat_map(|r| r.domains.clone()).collect();
-    if !all.is_empty() {
-        out.push(format!("--filter-udp=443 --hostlist-domains={}", all.join(",")));
-    }
-    out.join(" --new ")
+    lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
-pub fn inject(args: &str, rules: &[Rule], bin: &Path) -> String {
+pub fn seed_memory(paths: &Paths) {
+    let rules = load(paths);
+    let fresh = FRESH.lock().map(|mut f| std::mem::take(&mut *f)).unwrap_or_default();
     if rules.is_empty() {
-        return args.to_string();
+        return;
     }
-    let at = args.match_indices("--filter-").map(|(i, _)| i).find(|&i| i == 0 || args.as_bytes()[i - 1] == b' ');
-    let Some(i) = at else { return args.to_string() };
-    format!("{}{} --new {}", &args[..i], profiles(rules, bin), &args[i..])
-}
-
-pub fn with_rules(paths: &Paths, s: &Strategy, gf: &GameFilter) -> anyhow::Result<String> {
-    let args = strategy::extract_args(s, paths, gf)?;
-    Ok(inject(&args, &load(paths), &paths.bin()))
+    let file = super::ray::memory_path(paths);
+    let text = seed_text(&fs::read_to_string(&file).unwrap_or_default(), &rules, &fresh);
+    let _ = fs::write(&file, text);
 }
 
 #[derive(Clone, Debug)]
@@ -429,12 +290,16 @@ pub fn advise(baseline: &Trial, strategy: Option<&Trial>, techniques: &[Trial]) 
     }
 }
 
-fn measure_engine(engine: &Path, bin: &Path, args: &str, log: &str, targets: &[Target], cancel: &AtomicBool) -> Vec<Check> {
-    let mut child = match picker::start_raw(engine, bin, args, log) {
+fn measure_ray(paths: &Paths, experiment: &str, targets: &[Target], gf: &GameFilter, cancel: &AtomicBool) -> Vec<Check> {
+    let Some(exe) = super::ray::exe(paths) else { return vec![Check::failed(); targets.len()] };
+    let log = format!("rule-{experiment}");
+    let live = std::env::temp_dir().join("holyzapret-picker").join(format!("{log}.json"));
+    let args = super::ray::cli_args(paths, experiment, &live, gf);
+    let mut child = match picker::start_raw(&exe, &paths.bin(), &args, &log) {
         Ok(c) => c,
         Err(_) => return vec![Check::failed(); targets.len()],
     };
-    let checks = match picker::warm_up(&mut child, log, cancel) {
+    let checks = match picker::warm_up(&mut child, &log, cancel) {
         Ok(()) if !cancel.load(Ordering::Relaxed) => run_checks(targets),
         _ => vec![Check::failed(); targets.len()],
     };
@@ -469,70 +334,29 @@ fn resume(p: Pause) -> Option<String> {
     }
 }
 
-fn inspect(paths: &Paths, url: String, domains: Vec<String>, current: Option<&Strategy>, gf: &GameFilter, cancel: &AtomicBool, emit: &dyn Fn(Event)) -> Verdict {
+fn inspect(paths: &Paths, url: String, domains: Vec<String>, _current: Option<&Strategy>, gf: &GameFilter, cancel: &AtomicBool, emit: &dyn Fn(Event)) -> Verdict {
     let targets = targets(&url);
-
     emit(Event::Stage("Проверяю без обхода".into()));
-    let base_checks = run_checks(&targets);
-    let baseline = Trial::from("Без обхода", &base_checks);
-
-    let mut strategy_trial = None;
-    if let Some(s) = current {
-        if !cancel.load(Ordering::Relaxed) {
-            emit(Event::Stage(format!("Проверяю со стратегией «{}»", s.name)));
-            let checks = match strategy::extract_args(s, paths, gf) {
-                Ok(args) => measure_engine(&s.engine, &s.bin, &args, &s.name, &targets, cancel),
-                Err(_) => vec![Check::failed(); targets.len()],
-            };
-            strategy_trial = Some(Trial::from(s.name.clone(), &checks));
-        }
-    }
-
-    let origin_name = current.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+    let baseline = Trial::from("Без обхода", &run_checks(&targets));
     let mut techniques = Vec::new();
-    let need = !baseline.passed() && !strategy_trial.as_ref().is_some_and(Trial::passed);
-    if need {
-        let engine = paths.engine();
-        let bin = paths.bin();
+    if !baseline.passed() {
         for (i, t) in TECHNIQUES.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            emit(Event::Stage(format!("Приём {} из {}: {}", i + 1, TECHNIQUES.len(), t.name)));
-            let args = format!(
-                "--wf-tcp=80,443 --filter-tcp=80,443 --hostlist-domains={} {}",
-                domains.join(","),
-                technique_args(t, &bin)
-            );
-            let checks = measure_engine(&engine, &bin, &args, &format!("rule-{}", t.id), &targets, cancel);
-            let mut trial = Trial::from(t.name, &checks);
-            trial.rule = Some(Rule { technique: t.id.to_string(), domains: domains.clone(), origin: origin_name.clone(), ..Default::default() });
+            emit(Event::Stage(format!("Приём {} из {}: {}", i + 1, TECHNIQUES.len(), label(t))));
+            let checks = measure_ray(paths, t, &targets, gf, cancel);
+            let mut trial = Trial::from(label(t), &checks);
+            trial.rule = Some(Rule { technique: t.to_string(), domains: domains.clone(), origin: "RayOfLight".into(), ..Default::default() });
+            let done = trial.passed();
             techniques.push(trial);
-        }
-        if !techniques.iter().any(Trial::passed) {
-            let all = strategy::discover(paths);
-            let donors: Vec<&Strategy> = picker::optimal(paths, &all)
-                .into_iter()
-                .filter_map(|i| all.get(i))
-                .filter(|s| s.engine == engine && current.as_ref().is_none_or(|c| c.path != s.path))
-                .collect();
-            for (i, s) in donors.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                emit(Event::Stage(format!("Профиль из стратегии {} из {}: {}", i + 1, donors.len(), s.name)));
-                let Ok(rule) = borrow_rule(paths, s, domains.clone(), &origin_name) else { continue };
-                let args = format!("--wf-tcp=80,443 --wf-udp=443 {}", profiles(std::slice::from_ref(&rule), &bin));
-                let checks = measure_engine(&engine, &bin, &args, &format!("rule-from-{i}"), &targets, cancel);
-                let mut trial = Trial::from(format!("Как в «{}»", s.name), &checks);
-                trial.rule = Some(rule);
-                techniques.push(trial);
+            if done {
+                break;
             }
         }
     }
-
-    let advice = advise(&baseline, strategy_trial.as_ref(), &techniques);
-    Verdict { url, domains, baseline, strategy: strategy_trial, techniques, advice, origin: origin_name }
+    let advice = advise(&baseline, None, &techniques);
+    Verdict { url, domains, baseline, strategy: None, techniques, advice, origin: "RayOfLight".into() }
 }
 
 pub fn find(paths: Paths, url: String, current: Option<Strategy>, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
@@ -591,25 +415,12 @@ pub fn find_many(paths: Paths, urls: Vec<String>, current: Option<Strategy>, gf:
     emit(Event::Batch(out));
 }
 
-pub fn recheck(paths: Paths, list: Vec<Rule>, current: Strategy, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
+pub fn recheck(paths: Paths, list: Vec<Rule>, _current: Strategy, gf: GameFilter, cancel: &AtomicBool, emit: impl Fn(Event)) {
     if !picker::curl_available() {
         emit(Event::Failed("curl.exe не найден: он входит в Windows 10 1803 и новее".into()));
         return;
     }
-    let args = match strategy::extract_args(&current, &paths, &gf) {
-        Ok(a) => a,
-        Err(e) => {
-            emit(Event::Failed(format!("Не удалось прочитать стратегию «{}»: {e}", current.name)));
-            return;
-        }
-    };
-    let was_running = service::query(service::SERVICE) == ServiceState::Running;
-    let had_divert = service::query("WinDivert") != ServiceState::NotInstalled;
-    if was_running {
-        super::run_hidden("net", &["stop", service::SERVICE]);
-    }
-    picker::stop_engine(None);
-    let bin = paths.bin();
+    let paused = pause();
     let mut states = Vec::new();
     for (i, rule) in list.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -618,21 +429,17 @@ pub fn recheck(paths: Paths, list: Vec<Rule>, current: Strategy, gf: GameFilter,
         let site = rule.domains.first().cloned().unwrap_or_default();
         emit(Event::Stage(format!("Правило {} из {}: {site}", i + 1, list.len())));
         let targets = targets(&format!("https://{site}/"));
-        let plain = measure_engine(&current.engine, &current.bin, &args, &current.name, &targets, cancel);
-        let with = inject(&args, std::slice::from_ref(rule), &bin);
-        let ruled = measure_engine(&current.engine, &current.bin, &with, &current.name, &targets, cancel);
+        let plain = measure_ray(&paths, "adaptive", &targets, &gf, cancel);
+        let tech = if rule.technique == NONE { "none" } else { rule.technique.as_str() };
+        let ruled = if tech == "none" { run_checks(&targets) } else { measure_ray(&paths, tech, &targets, &gf, cancel) };
         states.push(rule_state(&Trial::from("с правилом", &ruled), &Trial::from("без правила", &plain)));
     }
-    picker::stop_engine(None);
-    let restore = was_running.then(service::start);
-    if !was_running && !had_divert {
-        let _ = service::unload_windivert();
-    }
+    let restore = resume(paused);
     if cancel.load(Ordering::Relaxed) {
         emit(Event::Failed("Перепроверка правил отменена".into()));
         return;
     }
-    if let Some(Err(e)) = restore {
+    if let Some(e) = restore {
         emit(Event::Failed(format!("Перепроверка закончилась, но службу не удалось запустить: {e}")));
     }
     emit(Event::Rechecked(list, states));
@@ -641,6 +448,18 @@ pub fn recheck(paths: Paths, list: Vec<Rule>, current: Strategy, gf: GameFilter,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_rules_map_to_ray_techniques_and_seed_memory() {
+        let r = parse("alt3-badseq | rutor.info | general\nfrom:ALT 4 | x.com | g | --dpi-desync=fake |\nmultidisorder | a.org |\nweird | b.org |\n");
+        assert_eq!(r.iter().map(|r| r.technique.as_str()).collect::<Vec<_>>(), vec!["badseq", "general", "disorder"]);
+        let mem = "rutor.info\tgeneral\t5\t1\nother.com\tttl\t1\t0\n";
+        let kept = seed_text(mem, &r, &[]);
+        assert!(kept.contains("rutor.info\tgeneral\t5\t1\n") && kept.contains("x.com\tgeneral\t0\t0\n") && kept.contains("other.com\tttl\t1\t0\n"));
+        let forced = seed_text(mem, &r, &["rutor.info".into()]);
+        assert!(forced.contains("rutor.info\tbadseq\t0\t0\n"));
+        assert_eq!(label("sni-split"), "Разрез по имени сайта");
+    }
 
     fn rule(t: &str, d: &[&str], o: &str) -> Rule {
         Rule { technique: t.into(), domains: d.iter().map(|s| s.to_string()).collect(), origin: o.into(), ..Default::default() }
@@ -688,41 +507,13 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_rules() {
-        let b = Rule {
-            technique: "from:general (ALT2)".into(),
-            domains: vec!["soundcloud.com".into(), "whatsapp.com".into()],
-            origin: "general".into(),
-            tcp: "--dpi-desync=fake,multisplit --dpi-desync-fake-tls=\"{BIN}tls_clienthello_www_google_com.bin\" --dpi-desync-repeats=6".into(),
-            udp: "--dpi-desync=fake --dpi-desync-fake-quic=\"{BIN}quic_initial_www_google_com.bin\"".into(),
-        };
-        assert_eq!(parse(&render(std::slice::from_ref(&b))), vec![b.clone()]);
-        assert_eq!(label(&b.technique), "Как в «general (ALT2)»");
-        let out = inject("--wf-tcp=443 --filter-tcp=443 --dpi-desync=fake", std::slice::from_ref(&b), Path::new(r"C:\hz\bin"));
-        assert!(out.contains(r#"--filter-tcp=80,443 --hostlist-domains=soundcloud.com,whatsapp.com --dpi-desync=fake,multisplit --dpi-desync-fake-tls="C:\hz\bin\tls_clienthello_www_google_com.bin""#), "{out}");
-        assert!(out.contains(r#"--filter-udp=443 --hostlist-domains=soundcloud.com,whatsapp.com --dpi-desync=fake --dpi-desync-fake-quic="C:\hz\bin\quic_initial_www_google_com.bin" --new --filter-udp=443 --hostlist-domains=soundcloud.com,whatsapp.com --new"#), "{out}");
-        for evil in [
-            "from:x | a.com | g | --debug=@C:\\x.txt |",
-            "from:x | a.com | g | --dpi-desync-fake-tls=\"{BIN}..\\..\\secret\" |",
-            "from:x | a.com | g | --dpi-desync-fake-tls=C:\\x.bin |",
-            "from:x | a.com | g | --hostlist-auto=x.txt |",
-            "from:x | a.com | g |  |",
-        ] {
-            assert!(parse(evil).is_empty(), "{evil}");
-        }
-        let bin = Path::new(r"C:\Hz Folder\bin");
-        let toks = vec!["--dpi-desync=fake".to_string(), r"--dpi-desync-fake-quic=C:\Hz Folder\bin\quic_initial_www_google_com.bin".to_string()];
-        assert_eq!(stored(&toks, bin), r#"--dpi-desync=fake --dpi-desync-fake-quic="{BIN}quic_initial_www_google_com.bin""#);
-    }
-
-    #[test]
     fn rules_round_trip() {
-        let rules = vec![rule(NONE, &["steampowered.com", "steamstatic.com"], "general"), rule("alt3-badseq", &["x.com"], "")];
+        let rules = vec![rule(NONE, &["steampowered.com", "steamstatic.com"], "general"), rule("badseq", &["x.com"], "")];
         let text = render(&rules);
         assert_eq!(parse(&text), rules);
         assert_eq!(parse("bogus | a.com | x\nnone | not a domain | y\n# c\nnone | B.com |"), vec![rule(NONE, &["b.com"], "")]);
         assert_eq!(label(NONE), "Не обходить");
-        assert_eq!(label("alt3-badseq"), "ALT3, подмена badseq");
+        assert_eq!(label("badseq"), "Фейк с неверным seq");
     }
 
     #[test]
@@ -730,22 +521,6 @@ mod tests {
         let mut rules = vec![rule(NONE, &["a.com", "b.com"], "g"), rule("seqovl", &["c.com"], "")];
         upsert(&mut rules, rule("alt3-ts", &["b.com", "c.com"], ""));
         assert_eq!(rules, vec![rule(NONE, &["a.com"], "g"), rule("alt3-ts", &["b.com", "c.com"], "")]);
-    }
-
-    #[test]
-    fn rules_go_before_strategy_profiles() {
-        let bin = Path::new(r"C:\hz\bin");
-        let args = "--wf-tcp=80,443 --wf-udp=443 --filter-udp=443 --hostlist=\"x\" --dpi-desync=fake --new --filter-tcp=443 --dpi-desync=fake";
-        assert_eq!(inject(args, &[], bin), args);
-        let rules = vec![rule(NONE, &["steampowered.com"], "g"), rule("seqovl", &["x.com"], "")];
-        let out = inject(args, &rules, bin);
-        assert!(out.starts_with(
-            "--wf-tcp=80,443 --wf-udp=443 --filter-tcp=80,443 --hostlist-domains=steampowered.com --new --filter-tcp=80,443 --hostlist-domains=x.com --dpi-desync=multisplit"
-        ));
-        assert!(out.contains(r#"--dpi-desync-split-seqovl-pattern="C:\hz\bin\tls_clienthello_www_google_com.bin""#));
-        assert!(out.contains("--filter-udp=443 --hostlist-domains=steampowered.com,x.com --new --filter-udp=443 --hostlist=\"x\""));
-        assert_eq!(out.matches("--new").count(), args.matches("--new").count() + 3);
-        assert_eq!(inject("--wf-tcp=80 --dpi-desync=fake", &rules, bin), "--wf-tcp=80 --dpi-desync=fake");
     }
 
     #[test]
@@ -773,56 +548,4 @@ mod tests {
         assert_eq!(advise(&t(0, None, 0), None, &[t(2, Some("c"), 50)]), Advice::Nothing);
     }
 
-    #[test]
-    #[ignore]
-    fn engine_accepts_rules_and_techniques() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
-        let paths = Paths { root };
-        let bin = paths.bin();
-        let dry = |args: &str| {
-            use std::os::windows::process::CommandExt;
-            let out = std::process::Command::new(paths.engine())
-                .env("__COMPAT_LAYER", "RunAsInvoker")
-                .current_dir(&bin)
-                .raw_arg(format!("--dry-run {args}"))
-                .creation_flags(0x0800_0000)
-                .output()
-                .unwrap();
-            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
-        };
-        for t in TECHNIQUES {
-            let args = format!("--wf-tcp=80,443 --filter-tcp=80,443 --hostlist-domains=a.com {}", technique_args(t, &bin));
-            let (ok, log) = dry(&args);
-            assert!(ok, "{}: {log}", t.id);
-        }
-        let all: Vec<Rule> = std::iter::once(rule(NONE, &["steampowered.com"], "g"))
-            .chain(TECHNIQUES.iter().enumerate().map(|(i, t)| Rule { technique: t.id.into(), domains: vec![format!("d{i}.com")], ..Default::default() }))
-            .collect();
-        let mut borrowed = 0;
-        for s in strategy::discover(&paths).iter().filter(|s| s.engine == paths.engine()) {
-            super::super::lists::ensure_user_files(&s.lists).unwrap();
-            for host in ["youtube.com", "discord.com", "x.com"] {
-                if let Ok(r) = borrow_rule(&paths, s, vec![host.to_string()], "test") {
-                    assert!(r.tcp.is_empty() || r.tcp.split(' ').any(|t| t.starts_with("--dpi-desync=")), "{} {host}: {}", s.name, r.tcp);
-                    assert!(r.udp.is_empty() || r.udp.split(' ').any(|t| t.starts_with("--dpi-desync=")), "{} {host}: {}", s.name, r.udp);
-                    let args = format!("--wf-tcp=80,443 --wf-udp=443 {}", profiles(std::slice::from_ref(&r), &bin));
-                    let (ok, log) = dry(&args);
-                    assert!(ok, "{} {host}: {log}", s.name);
-                    borrowed += 1;
-                }
-            }
-        }
-        assert!(borrowed > 10, "{borrowed}");
-        let mut checked = 0;
-        for s in strategy::discover(&paths).iter().filter(|s| s.engine == paths.engine()) {
-            super::super::lists::ensure_user_files(&s.lists).unwrap();
-            let args = inject(&strategy::extract_args(s, &paths, &GameFilter::default()).unwrap(), &all, &bin);
-            let (ok, log) = dry(&args);
-            assert!(ok, "{}: {log}", s.name);
-            checked += 1;
-        }
-        assert!(checked > 5, "{checked}");
-        let exp: Vec<Strategy> = strategy::discover(&paths).into_iter().filter(|s| s.category == crate::core::EXPERIMENTAL).collect();
-        assert!(exp.len() >= 11 && exp.iter().all(|s| s.lists == paths.exp_lists() && s.bin == paths.bin()), "{exp:?}");
-    }
 }

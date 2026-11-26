@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
+pub const EVENT_BIND: u32 = 3;
 pub const EVENT_CONNECT: u32 = 4;
 pub const EVENT_CLOSE: u32 = 7;
 const REFRESH: Duration = Duration::from_millis(250);
@@ -117,6 +118,36 @@ pub fn tcp_table() -> Vec<(Conn, u32)> {
     out
 }
 
+pub fn udp_table() -> Vec<(u16, u32)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedUdpTable, UDP_TABLE_OWNER_PID};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    let mut out = Vec::new();
+    for (family, row, port_at) in [(AF_INET, 12usize, 4usize), (AF_INET6, 28usize, 20usize)] {
+        let mut size = 0u32;
+        unsafe {
+            GetExtendedUdpTable(std::ptr::null_mut(), &mut size, 0, family as u32, UDP_TABLE_OWNER_PID, 0);
+            if size == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; size as usize + 4096];
+            size = buf.len() as u32;
+            if GetExtendedUdpTable(buf.as_mut_ptr() as _, &mut size, 0, family as u32, UDP_TABLE_OWNER_PID, 0) != 0 {
+                continue;
+            }
+            let n = u32_at(&buf, 0) as usize;
+            for i in 0..n {
+                let r = 4 + i * row;
+                if r + row > buf.len() {
+                    break;
+                }
+                let b = &buf[r..r + row];
+                out.push((u16::from_be_bytes([b[port_at], b[port_at + 1]]), u32_at(b, row - 4)));
+            }
+        }
+    }
+    out
+}
+
 pub fn process_names() -> HashMap<u32, String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
@@ -141,6 +172,9 @@ pub fn process_names() -> HashMap<u32, String> {
 
 pub struct ProcMap {
     conns: HashMap<Conn, (u32, Source)>,
+    udp: HashMap<u16, (u32, Source)>,
+    udp_at: Option<Instant>,
+    udp_table: Box<dyn FnMut() -> Vec<(u16, u32)> + Send>,
     pub system_events: u64,
     names: HashMap<u32, String>,
     table_at: Option<Instant>,
@@ -151,13 +185,49 @@ pub struct ProcMap {
 
 impl ProcMap {
     pub fn new(table: Box<dyn FnMut() -> Vec<(Conn, u32)> + Send>, snapshot: Box<dyn FnMut() -> HashMap<u32, String> + Send>) -> Self {
-        let mut m = ProcMap { conns: HashMap::new(), system_events: 0, names: HashMap::new(), table_at: None, names_at: None, table, snapshot };
+        let mut m = ProcMap {
+            conns: HashMap::new(),
+            udp: HashMap::new(),
+            udp_at: None,
+            udp_table: Box::new(Vec::new),
+            system_events: 0,
+            names: HashMap::new(),
+            table_at: None,
+            names_at: None,
+            table,
+            snapshot,
+        };
         m.reload_table(Instant::now());
         m
     }
 
     pub fn system() -> Self {
-        ProcMap::new(Box::new(tcp_table), Box::new(process_names))
+        ProcMap::new(Box::new(tcp_table), Box::new(process_names)).with_udp_table(Box::new(udp_table))
+    }
+
+    pub fn with_udp_table(mut self, table: Box<dyn FnMut() -> Vec<(u16, u32)> + Send>) -> Self {
+        self.udp_table = table;
+        self
+    }
+
+    pub fn udp_pid(&mut self, local_port: u16, now: Instant) -> Option<(u32, Source)> {
+        if let Some(p) = self.udp.get(&local_port) {
+            return Some(*p);
+        }
+        if self.udp_at.is_none_or(|t| now.duration_since(t) >= MISS_REFRESH) {
+            self.udp_at = Some(now);
+            for (port, pid) in (self.udp_table)() {
+                if !SYSTEM_PIDS.contains(&pid) {
+                    self.udp.entry(port).or_insert((pid, Source::Table));
+                }
+            }
+        }
+        self.udp.get(&local_port).copied()
+    }
+
+    pub fn udp_owner(&mut self, local_port: u16, now: Instant) -> Option<Owner> {
+        let (pid, source) = self.udp_pid(local_port, now)?;
+        Some(Owner { pid, name: self.name(pid, now), source })
     }
 
     fn reload_table(&mut self, now: Instant) {
@@ -171,6 +241,18 @@ impl ProcMap {
 
     pub fn on_event(&mut self, ev: &SocketEvent) {
         if !ev.tcp {
+            match ev.event {
+                EVENT_BIND | EVENT_CONNECT if !SYSTEM_PIDS.contains(&ev.pid) && ev.conn.local_port != 0 => {
+                    if self.udp.len() >= 65536 {
+                        self.udp.clear();
+                    }
+                    self.udp.insert(ev.conn.local_port, (ev.pid, Source::Event));
+                }
+                EVENT_CLOSE => {
+                    self.udp.remove(&ev.conn.local_port);
+                }
+                _ => {}
+            }
             return;
         }
         match ev.event {

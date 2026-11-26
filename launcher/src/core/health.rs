@@ -101,7 +101,7 @@ pub fn auto_pick(
         }
     }
     if idx.is_empty() {
-        anyhow::bail!("нет стратегий для подбора");
+        anyhow::bail!("нет bin\\RayOfLight.exe, подбирать нечего");
     }
     let list: Vec<_> = idx.into_iter().map(|i| all[i].clone()).collect();
     let targets = picker::load_targets(paths);

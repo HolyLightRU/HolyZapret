@@ -5,7 +5,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 
-pub const ENGINES: [&str; 2] = ["HolyZapret.exe", "winws.exe"];
+pub const ENGINES: [&str; 3] = ["HolyZapret.exe", "winws.exe", "RayOfLight.exe"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proc {
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn folders() {
-        assert!(under(Path::new(r"C:\HZ\flowseal\bin\winws.exe"), Path::new(r"C:\hz")));
+        assert!(under(Path::new(r"C:\HZ\bin\winws.exe"), Path::new(r"C:\hz")));
         assert!(under(Path::new(r"\\?\C:\HZ\bin\HolyZapret.exe"), Path::new(r"C:\HZ\")));
         assert!(!under(Path::new(r"C:\HZ2\bin\winws.exe"), Path::new(r"C:\HZ")));
         assert_eq!(install_dir(Path::new(r"C:\zapret\bin\winws.exe")), PathBuf::from(r"C:\zapret"));

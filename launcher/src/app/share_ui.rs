@@ -1,7 +1,7 @@
 use super::{App, Msg, notify, send};
 use crate::core::share::{self, Share};
 use crate::core::strategy::Strategy;
-use crate::core::{flowseal, gamefilter, service};
+use crate::core::{gamefilter, service};
 use crate::log::Lvl;
 use crate::theme;
 use eframe::egui::{self, Color32, CornerRadius, RichText};
@@ -38,7 +38,7 @@ fn sample(items: &[String]) -> String {
 fn summary(sh: &Share) -> String {
     let mut parts = Vec::new();
     if let Some(s) = &sh.strategy {
-        parts.push(format!("стратегия «{}»", short_name(s)));
+        parts.push(format!("вариант «{}»", short_name(s)));
     }
     let n = sh.list_count();
     if n > 0 {
@@ -95,8 +95,8 @@ impl App {
     }
 
     fn apply_share(&mut self, ctx: &egui::Context) {
-        if self.trial.is_some() || self.picker.running() {
-            self.toast(ctx, Lvl::Info, "Сначала остановите пробный запуск и подбор");
+        if self.picker.running() {
+            self.toast(ctx, Lvl::Info, "Сначала остановите подбор");
             return;
         }
         let Some(pv) = self.share.preview.take() else { return };
@@ -128,7 +128,7 @@ impl App {
             }
             if let Some(s) = target {
                 match service::install(p, &s) {
-                    Ok(_) => done.push(format!("служба запущена со стратегией «{}»", s.name)),
+                    Ok(_) => done.push(format!("служба запущена с «{}»", s.name)),
                     Err(e) => notify(tx, Lvl::Err, format!("Службу не удалось установить: {e}")),
                 }
             }
@@ -183,18 +183,13 @@ impl App {
                     if let Some(id) = &pv.share.strategy {
                         match &pv.found {
                             Some(s) => {
-                                ui.checkbox(&mut pv.use_strategy, format!("Стратегия «{}»: служба переустановится с ней", s.name));
+                                ui.checkbox(&mut pv.use_strategy, format!("Вариант «{}»: служба переустановится с ним", s.name));
                                 ui.indent("s", |ui| {
-                                    ui.add(muted("Стратегию подбирали под провайдера друга. Если у вас другой провайдер, она может не подойти, тогда запустите подбор."));
+                                    ui.add(muted("Вариант подбирали под провайдера друга. Если у вас другой провайдер, он может не подойти, тогда запустите подбор."));
                                 });
                             }
                             None => {
-                                let hint = if id.to_lowercase().starts_with(&format!("{}\\", flowseal::DIR)) {
-                                    "скачайте стратегии Flowseal в Настройках и вставьте код ещё раз"
-                                } else {
-                                    "обновите HolyZapret и вставьте код ещё раз"
-                                };
-                                ui.add(egui::Label::new(RichText::new(format!("Стратегии «{}» у вас нет: {hint}", short_name(id))).color(theme::YELLOW).size(12.5)).wrap());
+                                ui.add(egui::Label::new(RichText::new(format!("Варианта «{}» у вас нет: обновите HolyZapret и вставьте код ещё раз", short_name(id))).color(theme::YELLOW).size(12.5)).wrap());
                             }
                         }
                         ui.add_space(4.0);

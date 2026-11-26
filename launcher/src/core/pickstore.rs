@@ -10,12 +10,6 @@ pub struct Score {
     pub failed: bool,
 }
 
-impl Score {
-    pub fn key(&self) -> (bool, std::cmp::Reverse<usize>, usize, u32) {
-        (self.failed, std::cmp::Reverse(self.ok), self.frozen, self.ms)
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LastPick {
     pub when: String,
@@ -111,7 +105,7 @@ mod tests {
         let back = parse(&to_text(&p));
         assert_eq!(back, p);
         let mut v: Vec<_> = back.scores.values().collect();
-        v.sort_by_key(|s| s.key());
+        v.sort_by_key(|s| (s.failed, std::cmp::Reverse(s.ok), s.frozen, s.ms));
         assert_eq!((v[0].ok, v[2].failed), (33, true));
     }
 }
