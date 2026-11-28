@@ -87,7 +87,7 @@ impl App {
             .inner_margin(egui::Margin::same(20));
         let modal = egui::Modal::new(egui::Id::NULL.with("confirm")).frame(frame).show(ctx, |ui| {
             ui.set_width(380.0);
-            ui.label(RichText::new(title).size(17.0).strong());
+            ui.label(RichText::new(title).font(crate::theme::semibold(17.0)).strong());
             ui.add_space(4.0);
             ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(190))).wrap());
             ui.add_space(14.0);
@@ -96,7 +96,7 @@ impl App {
                 if ui.add(danger).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Отмена").clicked() {
+                if crate::theme::button(ui, "Отмена").clicked() {
                     answer = Some(false);
                 }
             });
@@ -122,8 +122,11 @@ impl App {
                         Ok(m) => self.toast(ctx, Lvl::Ok, m),
                         Err(e) => self.toast(ctx, Lvl::Err, e.to_string()),
                     },
-                    Confirm::QuitSharing => crate::tray::exit(),
-                    Confirm::WarpBlocksCheck => self.warp_do(ctx, WarpAction::Disconnect),
+                    Confirm::QuitSharing => self.request_quit(ctx),
+                    Confirm::WarpBlocksCheck => {
+                        self.after_warp_armed = self.after_warp.is_some();
+                        self.warp_do(ctx, WarpAction::Disconnect);
+                    }
                 }
             }
             Some(false) => {

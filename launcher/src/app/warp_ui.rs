@@ -32,9 +32,17 @@ impl App {
                 WarpAction::Disconnect => warp::disconnect().map(|_| "WARP отключён".to_string()),
                 WarpAction::Mode(m) => warp::set_mode(m).map(|_| format!("Режим WARP: {}", m.label())),
             };
+            let disconnect = matches!(a, WarpAction::Disconnect);
             result_msg(tx, r, "WARP");
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            let _ = tx.send(Msg::Warp(warp::query()));
+            for _ in 0..if disconnect { 8 } else { 1 } {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let s = warp::query();
+                let done = s.conn == Conn::Disconnected;
+                let _ = tx.send(Msg::Warp(s));
+                if !disconnect || done {
+                    break;
+                }
+            }
         });
     }
 
@@ -73,31 +81,34 @@ impl App {
     fn warp_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &warp::State) {
         ui.add_enabled_ui(!self.busy, |ui| {
             if s.needs_setup {
-                if ui.button("Открыть WARP").clicked() {
+                if crate::theme::button(ui, "Открыть WARP").clicked() {
                     warp::open_app();
                 }
             } else if matches!(s.conn, Conn::Connected | Conn::Connecting) {
-                if ui.button("Отключить").clicked() {
+                if crate::theme::button(ui, "Отключить").clicked() {
                     self.warp_do(ctx, WarpAction::Disconnect);
                 }
-            } else if ui.button("Подключить").clicked() {
+            } else if crate::theme::button(ui, "Подключить").clicked() {
                 self.warp_connect(ctx);
             }
         });
     }
 
-    pub(super) fn warp_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(super) fn warp_line(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(s) = self.warp.clone().filter(|w| w.installed) else { return };
-        theme::card(ui, |ui| {
-            theme::row(ui, 34.0, |ui| {
-                ui.label(RichText::new(theme::icon::CLOUD).font(theme::icon_font(18.0)).color(CYAN));
-                ui.add_space(2.0);
-                ui.label(RichText::new("Cloudflare WARP").strong());
-                conn_chip(ui, &s);
-                ui.label(RichText::new(s.mode.label()).color(Color32::from_gray(150)).size(12.5));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.warp_buttons(ui, ctx, &s);
-                });
+        ui.add_space(10.0);
+        let y = ui.cursor().top();
+        let x = ui.max_rect().x_range();
+        ui.painter().hline(x, y, egui::Stroke::new(1.0, Color32::from_white_alpha(12)));
+        ui.add_space(8.0);
+        theme::row(ui, 34.0, |ui| {
+            ui.label(RichText::new(theme::icon::CLOUD).font(theme::icon_font(17.0)).color(CYAN));
+            ui.add_space(2.0);
+            ui.label(RichText::new("Cloudflare WARP").strong());
+            conn_chip(ui, &s);
+            ui.label(RichText::new(s.mode.label()).color(Color32::from_gray(165)).size(13.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.warp_buttons(ui, ctx, &s);
             });
         });
     }
@@ -108,14 +119,14 @@ impl App {
             theme::row(ui, 32.0, |ui| {
                 ui.label(RichText::new(theme::icon::CLOUD).font(theme::icon_font(17.0)).color(CYAN));
                 ui.add_space(2.0);
-                ui.label(RichText::new("Cloudflare WARP").size(15.5).strong());
+                ui.label(RichText::new("Cloudflare WARP").font(crate::theme::semibold(15.5)).strong());
                 if s.installed {
                     conn_chip(ui, &s);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if s.installed {
                         self.warp_buttons(ui, ctx, &s);
-                    } else if ui.button("Скачать с сайта Cloudflare").clicked() {
+                    } else if crate::theme::button(ui, "Скачать с сайта Cloudflare").clicked() {
                         ctx.open_url(egui::OpenUrl::new_tab(warp::DOWNLOAD_URL));
                     }
                 });

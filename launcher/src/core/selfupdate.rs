@@ -341,7 +341,8 @@ fn install_zip(paths: &Paths, bytes: &[u8], version: &str) -> anyhow::Result<Sum
 
 const LEGACY_DIRS: [&str; 2] = ["additional", "experimental"];
 const RETIRED: [&str; 3] = ["auto_update.bat", "general.bat", "MAX.bat"];
-const RETIRED_PATHS: [&str; 10] = [
+const RETIRED_PATHS: [&str; 11] = [
+    "bin/cygwin1.dll",
     "utils/optimal_strategies.txt",
     "utils/test zapret.ps1",
     "bin/4pda.bin",

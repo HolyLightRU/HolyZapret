@@ -102,7 +102,7 @@ impl<A: Clone> Engine<A> {
             if tech != UDP_ROTATION[0] {
                 self.stats.handled += 1;
             }
-            self.upending.insert(key, Pending { host: Some(host), tech, since: now, id, ack0: None, dcid: None, bg: false });
+            self.upending.insert(key, Pending { host: Some(host), tech, since: now, id, ack0: None, dcid: None, bg: false, node: None, fname: None });
         }
         if tech != UDP_ROTATION[0] {
             self.stats.game_udp += 1;
@@ -198,7 +198,7 @@ impl<A: Clone> Engine<A> {
             return false;
         }
         let Some(idx) = UDP_ROTATION.iter().position(|t| *t == tech) else { return false };
-        self.umemory.insert(host.to_string(), Memory { idx, ok, fails, streak: 0 });
+        self.umemory.insert(host.to_string(), Memory { idx, ok, fails, ..Default::default() });
         true
     }
 

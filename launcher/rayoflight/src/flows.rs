@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 mod freeze;
 mod quicflow;
+mod store;
 mod udpauto;
 
-pub use freeze::{FREEZE_HI, FREEZE_LO, FREEZE_STALL};
+pub use freeze::{FETCH_WANT, FREEZE_HI, FREEZE_LO, FREEZE_STALL, Fetch, fetch_verdict};
 pub use quicflow::{QuicCfg, QuicMode};
 pub use udpauto::{UDP_KEY, UDP_ROTATION, UDP_SWITCH_AFTER, UDP_WHY, UDP_WINDOW, udp_key};
 
@@ -47,6 +48,11 @@ struct Flow<A> {
     hops: Option<u8>,
     srv_isn: Option<u32>,
     watch: Option<freeze::Watch>,
+    sent: Option<(u32, &'static str)>,
+    redo: Option<&'static str>,
+    resent: u8,
+    wscale: Option<u8>,
+    wss: u8,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,14 +102,38 @@ pub struct Stats {
     pub game_udp: u64,
     pub auto_added: u64,
     pub flushed: u64,
+    pub resent: u64,
     pub app_skipped: u64,
     pub app_all: u64,
     pub answered: u64,
     pub reset: u64,
     pub silent: u64,
     pub frozen: u64,
+    pub rst_filter: u64,
+    pub rst_server: u64,
+    pub rst_far: u64,
+    pub rst_blind: u64,
     pub by_tech: BTreeMap<&'static str, TechStats>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RstFrom {
+    Filter,
+    Server,
+    Far,
+    Blind,
+}
+
+pub fn reset_from(rst_hops: u8, server_hops: Option<u8>) -> RstFrom {
+    let Some(server) = server_hops else { return RstFrom::Blind };
+    match server as i16 - rst_hops as i16 {
+        d if d >= 2 => RstFrom::Filter,
+        d if d <= -2 => RstFrom::Far,
+        _ => RstFrom::Server,
+    }
+}
+
+const RST_NOTES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -121,7 +151,7 @@ impl Mode {
             let mut list = vec![
                 desync::GENERAL,
                 desync::SNI_SPLIT,
-                desync::SNI_MAX,
+                desync::POOLED,
                 desync::NONE,
                 desync::TTL,
                 desync::DISORDER,
@@ -161,9 +191,31 @@ pub struct Memory {
     pub ok: u32,
     pub fails: u32,
     pub streak: u32,
+    pub hint: bool,
 }
 
 pub const SWITCH_AFTER: u32 = 2;
+pub const NODE: &str = "node:";
+pub const STAT: &str = "stat:";
+pub const NAME: &str = "name:";
+pub const SITE_NAME: &str = "fakename:";
+pub const QUIET_APPS: [&str; 2] = ["holyzapret launcher.exe", "holyzapret-launcher.exe"];
+const SAME_SKIP: usize = 40;
+pub const NODE_TRUST: u32 = 2;
+
+pub fn node_key(ip: &IpAddr) -> String {
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            format!("{NODE}{}.{}.{}", o[0], o[1], o[2])
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            format!("{NODE}{:x}:{:x}:{:x}", s[0], s[1], s[2])
+        }
+    }
+}
+const RESEND_MAX: u8 = 3;
 
 pub fn site_base(host: &str) -> Option<&str> {
     let labels: Vec<&str> = host.split('.').collect();
@@ -184,6 +236,8 @@ struct Pending {
     ack0: Option<u32>,
     dcid: Option<Vec<u8>>,
     bg: bool,
+    node: Option<IpAddr>,
+    fname: Option<&'static str>,
 }
 
 struct Target {
@@ -235,7 +289,7 @@ pub struct Engine<A> {
     app_of: Option<AppLookup>,
     mode: Mode,
     pending: HashMap<Key, Pending>,
-    memory: HashMap<String, Memory>,
+    memory: store::Store,
     next_id: u64,
     pub verbose: bool,
     pub track: bool,
@@ -248,10 +302,18 @@ pub struct Engine<A> {
     game_seen: HashMap<Key, (u32, Instant)>,
     pub autolist: bool,
     pub forward: bool,
-    qmemory: HashMap<String, Memory>,
+    qmemory: store::Store,
+    nodes: store::Store,
     auto_fails: HashMap<String, (u32, Instant)>,
     auto_new: Vec<String>,
     fail_log: HashMap<String, Vec<(Instant, &'static str, bool)>>,
+    rst_noted: HashSet<String>,
+    rank: HashMap<&'static str, (u32, u32)>,
+    delayed: Vec<(Instant, Vec<(Vec<u8>, A)>)>,
+    name_rank: HashMap<&'static str, (u32, u32)>,
+    site_names: HashMap<String, &'static str>,
+    tried_names: HashMap<String, Vec<&'static str>>,
+    burned: HashMap<String, Vec<&'static str>>,
     redeemed: Vec<Instant>,
     targets: HashMap<String, Target>,
     bg_ports: HashSet<u16>,
@@ -263,6 +325,7 @@ pub struct Engine<A> {
     ulast_ok: HashMap<String, Instant>,
     warp: Option<std::sync::Arc<crate::warp::Shared>>,
     frozen: freeze::FrozenMap,
+    later: Vec<String>,
     flush_dns: bool,
     pub dns_alt: bool,
 }
@@ -277,7 +340,7 @@ impl<A: Clone> Engine<A> {
             app_of: None,
             mode: Mode::Fixed(desync::GENERAL),
             pending: HashMap::new(),
-            memory: HashMap::new(),
+            memory: store::Store::new(),
             next_id: 0,
             verbose: false,
             track: false,
@@ -290,10 +353,18 @@ impl<A: Clone> Engine<A> {
             game_seen: HashMap::new(),
             autolist: false,
             forward: false,
-            qmemory: HashMap::new(),
+            qmemory: store::Store::new(),
+            nodes: store::Store::with_limit(MAX_MEMORY),
             auto_fails: HashMap::new(),
             auto_new: Vec::new(),
             fail_log: HashMap::new(),
+            rst_noted: HashSet::new(),
+            rank: HashMap::new(),
+            delayed: Vec::new(),
+            name_rank: HashMap::new(),
+            site_names: HashMap::new(),
+            tried_names: HashMap::new(),
+            burned: HashMap::new(),
             redeemed: Vec::new(),
             targets: HashMap::new(),
             bg_ports: HashSet::new(),
@@ -305,6 +376,7 @@ impl<A: Clone> Engine<A> {
             ulast_ok: HashMap::new(),
             warp: None,
             frozen: HashMap::new(),
+            later: Vec::new(),
             flush_dns: false,
             dns_alt: false,
         }
@@ -485,6 +557,8 @@ impl<A: Clone> Engine<A> {
             }
         }
         self.warp = Some(shared);
+        let later = std::mem::take(&mut self.later);
+        self.load_memory(&later.join("\n"));
         self
     }
 
@@ -493,7 +567,7 @@ impl<A: Clone> Engine<A> {
         let id = self.record(&host, &owner, true, crate::warp::WHY, Some(desync::WARP.name));
         self.stats.handled += 1;
         self.stats.by_tech.entry(desync::WARP.name).or_default().used += 1;
-        let p = Pending { host, tech: desync::WARP.name, since: now, id, ack0: None, dcid: None, bg: false };
+        let p = Pending { host, tech: desync::WARP.name, since: now, id, ack0: None, dcid: None, bg: false, node: None, fname: None };
         self.settle(p, outcome);
     }
 
@@ -511,13 +585,100 @@ impl<A: Clone> Engine<A> {
         &self.mode
     }
 
-    fn choose(&mut self, host: Option<&str>) -> Technique {
+    fn choose(&mut self, host: Option<&str>, addr: Option<&IpAddr>) -> Technique {
         match &self.mode {
             Mode::Fixed(t) => *t,
             Mode::Adaptive(list) => {
-                let m = host.and_then(|h| self.memory_for(h)).unwrap_or_default();
+                let m = host.and_then(|h| self.memory_for(h)).or_else(|| self.node_hint(addr)).unwrap_or_default();
                 list[m.idx % list.len()]
             }
+        }
+    }
+
+    fn node_hint(&self, addr: Option<&IpAddr>) -> Option<Memory> {
+        let Mode::Adaptive(list) = &self.mode else { return None };
+        let m = self.nodes.get(&node_key(addr?))?;
+        let trusted = m.ok >= NODE_TRUST && m.streak == 0 && m.idx < list.len() && list[m.idx].name != desync::WARP.name;
+        trusted.then(|| Memory { idx: m.idx, hint: m.idx != 0, ..Default::default() })
+    }
+
+    pub fn fake_name(&self, host: Option<&str>) -> &'static str {
+        if let Some(mut h) = host {
+            loop {
+                if let Some(n) = self.site_names.get(h) {
+                    return n;
+                }
+                let Some((_, rest)) = h.split_once('.') else { break };
+                if !rest.contains('.') {
+                    break;
+                }
+                h = rest;
+            }
+        }
+        let tried = host.and_then(|h| self.tried_names.get(h));
+        let score = |n: &str| {
+            let (ok, fails) = self.name_rank.get(n).copied().unwrap_or_default();
+            (ok as f32 + 1.0) / ((ok + fails) as f32 + 2.0)
+        };
+        desync::FAKE_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !tried.is_some_and(|t| t.contains(n)))
+            .max_by(|a, b| score(a.1).total_cmp(&score(b.1)).then_with(|| b.0.cmp(&a.0)))
+            .map(|(_, n)| *n)
+            .unwrap_or(desync::FAKE_NAMES[0])
+    }
+
+    fn plan(&mut self, first: &packet::Tcp, hello: &[u8], tech: &Technique, hops: Option<u8>, host: Option<&str>) -> (Option<desync::Out>, Option<&'static str>) {
+        if !tech.pooled {
+            return (desync::first_segment(first, hello, &self.cfg, tech, hops, &mut *self.rnd), None);
+        }
+        let name = self.fake_name(host);
+        let blob = desync::named_fake(&self.cfg, tech, hello, name, &mut *self.rnd);
+        (desync::first_segment_with(first, hello, &self.cfg, tech, hops, Some(&blob), &mut *self.rnd), Some(name))
+    }
+
+    fn rank_of(&self, name: &str) -> f32 {
+        let (ok, fails) = self.rank.get(name).copied().unwrap_or_default();
+        (ok as f32 + 1.0) / ((ok + fails) as f32 + 2.0)
+    }
+
+    fn next_idx(&self, host: &str, cur: usize, list: &[Technique]) -> usize {
+        let n = list.len();
+        let burned = self.burned.get(host);
+        let fresh = |i: &usize| *i != cur && !burned.is_some_and(|b| b.contains(&list[*i].name));
+        let best = (0..n)
+            .filter(fresh)
+            .filter(|i| list[*i].name != desync::WARP.name)
+            .max_by(|a, b| self.rank_of(list[*a].name).total_cmp(&self.rank_of(list[*b].name)).then_with(|| b.cmp(a)));
+        best.or_else(|| (0..n).filter(fresh).find(|i| list[*i].name == desync::WARP.name)).unwrap_or((cur + 1) % n)
+    }
+
+    fn node_learn(&mut self, addr: &IpAddr, idx: usize, outcome: Outcome) {
+        let key = node_key(addr);
+        match outcome {
+            Outcome::Answered => {
+                let m = self.nodes.entry_or(&key, || Memory { idx, ..Default::default() });
+                if m.idx == idx {
+                    m.ok += 1;
+                    m.streak = 0;
+                } else if m.ok <= 1 {
+                    *m = Memory { idx, ok: 1, ..Default::default() };
+                } else {
+                    m.ok -= 1;
+                }
+            }
+            Outcome::Reset | Outcome::Silent => {
+                if let Some(m) = self.nodes.get_mut(&key).filter(|m| m.idx == idx) {
+                    m.fails += 1;
+                    m.streak += 1;
+                    if m.streak >= SWITCH_AFTER {
+                        m.ok = 0;
+                        m.streak = 0;
+                    }
+                }
+            }
+            Outcome::Frozen => {}
         }
     }
 
@@ -538,11 +699,9 @@ impl<A: Clone> Engine<A> {
 
     fn sibling_memory(&self, host: &str) -> Option<Memory> {
         let Mode::Adaptive(list) = &self.mode else { return None };
-        let tail = format!(".{}", site_base(host)?);
-        let base = &tail[1..];
         self.memory
-            .iter()
-            .filter(|(h, m)| (h.ends_with(&tail) || h.as_str() == base) && m.ok > 0 && m.streak == 0 && list[m.idx % list.len()].name != desync::NONE.name)
+            .siblings(site_base(host)?)
+            .filter(|(_, m)| m.ok > 0 && m.streak == 0 && list[m.idx % list.len()].name != desync::NONE.name)
             .max_by_key(|(h, m)| (m.ok, std::cmp::Reverse((*h).clone())))
             .map(|(_, m)| Memory { idx: m.idx, ..Default::default() })
     }
@@ -550,11 +709,20 @@ impl<A: Clone> Engine<A> {
     pub fn memory_text(&self) -> String {
         let mut rows: Vec<(String, String)> = Vec::new();
         if let Mode::Adaptive(list) = &self.mode {
-            rows.extend(self.memory.iter().map(|(h, m)| (h.clone(), format!("{}\t{}\t{}", list[m.idx % list.len()].name, m.ok, m.fails))));
+            rows.extend(self.memory.by_age().into_iter().map(|(h, m)| (h.clone(), format!("{}\t{}\t{}", list[m.idx % list.len()].name, m.ok, m.fails))));
+            let mut stat: Vec<(String, String)> = list.iter().filter_map(|t| self.rank.get(t.name).filter(|r| r.0 > 0).map(|r| (format!("{STAT}{}", t.name), format!("{}\t{}\t{}", t.name, r.0, r.1)))).collect();
+            stat.dedup();
+            rows.extend(stat);
+            rows.extend(desync::FAKE_NAMES.iter().filter_map(|n| self.name_rank.get(n).filter(|r| r.0 > 0).map(|r| (format!("{NAME}{n}"), format!("{}\t{}\t{}", desync::POOLED.name, r.0, r.1)))));
+            let mut names: Vec<(&String, &&str)> = self.site_names.iter().collect();
+            names.sort();
+            rows.extend(names.into_iter().map(|(h, n)| (format!("{SITE_NAME}{h}"), format!("{n}\t0\t0"))));
+            rows.extend(self.nodes.by_age().into_iter().filter(|(_, m)| m.ok >= NODE_TRUST).map(|(h, m)| (h.clone(), format!("{}\t{}\t{}", list[m.idx % list.len()].name, m.ok, m.fails))));
         }
         rows.extend(self.quic_memory_lines());
-        rows.extend(self.udp_memory_lines());
-        rows.sort();
+        let mut udp = self.udp_memory_lines();
+        udp.sort();
+        rows.extend(udp);
         rows.iter().map(|(h, rest)| format!("{h}\t{rest}\n")).collect()
     }
 
@@ -578,11 +746,43 @@ impl<A: Clone> Engine<A> {
                 n += self.quic_load(f[0], f[1], ok, fails) as usize;
                 continue;
             }
-            if self.memory.len() >= MAX_MEMORY {
+            if let Some(h) = f[0].strip_prefix(SITE_NAME) {
+                if let Some(n) = desync::FAKE_NAMES.iter().find(|n| **n == f[1]) {
+                    if self.site_names.len() < MAX_MEMORY {
+                        self.site_names.insert(h.to_string(), n);
+                    }
+                }
                 continue;
             }
-            let Some(idx) = list.iter().position(|t| t.name == f[1]) else { continue };
-            self.memory.insert(f[0].to_string(), Memory { idx, ok, fails, streak: 0 });
+            if let Some(name) = f[0].strip_prefix(NAME) {
+                if let Some(n) = desync::FAKE_NAMES.iter().find(|n| **n == name) {
+                    self.name_rank.insert(n, (ok, fails));
+                }
+                continue;
+            }
+            let named = desync::technique(f[1]).filter(|t| t.sni.is_some() && !list.iter().any(|x| x.name == t.name) && list.iter().any(|x| x.pooled));
+            let carried = named.and_then(|t| desync::FAKE_NAMES.iter().copied().find(|n| Some(*n) == t.sni));
+            let wanted_name = if named.is_some() { desync::POOLED.name } else { f[1] };
+            let Some(idx) = list.iter().position(|t| t.name == wanted_name) else {
+                if f[1] == desync::WARP.name && self.warp.is_none() && self.later.len() < MAX_MEMORY {
+                    self.later.push(line.to_string());
+                }
+                continue;
+            };
+            if f[0].starts_with(STAT) {
+                self.rank.insert(list[idx].name, (ok, fails));
+                continue;
+            }
+            if f[0].starts_with(NODE) {
+                self.nodes.insert(f[0], Memory { idx, ok, fails, ..Default::default() });
+                continue;
+            }
+            self.memory.insert(f[0], Memory { idx, ok, fails, ..Default::default() });
+            if let Some(c) = carried {
+                if !self.site_names.contains_key(f[0]) && self.site_names.len() < MAX_MEMORY {
+                    self.site_names.insert(f[0].to_string(), c);
+                }
+            }
             n += 1;
         }
         n
@@ -624,6 +824,8 @@ impl<A: Clone> Engine<A> {
         if let Some(d) = self.recent.iter_mut().rev().find(|d| d.id == p.id) {
             d.outcome = Some(outcome);
         }
+        let rescue = p.host.as_deref().is_some_and(|h| self.fail_log.get(h).is_some_and(|l| l.iter().any(|e| e.1 != p.tech)));
+        let failed_before = p.host.as_deref().is_some_and(|h| self.fail_log.get(h).is_some_and(|l| !l.is_empty()));
         if let Some(h) = p.host.as_deref().filter(|_| !p.tech.starts_with("quic-")) {
             self.note_outcome(h, p.tech, p.since, outcome, !p.bg);
         }
@@ -634,9 +836,54 @@ impl<A: Clone> Engine<A> {
         } else if let (Mode::Adaptive(list), Some(h)) = (&self.mode, &p.host) {
             let n = list.len();
             let cur = list.iter().position(|t| t.name == p.tech);
-            if self.memory.len() < MAX_MEMORY || self.memory.contains_key(h) {
-                let base = self.memory_for(h).map(|m| Memory { idx: m.idx, ..Default::default() }).unwrap_or_default();
-                let m = self.memory.entry(h.clone()).or_insert(base);
+            if let Some(c) = cur.filter(|_| rescue && outcome != Outcome::Frozen) {
+                let r = self.rank.entry(list[c].name).or_default();
+                if outcome == Outcome::Answered {
+                    r.0 = r.0.saturating_add(1);
+                } else {
+                    r.1 = r.1.saturating_add(1);
+                }
+            }
+            let next = cur.map(|c| self.next_idx(h, c, list));
+            let pooled = cur.is_some_and(|c| list[c].pooled);
+            let mut name_hold = false;
+            if let (true, Some(name)) = (pooled, p.fname) {
+                if failed_before && outcome != Outcome::Frozen {
+                    let r = self.name_rank.entry(name).or_default();
+                    if outcome == Outcome::Answered {
+                        r.0 = r.0.saturating_add(1);
+                    } else {
+                        r.1 = r.1.saturating_add(1);
+                    }
+                }
+                match outcome {
+                    Outcome::Answered => {
+                        if self.site_names.len() >= MAX_MEMORY && !self.site_names.contains_key(h.as_str()) {
+                            self.site_names.clear();
+                        }
+                        self.site_names.insert(h.clone(), name);
+                        self.tried_names.remove(h.as_str());
+                    }
+                    Outcome::Frozen => {}
+                    _ => {
+                        if self.site_names.get(h.as_str()) == Some(&name) {
+                            self.site_names.remove(h.as_str());
+                        }
+                        if self.tried_names.len() >= MAX_MEMORY && !self.tried_names.contains_key(h.as_str()) {
+                            self.tried_names.clear();
+                        }
+                        let t = self.tried_names.entry(h.clone()).or_default();
+                        if !t.contains(&name) {
+                            t.push(name);
+                        }
+                        name_hold = t.len() < desync::NAME_TRIES;
+                    }
+                }
+            }
+            let mut switched = false;
+            {
+                let base = self.memory_for(h).map(|m| Memory { idx: m.idx, ..Default::default() }).or_else(|| self.node_hint(p.node.as_ref())).unwrap_or_default();
+                let m = self.memory.entry_or(h, || base);
                 if outcome == Outcome::Answered {
                     m.ok += 1;
                     if cur == Some(m.idx % n) {
@@ -646,11 +893,36 @@ impl<A: Clone> Engine<A> {
                     m.fails += 1;
                     if cur == Some(m.idx % n) {
                         m.streak += 1;
-                        if m.streak >= SWITCH_AFTER {
-                            m.idx = (m.idx + 1) % n;
+                        if pooled && name_hold && !m.hint {
                             m.streak = 0;
                         }
+                        if m.streak >= SWITCH_AFTER || (pooled && !name_hold && !m.hint) {
+                            m.idx = if m.hint { 0 } else { next.unwrap_or((m.idx + 1) % n) };
+                            m.hint = false;
+                            m.streak = 0;
+                            switched = true;
+                        }
                     }
+                }
+            }
+            if switched && pooled {
+                self.tried_names.remove(h.as_str());
+            }
+            if let Some(c) = cur.filter(|_| switched) {
+                if self.burned.len() >= MAX_MEMORY && !self.burned.contains_key(h.as_str()) {
+                    self.burned.clear();
+                }
+                let b = self.burned.entry(h.clone()).or_default();
+                if !b.contains(&list[c].name) {
+                    b.push(list[c].name);
+                }
+                if b.len() >= n {
+                    self.burned.remove(h.as_str());
+                }
+            }
+            if let (Some(ip), Some(c)) = (p.node, cur) {
+                if list[c].name != desync::WARP.name {
+                    self.node_learn(&ip, c, outcome);
                 }
             }
         }
@@ -692,8 +964,34 @@ impl<A: Clone> Engine<A> {
         };
         let _ = now;
         if let Some(p) = self.pending.remove(&key) {
+            if outcome == Outcome::Reset && !p.bg && p.tech != PROBE {
+                self.classify_reset(&key, &p, t.ttl);
+            }
             self.settle(p, outcome);
         }
+    }
+
+    fn classify_reset(&mut self, key: &Key, p: &Pending, ttl: u8) {
+        let rst = packet::hops(ttl);
+        let server = self.flows.get(key).and_then(|f| f.hops);
+        let from = reset_from(rst, server);
+        match from {
+            RstFrom::Filter => self.stats.rst_filter += 1,
+            RstFrom::Server => self.stats.rst_server += 1,
+            RstFrom::Far => self.stats.rst_far += 1,
+            RstFrom::Blind => self.stats.rst_blind += 1,
+        }
+        let Some(host) = p.host.as_deref() else { return };
+        if from == RstFrom::Blind || self.rst_noted.len() >= RST_NOTES || !self.rst_noted.insert(host.to_string()) {
+            return;
+        }
+        let who = match from {
+            RstFrom::Filter => "от фильтра на пути",
+            RstFrom::Server => "от самого сервера",
+            _ => "дальше сервера",
+        };
+        let server = server.map(|s| s.to_string()).unwrap_or_default();
+        self.notes.push(format!("сброс: {host} — {who} (узлов до сброса {rst}, до сервера {server}), приём {}", p.tech));
     }
 
     pub fn pending(&self) -> usize {
@@ -710,6 +1008,19 @@ impl<A: Clone> Engine<A> {
         let id = self.next_id;
         if !self.track {
             return id;
+        }
+        if !handled {
+            let app = owner.as_ref().and_then(|o| o.name.as_deref());
+            if app.is_some_and(|a| QUIET_APPS.contains(&a)) {
+                return id;
+            }
+            let same = self.recent.iter_mut().rev().take(SAME_SKIP).find(|d| !d.handled && d.why == why && d.host == *host && d.app.as_deref() == app);
+            if let Some(d) = same {
+                d.time = (self.clock)();
+                d.outcome = None;
+                self.next_id -= 1;
+                return d.id;
+            }
         }
         if self.recent.len() >= RECENT {
             self.recent.pop_front();
@@ -783,11 +1094,16 @@ impl<A: Clone> Engine<A> {
             if self.flows.len() >= MAX_FLOWS {
                 self.evict(now);
             }
-            self.flows.insert(key, Flow { isn: Some(t.seq), stage: Stage::Fresh, last: now, hops: None, srv_isn: None, watch: None });
+            self.flows.insert(key, Flow { isn: Some(t.seq), stage: Stage::Fresh, last: now, hops: None, srv_isn: None, watch: None, sent: None, redo: None, resent: 0, wscale: packet::wscale(&t), wss: 0 });
             return Action::Pass;
         }
         let data = t.payload();
         if data.is_empty() {
+            if let Some(f) = self.flows.get_mut(&key).filter(|f| f.wss > 0) {
+                f.wss -= 1;
+                f.last = now;
+                return Action::Send(vec![(packet::with_window(raw, desync::wss_window(f.wscale)), meta)]);
+            }
             return Action::Pass;
         }
         let tls_port = self.tls_port(t.dport);
@@ -798,14 +1114,23 @@ impl<A: Clone> Engine<A> {
             if self.flows.len() >= MAX_FLOWS {
                 self.evict(now);
             }
-            self.flows.insert(key, Flow { isn: None, stage: Stage::Fresh, last: now, hops: None, srv_isn: None, watch: None });
+            self.flows.insert(key, Flow { isn: None, stage: Stage::Fresh, last: now, hops: None, srv_isn: None, watch: None, sent: None, redo: None, resent: 0, wscale: None, wss: 0 });
         }
         let flow = self.flows.get_mut(&key).unwrap();
         flow.last = now;
         let stage = std::mem::replace(&mut flow.stage, Stage::Done);
         match stage {
             Stage::Done => {
-                self.watch_out(&key, t.seq, t.ack, data.len() as u32, now);
+                let again = self.flows.get(&key).and_then(|f| f.sent).filter(|(seq, _)| *seq == t.seq);
+                if let Some((_, tech)) = again.filter(|_| tls_port && tls::is_client_hello(data)) {
+                    return self.resend_hello(key, tech, raw, t.seq, data, meta, now);
+                }
+                if let Some(f) = self.flows.get_mut(&key) {
+                    f.wss = 0;
+                }
+                if data.len() > 1 {
+                    self.watch_out(&key, t.seq, t.ack, data.len() as u32, now);
+                }
                 Action::Pass
             }
             Stage::Fresh => {
@@ -842,12 +1167,45 @@ impl<A: Clone> Engine<A> {
                 let next_seq = next_seq.wrapping_add(data.len() as u32);
                 if buf.len() >= need {
                     buf.truncate(need);
+                    if let Some(tech) = flow.redo.take() {
+                        return self.redo(&key, tech, &buf, held);
+                    }
                     return self.decide(&buf, held, now);
                 }
                 flow.stage = Stage::Reasm { need, buf, held, next_seq, since };
                 Action::Hold
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resend_hello(&mut self, key: Key, tech: &'static str, raw: &[u8], seq: u32, data: &[u8], meta: A, now: Instant) -> Action<A> {
+        let Some(need) = tls::record_len(data).filter(|n| *n <= MAX_REASM) else { return Action::Pass };
+        let Some(f) = self.flows.get_mut(&key) else { return Action::Pass };
+        if f.resent >= RESEND_MAX {
+            return Action::Pass;
+        }
+        f.resent += 1;
+        if data.len() >= need {
+            return self.redo(&key, tech, &data[..need], vec![(packet::fixed(raw), meta)]);
+        }
+        f.redo = Some(tech);
+        f.stage = Stage::Reasm { need, buf: data.to_vec(), held: vec![(packet::fixed(raw), meta)], next_seq: seq.wrapping_add(data.len() as u32), since: now };
+        Action::Hold
+    }
+
+    fn redo(&mut self, key: &Key, tech: &'static str, hello: &[u8], held: Vec<(Vec<u8>, A)>) -> Action<A> {
+        let raw0 = held[0].0.clone();
+        let Some(first) = packet::parse(&raw0) else { return Action::Send(held) };
+        let technique = desync::technique(tech).unwrap_or(desync::GENERAL);
+        let hops = self.flows.get(key).and_then(|f| f.hops);
+        let host = tls::sni(hello);
+        let Some(out) = self.plan(&first, hello, &technique, hops, host.as_deref()).0 else { return Action::Send(held) };
+        self.stats.resent += 1;
+        let meta = held[0].1.clone();
+        let mut sends: Vec<(Vec<u8>, A)> = out.packets.into_iter().map(|p| (p, meta.clone())).collect();
+        sends.extend(held.into_iter().skip(1));
+        Action::Send(sends)
     }
 
     fn tls_port(&self, port: u16) -> bool {
@@ -889,7 +1247,7 @@ impl<A: Clone> Engine<A> {
             self.note(format!("пропущен {who}: {why}"));
             return Action::Pass;
         }
-        let tech = self.choose(host.as_deref());
+        let tech = self.choose(host.as_deref(), None);
         if tech.name == desync::NONE.name {
             self.record(&host, &owner, true, why, Some(tech.name));
             self.note(format!("пропущен как есть {who}: {why}, приём {}", tech.name));
@@ -925,20 +1283,19 @@ impl<A: Clone> Engine<A> {
         let first_raw = held[0].0.clone();
         let first = packet::parse(&first_raw).expect("held packets are parsed");
         let host = tls::sni(hello);
-        let bg = !self.forward && self.bg_ports.contains(&first.sport);
-        let owner = if bg {
-            Some(Owner { pid: std::process::id(), name: Some(BG_APP.to_string()), source: Source::Table })
-        } else {
-            self.owner_of(first.src, first.sport, first.dst, first.dport, now)
-        };
+        let by_port = !self.forward && self.bg_ports.contains(&first.sport);
+        let found = if by_port { None } else { self.owner_of(first.src, first.sport, first.dst, first.dport, now) };
+        let own = !self.forward && found.as_ref().is_some_and(|o| o.pid == std::process::id());
+        let bg = by_port || own;
+        let owner = if bg { Some(Owner { pid: std::process::id(), name: Some(BG_APP.to_string()), source: Source::Table }) } else { found };
         let (wanted, why, zero) = self.verdict(host.as_deref(), &first.dst, first.dport, false, &owner);
-        let (wanted, why) = if bg { (true, BG_APP) } else { (wanted, why) };
+        let (wanted, why) = if by_port { (true, BG_APP) } else { (wanted, why) };
         if wanted && !bg && first.dport == 443 {
             if let Some(h) = &host {
                 self.note_target(h, SocketAddr::new(first.dst, first.dport), parts, now);
             }
         }
-        let tech = self.choose(host.as_deref());
+        let tech = self.choose(host.as_deref(), Some(&first.dst));
         let key = (first.src, first.sport, first.dst, first.dport);
         let who = Self::who(&host, &owner);
         let forced = !bg && first.dport == 443 && host.as_deref().is_some_and(|h| self.warp.as_ref().is_some_and(|w| w.forced(h)));
@@ -964,7 +1321,7 @@ impl<A: Clone> Engine<A> {
                 self.stats.by_tech.entry(tech.name).or_default().used += 1;
             }
             if first.dport == 443 {
-                self.pending.insert(key, Pending { host: host.clone(), tech: tech.name, since: now, id, ack0: Some(first.ack), dcid: None, bg });
+                self.pending.insert(key, Pending { host: host.clone(), tech: tech.name, since: now, id, ack0: Some(first.ack), dcid: None, bg, node: Some(first.dst), fname: None });
                 if !bg {
                     self.start_watch(&key, &host, tech.name, id, first.dst, first.seq.wrapping_add(hello.len() as u32), now);
                 }
@@ -972,18 +1329,21 @@ impl<A: Clone> Engine<A> {
             return if single { Action::Pass } else { Action::Send(held) };
         }
         let hops = self.flows.get(&key).and_then(|f| f.hops);
-        let plan = if wanted { desync::first_segment(&first, hello, &self.cfg, &tech, hops, &mut *self.rnd) } else { None };
+        let (plan, fname) = if wanted { self.plan(&first, hello, &tech, hops, host.as_deref()) } else { (None, None) };
         let Some(out) = plan else {
             self.stats.skipped += 1;
             let id = self.record(&host, &owner, false, why, None);
             self.note(format!("пропущен {who}: {why}"));
             if self.autolist && !wanted && first.dport == 443 && host.is_some() && why == "сайта нет в списке" {
-                self.pending.insert(key, Pending { host: host.clone(), tech: PROBE, since: now, id, ack0: Some(first.ack), dcid: None, bg: false });
+                self.pending.insert(key, Pending { host: host.clone(), tech: PROBE, since: now, id, ack0: Some(first.ack), dcid: None, bg: false, node: None, fname: None });
             }
             return if single { Action::Pass } else { Action::Send(held) };
         };
         let id = self.record(&host, &owner, true, why, Some(tech.name));
         self.mark_parts(id, parts);
+        if let Some(f) = self.flows.get_mut(&key) {
+            f.sent = Some((first.seq, tech.name));
+        }
         match out.fallback {
             Some(f) => self.note(format!("обработан {who}: {why}, приём {}, запасной {f}", tech.name)),
             None => self.note(format!("обработан {who}: {why}, приём {}", tech.name)),
@@ -993,10 +1353,13 @@ impl<A: Clone> Engine<A> {
             self.stats.by_tech.entry(tech.name).or_default().used += 1;
         }
         if first.dport == 443 {
-            self.pending.insert(key, Pending { host: host.clone(), tech: tech.name, since: now, id, ack0: Some(first.ack), dcid: None, bg });
+            self.pending.insert(key, Pending { host: host.clone(), tech: tech.name, since: now, id, ack0: Some(first.ack), dcid: None, bg, node: Some(first.dst), fname });
             if !bg {
                 self.start_watch(&key, &host, tech.name, id, first.dst, first.seq.wrapping_add(hello.len() as u32), now);
             }
+        }
+        if let Some(n) = fname {
+            self.note(format!("имя в фейке {who}: {n}"));
         }
         if first.ts.is_none() {
             self.stats.no_ts += 1;
@@ -1006,6 +1369,15 @@ impl<A: Clone> Engine<A> {
         }
         let meta = held[0].1.clone();
         let mut packets = out.packets;
+        let small = tech.wssize.then(|| desync::wss_window(self.flows.get(&key).and_then(|f| f.wscale)));
+        if let Some(w) = small {
+            for p in packets.iter_mut() {
+                *p = packet::with_window(p, w);
+            }
+            if let Some(f) = self.flows.get_mut(&key) {
+                f.wss = desync::WSS_PACKETS;
+            }
+        }
         if zero && !first.v6 && !self.forward {
             for p in packets.iter_mut() {
                 *p = packet::with_ip_id(p, 0);
@@ -1014,6 +1386,10 @@ impl<A: Clone> Engine<A> {
         let mut sends: Vec<(Vec<u8>, A)> = packets.into_iter().map(|p| (p, meta.clone())).collect();
         let mut ip_id = out.next_ip_id;
         for (raw, m) in held.into_iter().skip(1) {
+            let raw = match small {
+                Some(w) => packet::with_window(&raw, w),
+                None => raw,
+            };
             if first.v6 || zero {
                 sends.push((raw, m));
             } else {
@@ -1021,10 +1397,23 @@ impl<A: Clone> Engine<A> {
                 ip_id = desync::next_ip_id(ip_id);
             }
         }
+        if tech.pause_ms > 0 && out.fakes > 0 && out.fakes < sends.len() && self.delayed.len() < MAX_FLOWS {
+            let later = sends.split_off(out.fakes);
+            self.delayed.push((now + Duration::from_millis(tech.pause_ms as u64), later));
+        }
         Action::Send(sends)
     }
 
     pub fn expire(&mut self, now: Instant) -> Vec<(Vec<u8>, A)> {
+        let mut due = Vec::new();
+        self.delayed.retain_mut(|(at, pkts)| {
+            if *at <= now {
+                due.append(pkts);
+                false
+            } else {
+                true
+            }
+        });
         let mut quic_out = self.expire_quic(now);
         self.expire_udp(now);
         let late: Vec<Key> = self.pending.iter().filter(|(_, p)| now.duration_since(p.since) >= SILENT).map(|(k, _)| *k).collect();
@@ -1051,7 +1440,8 @@ impl<A: Clone> Engine<A> {
             self.flows.remove(&k);
         }
         out.append(&mut quic_out);
-        out
+        due.append(&mut out);
+        due
     }
 
     fn evict(&mut self, now: Instant) {
@@ -1065,7 +1455,7 @@ impl<A: Clone> Engine<A> {
     }
 
     pub fn drain(&mut self) -> Vec<(Vec<u8>, A)> {
-        let mut out = Vec::new();
+        let mut out: Vec<(Vec<u8>, A)> = self.delayed.drain(..).flat_map(|(_, p)| p).collect();
         for (_, f) in self.flows.drain() {
             if let Stage::Reasm { held, .. } = f.stage {
                 out.extend(held);

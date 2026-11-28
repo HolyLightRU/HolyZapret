@@ -10,6 +10,7 @@ pub const LOG: &str = "rayoflight.log";
 pub const LIVE: &str = "rayoflight-live.json";
 pub const MEMORY: &str = "rayoflight-memory.tsv";
 pub const AUTOLIST: &str = "rayoflight-autolist.txt";
+pub const CONFIG: &str = "rayoflight-config.txt";
 pub const DEVICE: &str = "устройство ";
 pub const HISTORY: usize = 31;
 
@@ -24,7 +25,7 @@ pub fn auto_sites(paths: &Paths) -> Vec<String> {
 pub fn clear_autolist(paths: &Paths) {
     let _ = std::fs::remove_file(autolist_path(paths));
 }
-pub const EXPERIMENTS: [(&str, &str, &str); 20] = [
+pub const EXPERIMENTS: [(&str, &str, &str); 23] = [
     ("general", "Как general", "Основной приём: 8 фейков перед ClientHello и разрез после первого байта"),
     ("sni-split", "Разрез по имени сайта", "Режет ClientHello посередине имени сайта, а не после первого байта"),
     ("overlap", "Наложение без фейка", "Без фейков: начало ClientHello уходит с наложенным чужим ClientHello (узор 4pda.to), как в ALT 3"),
@@ -34,7 +35,6 @@ pub const EXPERIMENTS: [(&str, &str, &str); 20] = [
     ("disorder", "Части в обратном порядке", "Сначала уходит конец ClientHello, потом начало"),
     ("badseq", "Фейк с неверным seq", "Фейк защищён неверным номером, работает и без TCP timestamps"),
     ("md5sig", "Фейк с подписью md5", "Фейк защищён подписью TCP MD5, работает и без TCP timestamps"),
-    ("badsum", "Фейк с неверной суммой", "У фейка испорчена контрольная сумма: сайт его выбросит, а фильтр провайдера может не проверить"),
     ("sni-vk", "Фейк с именем vk.com", "Как general, но в фейке имя vk.com, как в R08"),
     ("sni-fonts", "Фейк с именем fonts.google.com", "Как general, но в фейке имя fonts.google.com, как в R12"),
     ("sni-max", "Фейк с именем max.ru", "Как general, но в фейке имя max.ru: фильтр провайдера может пропускать его в первую очередь"),
@@ -44,12 +44,16 @@ pub const EXPERIMENTS: [(&str, &str, &str); 20] = [
     ("overlap-2", "Наложение 652 после 2 байт", "Без фейков: разрез после второго байта и наложение 652 байт с узором max.ru, как в ALT 5"),
     ("overlap-sld", "Наложение и разрез домена", "Без фейков: наложение с узором max.ru и второй разрез посередине имени сайта, как у YouTube в ALT 5"),
     ("fake-ts", "Только фейки ts", "6 фейков с неверной временной меткой, а ClientHello уходит целиком, как в ALT 4"),
+    ("wssize", "Сжатое окно", "Как general, но программа объявляет серверу крошечное окно приёма, и сервер шлёт свой ответ мелкими кусками. Против фильтров, которые читают ответ сервера; соединение открывается медленнее"),
+    ("sni-pool", "Фейк с другим именем", "Как general, но имя в фейке берётся из списка разрешённых сайтов (max.ru, fonts.google.com, gosuslugi.ru…): движок сам запоминает, какое имя пропускает фильтр"),
+    ("fake-copy", "Фейк — копия ClientHello", "Фейк — точная копия настоящего ClientHello программы той же длины, только с другим именем сайта: фильтр не отличит его по виду"),
+    ("pause", "Пауза после фейка", "Как general, но настоящий ClientHello уходит через четверть секунды после фейков: фильтр может перестать ждать продолжения"),
     ("adaptive", "Самоподстройка", "Если сайт два раза подряд ответил сбросом или тишиной, пробует другой приём и запоминает рабочий. Третьим шагом пробует фейк с именем max.ru, потом пустить сайт без обхода: некоторые сайты обход ломает"),
 ];
 
-pub const EXTRA: [&str; 9] = ["sni-vk", "sni-fonts", "overlap", "fake-only", "fakedsplit", "fakedsplit-ttl", "overlap-2", "overlap-sld", "fake-ts"];
+pub const EXTRA: [&str; 13] = ["pause", "sni-max", "fake-copy", "wssize", "sni-vk", "sni-fonts", "overlap", "fake-only", "fakedsplit", "fakedsplit-ttl", "overlap-2", "overlap-sld", "fake-ts"];
 
-pub const QUIC_EXPERIMENTS: [(&str, &str, &str); 5] = [
+pub const QUIC_EXPERIMENTS: [(&str, &str, &str); 6] = [
     (
         "adaptive",
         "QUIC: самоподстройка",
@@ -59,6 +63,7 @@ pub const QUIC_EXPERIMENTS: [(&str, &str, &str); 5] = [
     ("random", "QUIC: случайные фейки", "Фейки QUIC с разными именами сайтов и разного размера"),
     ("shuffle", "QUIC: перемешанный ClientHello", "Имя сайта режется на мелкие куски, и они перемешиваются внутри первого пакета"),
     ("block", "QUIC: глушить", "Первый пакет QUIC не уходит, и браузер переходит на обычный HTTPS"),
+    ("split", "QUIC: ClientHello в двух пакетах", "ClientHello разносится по двум отдельным пакетам QUIC с разрезом посередине имени сайта"),
 ];
 
 pub fn quic_label(name: &str) -> &'static str {
@@ -228,6 +233,9 @@ pub fn experiment_label(name: &str) -> &'static str {
         "udp-random" => return "Случайные фейки",
         "udp-quic" => return "Фейки QUIC",
         "warp" => return "Через WARP",
+        "badsum" => return "Фейк с неверной суммой",
+        "split" => return "Разрез без фейков",
+        "fake-rst" => return "Ложный сброс",
         _ => {}
     }
     EXPERIMENTS.iter().find(|e| e.0 == name).map(|e| e.1).unwrap_or("Как general")
@@ -322,6 +330,7 @@ pub struct Live {
     pub reset: u64,
     pub silent: u64,
     pub frozen: u64,
+    pub rst: [u64; 4],
     pub techniques: Vec<TechLive>,
     pub recent: Vec<LiveItem>,
     pub warp: Option<WarpLive>,
@@ -412,6 +421,7 @@ pub fn parse_live(text: &str) -> Option<Live> {
         reset: n(&v["reset"]),
         silent: n(&v["silent"]),
         frozen: n(&v["frozen"]),
+        rst: [n(&v["rst"][0]), n(&v["rst"][1]), n(&v["rst"][2]), n(&v["rst"][3])],
         techniques,
         recent,
     })
@@ -475,8 +485,86 @@ pub fn wanted() -> bool {
     super::settings::ray_enabled()
 }
 
+pub fn config_path(paths: &Paths) -> PathBuf {
+    data_file(paths, CONFIG)
+}
+
 pub fn command(paths: &Paths) -> Option<String> {
     let exe = exe(paths)?;
+    Some(format!("\"{}\" --service --config \"{}\"", exe.display(), config_path(paths).display()))
+}
+
+pub fn split_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+pub fn new_stamp() -> String {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default().to_string()
+}
+
+pub fn config_body(paths: &Paths) -> Option<String> {
+    Some(split_args(&service_args(paths)?).join("\n"))
+}
+
+fn without_stamp(text: &str) -> String {
+    let lines: Vec<&str> = text.trim_start_matches('\u{feff}').lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let cut = lines.iter().position(|l| *l == "--stamp").unwrap_or(lines.len());
+    lines[..cut].join("\n")
+}
+
+pub fn config_current(paths: &Paths) -> bool {
+    match (std::fs::read_to_string(config_path(paths)), config_body(paths)) {
+        (Ok(have), Some(want)) => without_stamp(&have) == want,
+        _ => false,
+    }
+}
+
+pub fn write_config(paths: &Paths, stamp: &str) -> anyhow::Result<()> {
+    let body = config_body(paths).ok_or_else(|| anyhow::anyhow!("нет {}", paths.bin().join(EXE).display()))?;
+    let path = config_path(paths);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, format!("{body}\n--stamp\n{stamp}\n"))?;
+    std::fs::rename(&tmp, &path).or_else(|_| std::fs::copy(&tmp, &path).map(|_| ()))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
+
+pub fn applied(paths: &Paths, stamp: &str, timeout: std::time::Duration) -> bool {
+    let mark = format!("(метка {stamp})");
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if log_tail(paths, 60).iter().any(|l| l.contains(&mark)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+fn service_args(paths: &Paths) -> Option<String> {
+    exe(paths)?;
     let (all, skip) = super::settings::ray_apps();
     let experiment = super::settings::ray_experiment();
     let quic = match super::settings::ray_quic() {
@@ -484,8 +572,7 @@ pub fn command(paths: &Paths) -> Option<String> {
         q => q,
     };
     let mut cmd = format!(
-        "\"{}\" --service --log \"{}\" {}",
-        exe.display(),
+        "--log \"{}\" {}",
         log_path(paths).display(),
         engine_args(paths, &tcp_experiment(), &quic, &super::gamefilter::load(paths))
     );
@@ -550,6 +637,12 @@ pub fn report_lines(paths: &Paths) -> Vec<String> {
             ));
             for t in &l.techniques {
                 out.push(format!("Приём {}: применён {}, ответ {}, сброс {}, тишина {}, заморозка {}", t.name, t.used, t.answered, t.reset, t.silent, t.frozen));
+            }
+            if l.rst.iter().sum::<u64>() > 0 {
+                out.push(format!(
+                    "Откуда сбросы (по TTL сброса и ответа сервера): от фильтра на пути {}, от самого сервера {}, дальше сервера {}, не определить {}",
+                    l.rst[0], l.rst[1], l.rst[2], l.rst[3]
+                ));
             }
             out.push(format!("Голос Discord: фейки перед {} пакетами; игры UDP: фейки перед {} потоками", l.voice, l.game_udp));
             match &l.warp {
@@ -657,6 +750,15 @@ pub fn last_line(paths: &Paths) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_split_into_config_lines_keeping_quoted_paths() {
+        let a = split_args(r#"--log "C:\Users\Иван Петров\AppData\Local\HolyZapret\rayoflight.log" --bin "C:\Мой запрет\bin"  --dns --app-all "a.exe,b c.exe" --warp 40000"#);
+        assert_eq!(a, ["--log", r"C:\Users\Иван Петров\AppData\Local\HolyZapret\rayoflight.log", "--bin", r"C:\Мой запрет\bin", "--dns", "--app-all", "a.exe,b c.exe", "--warp", "40000"]);
+        assert_eq!(without_stamp("\u{feff}--bin\r\nb\r\n\r\n--dns\r\n--stamp\r\n17\r\n"), "--bin\nb\n--dns");
+        assert_eq!(without_stamp("--bin\nb"), "--bin\nb");
+        assert!(new_stamp().parse::<u128>().is_ok());
+    }
 
     #[test]
     fn picked_technique_is_installed_as_the_first_step_of_self_tuning() {

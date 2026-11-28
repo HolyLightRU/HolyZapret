@@ -530,6 +530,65 @@ fn quic_check(t: &Target) -> Check {
     done(false, 28)
 }
 
+pub fn record_probe(targets: &[Target], cancel: &AtomicBool) -> Option<String> {
+    use super::checks::{Shape, tls13_probe_as};
+    let mut hosts: Vec<String> = targets.iter().filter(|t| matches!(t.kind, CheckKind::Tls12 | CheckKind::Tls13)).map(|t| host_of(&t.url)).collect();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.is_empty() || cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let shapes = [Shape::Plain, Shape::Records, Shape::RecordsApart];
+    let results: Vec<[u8; 3]> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                sc.spawn(move || {
+                    let mut won = [0u8; 3];
+                    for _ in 0..PROBE_TRIES {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        for (i, s) in shapes.iter().enumerate() {
+                            if matches!(tls13_probe_as(h, Duration::from_secs(3), *s).0, Ok(_)) {
+                                won[i] += 1;
+                            }
+                        }
+                    }
+                    won
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap_or([0; 3])).collect()
+    });
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(record_summary(&hosts, &results))
+}
+
+const PROBE_TRIES: u8 = 3;
+
+pub fn record_summary(hosts: &[String], results: &[[u8; 3]]) -> String {
+    let steady = |n: u8| n * 2 > PROBE_TRIES;
+    let count = |i: usize| results.iter().filter(|r| steady(r[i])).count();
+    let only: Vec<&str> = hosts.iter().zip(results).filter(|(_, r)| r[0] == 0 && (steady(r[1]) || steady(r[2]))).map(|(h, _)| h.as_str()).collect();
+    let shaky = results.iter().filter(|r| r.iter().any(|&n| n > 0 && n < PROBE_TRIES)).count();
+    let mut s = format!(
+        "Проба разреза на TLS-записи без обхода (TLS 1.3, сайтов {}, по {} попытки каждого вида; считается сайт, ответивший хотя бы в 2 из 3): обычный ClientHello — ответили {}; две записи в одном пакете — {}; две записи в двух пакетах — {}; ответы нестабильны у {}",
+        hosts.len(),
+        PROBE_TRIES,
+        count(0),
+        count(1),
+        count(2),
+        shaky
+    );
+    if !only.is_empty() {
+        s.push_str(&format!(". Обычный ни разу, а разрез стабильно: {}", only.join(", ")));
+    }
+    s
+}
+
 fn hello_check(t: &Target) -> Check {
     let (r, ms) = super::checks::tls13_probe(&host_of(&t.url), Duration::from_secs(5));
     let (ok, exit) = match r {
@@ -596,7 +655,7 @@ fn resolve_hosting(targets: &[Target]) -> Vec<Vec<std::net::IpAddr>> {
 }
 
 fn run_suite(targets: &Arc<Vec<Target>>, cancel: &Arc<AtomicBool>, emit: &(impl Fn(Event) + Sync)) -> Vec<Check> {
-    run_suite_skipping(targets, &vec![false; targets.len()], &[], cancel, emit)
+    run_suite_skipping(targets, &vec![false; targets.len()], &[], cancel, emit, WORKERS)
 }
 
 fn run_suite_skipping(
@@ -605,12 +664,13 @@ fn run_suite_skipping(
     base: &[Check],
     cancel: &Arc<AtomicBool>,
     emit: &(impl Fn(Event) + Sync),
+    workers: usize,
 ) -> Vec<Check> {
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let results: Mutex<Vec<Option<Check>>> = Mutex::new(vec![None; targets.len()]);
     std::thread::scope(|s| {
-        for _ in 0..WORKERS.min(targets.len()) {
+        for _ in 0..workers.min(targets.len()) {
             s.spawn(|| {
                 loop {
                     if cancel.load(Ordering::Relaxed) {
@@ -760,6 +820,7 @@ pub(crate) fn stop_engine(child: Option<Child>) {
     std::thread::sleep(Duration::from_millis(400));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     paths: Paths,
     strategies: Vec<Strategy>,
@@ -787,7 +848,8 @@ pub fn run(
     let hosting_ips = resolve_hosting(&targets);
     let mut cover = super::coverage::Cache::default();
     if !cancel.load(Ordering::Relaxed) {
-        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone(), ray: None }));
+        let probe = if super::TEST_BUILD { record_probe(&targets, &cancel) } else { None };
+        emit(Event::Done(Outcome { name: "Без обхода".into(), path: None, error: None, checks: base.clone(), ray: probe }));
         if !add_to.is_empty() {
             let (blocked, open) = blocked_sites(&targets, &base);
             let added = site_domains(&blocked);
@@ -809,7 +871,7 @@ pub fn run(
         match start_engine(&paths, s, &game_filter, false) {
             Ok(mut child) => match warm_up(&mut child, &s.name, &cancel) {
                 Ok(()) => {
-                    outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit);
+                    outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit, WORKERS);
                     recheck(&targets, &base, &mut outcome.checks, &cancel);
                     if blackout(&base, &outcome.checks) && !cancel.load(Ordering::Relaxed) {
                         stop_engine(Some(child));
@@ -822,7 +884,7 @@ pub fn run(
                             }
                         };
                         if warm_up(&mut child, &s.name, &cancel).is_ok() {
-                            outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit);
+                            outcome.checks = run_suite_skipping(&targets, &skip, &base, &cancel, &emit, WORKERS);
                             recheck(&targets, &base, &mut outcome.checks, &cancel);
                         }
                     }
@@ -1029,6 +1091,16 @@ mod tests {
     fn quic_check_live() {
         let r: Vec<(String, bool, u32)> = quic_targets().iter().map(|t| { let c = run_check(t); (t.name.clone(), c.ok, c.ms) }).collect();
         assert!(r.iter().all(|x| x.1), "{r:?}");
+    }
+
+    #[test]
+    fn record_probe_summary_names_sites_that_only_split_opens() {
+        let hosts = vec!["a.com".to_string(), "b.com".to_string(), "c.com".to_string()];
+        let s = record_summary(&hosts, &[[3, 3, 3], [0, 2, 1], [1, 0, 0]]);
+        assert!(s.contains("обычный ClientHello — ответили 1; две записи в одном пакете — 2; две записи в двух пакетах — 1; ответы нестабильны у 2"), "{s}");
+        assert!(s.ends_with("Обычный ни разу, а разрез стабильно: b.com"), "{s}");
+        assert!(!record_summary(&hosts[..1], &[[3, 3, 3]]).contains("разрез стабильно"));
+        assert!(!record_summary(&hosts[..1], &[[0, 1, 1]]).contains("разрез стабильно"));
     }
 
     #[test]

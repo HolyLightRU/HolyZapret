@@ -89,6 +89,27 @@ pub fn take_start_migration() -> bool {
     k.set_value("RayStartMigrated", &1u32).is_ok()
 }
 
+pub fn warp_owned() -> Option<String> {
+    RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok()?.get_value::<String, _>("WarpOwned").ok().filter(|v| !v.is_empty())
+}
+
+pub fn set_warp_owned(mode: Option<&str>) {
+    if let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) {
+        let _ = match mode {
+            Some(m) => k.set_value("WarpOwned", &m),
+            None => k.delete_value("WarpOwned"),
+        };
+    }
+}
+
+pub fn take_refresh(version: &str) -> bool {
+    let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) else { return false };
+    if k.get_value::<String, _>("ServiceRefreshed").is_ok_and(|v| v == version) {
+        return false;
+    }
+    k.set_value("ServiceRefreshed", &version).is_ok()
+}
+
 pub const DEFAULT_QUIC: &str = "adaptive";
 
 pub fn ray_quic() -> String {

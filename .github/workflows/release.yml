@@ -36,14 +36,10 @@ jobs:
           $tag = $env:TAG
           if ($tag -notmatch '^v\d+(\.\d+)*$') { throw "Тег '$tag' должен выглядеть как v2.0.3" }
           $version = $tag.Substring(1)
-          $manager = (Get-Content scripts/manager.bat -Raw) -match 'set "LOCAL_VERSION=([^"]+)"'
-          if (-not $manager) { throw "В scripts/manager.bat не найден LOCAL_VERSION" }
-          $managerVersion = $Matches[1]
           $cargo = (Get-Content launcher/Cargo.toml -Raw) -match '(?m)^version\s*=\s*"([^"]+)"'
           if (-not $cargo) { throw "В launcher/Cargo.toml не найдена version" }
           $cargoVersion = $Matches[1]
           $bad = @()
-          if ($managerVersion -ne $version) { $bad += "scripts/manager.bat: $managerVersion" }
           if ($cargoVersion -ne $version) { $bad += "launcher/Cargo.toml: $cargoVersion" }
           if ($bad.Count -gt 0) { throw "Версии не совпадают с тегом $tag -> $($bad -join ', ')" }
           "version=$version" >> $env:GITHUB_OUTPUT
@@ -82,6 +78,7 @@ jobs:
           Copy-Item "launcher/target/release/holyzapret-launcher.exe" (Join-Path $stage "HolyZapret Launcher.exe")
           Copy-Item "launcher/target/release/RayOfLight.exe" (Join-Path $stage "bin/RayOfLight.exe")
           if (-not (Test-Path (Join-Path $stage "bin/WinDivert64.sys"))) { throw "В пакете нет bin/WinDivert64.sys" }
+          if (-not (Test-Path (Join-Path $stage "bin/HolyZapret.exe"))) { throw "В пакете нет bin/HolyZapret.exe: версии 3.2.0 и старше не примут такой архив" }
           if (-not (Test-Path (Join-Path $stage "bin/RayOfLight.exe"))) { throw "В пакете нет bin/RayOfLight.exe" }
           $zip = Join-Path $env:RUNNER_TEMP "Holy-Zapret-$version.zip"
           Push-Location $stage

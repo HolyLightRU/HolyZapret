@@ -1,4 +1,5 @@
 use crate::desync::Config;
+use crate::guard::{self, Pulse};
 use crate::flows::{Action, Engine, Lists, Mode, QuicCfg, QuicMode, Stats};
 use crate::lists::{Hosts, Nets};
 use crate::procs::{self, Apps, ProcMap};
@@ -17,7 +18,7 @@ pub const PATTERN: &str = "tls_clienthello_www_google_com.bin";
 pub const WINWS_MUTEX: &str = "Global\\winws_windivert_mutex";
 pub const PRIORITY: i16 = -100;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub bin: PathBuf,
     pub lists: PathBuf,
@@ -98,6 +99,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
             "--follow" => follow = Some(value()?),
             "--service" => service = true,
             "--dns" => dns = true,
+            "--stamp" | "--config" => {
+                value()?;
+            }
             "--live" => live = Some(PathBuf::from(value()?)),
             "--live-ms" => {
                 live_ms = value()?.parse().map_err(|_| "--live-ms должен быть числом миллисекунд".to_string())?;
@@ -126,6 +130,44 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String
         }
     }
     Ok(Args { bin: bin.ok_or("не указан --bin")?, lists: lists.ok_or("не указан --lists")?, priority, log, dry_run, app_all, app_skip, verbose, follow, service, live, live_ms, quic, autolist, own, game_tcp, game_udp, experiment, memory, forward_watch, forward, warp, warp_force, dns })
+}
+
+pub fn config_path(args: &[String]) -> Option<PathBuf> {
+    args.iter().enumerate().find_map(|(i, a)| match a.split_once('=') {
+        Some(("--config", v)) => Some(PathBuf::from(v)),
+        _ if a == "--config" => args.get(i + 1).map(PathBuf::from),
+        _ => None,
+    })
+}
+
+pub fn config_tokens(text: &str) -> Vec<String> {
+    text.trim_start_matches('\u{feff}').lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+pub fn stamp_of(text: &str) -> Option<String> {
+    let t = config_tokens(text);
+    t.iter().position(|l| l == "--stamp").and_then(|i| t.get(i + 1).cloned())
+}
+
+pub fn read_config(path: &Path) -> Result<(Args, String), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("не прочитан файл настроек {}: {e}", path.display()))?;
+    let args = parse_args(config_tokens(&text)).map_err(|e| format!("файл настроек {}: {e}", path.display()))?;
+    Ok((args, text))
+}
+
+pub type Loaded = (Args, String);
+
+fn changed_config(config: Option<&(PathBuf, String)>, bad: &mut Option<String>, log: &Log) -> Option<Loaded> {
+    let (path, text) = config?;
+    let fresh = std::fs::read_to_string(path).ok().filter(|t| t != text && Some(t) != bad.as_ref())?;
+    match parse_args(config_tokens(&fresh)) {
+        Ok(a) => Some((a, fresh)),
+        Err(e) => {
+            log.line(&format!("новые настройки не приняты, работаю на прежних: {e}"));
+            *bad = Some(fresh);
+            None
+        }
+    }
 }
 
 pub fn load_lists(dir: &Path) -> Lists {
@@ -264,6 +306,9 @@ pub fn stats_line(s: &Stats, flows: usize) -> String {
         "обработано {}, пропущено {}, без TCP timestamps {}, запасной приём {}, отпущено без изменений {}, потоков {}",
         s.handled, s.skipped, s.no_ts, s.fallback, s.flushed, flows
     );
+    if s.resent > 0 {
+        l.push_str(&format!(", повторов ClientHello с обходом {}", s.resent));
+    }
     if s.answered + s.reset + s.silent + s.frozen > 0 {
         l.push_str(&format!("; итоги: ответ {}, сброс {}, тишина {}", s.answered, s.reset, s.silent));
         if s.frozen > 0 {
@@ -272,6 +317,9 @@ pub fn stats_line(s: &Stats, flows: usize) -> String {
         for (name, t) in &s.by_tech {
             l.push_str(&format!("; {name}: {} из {}", t.answered, t.answered + t.reset + t.silent + t.frozen));
         }
+    }
+    if s.rst_filter + s.rst_server + s.rst_far + s.rst_blind > 0 {
+        l.push_str(&format!("; сбросы: от фильтра {}, от сервера {}, дальше сервера {}, не определить {}", s.rst_filter, s.rst_server, s.rst_far, s.rst_blind));
     }
     if s.voice + s.game_udp > 0 {
         l.push_str(&format!(", голос Discord {}, игры UDP {}", s.voice, s.game_udp));
@@ -323,7 +371,7 @@ pub fn live_json(s: &Stats, flows: usize, recent: &std::collections::VecDeque<cr
         .map(|(n, t)| format!("{{\"name\":\"{}\",\"used\":{},\"answered\":{},\"reset\":{},\"silent\":{},\"frozen\":{}}}", esc(n), t.used, t.answered, t.reset, t.silent, t.frozen))
         .collect();
     format!(
-        "{{\"running\":{running},\"gateway\":{gateway},\"time\":\"{}\",\"mode\":\"{}\",\"handled\":{},\"skipped\":{},\"no_ts\":{},\"fallback\":{},\"voice\":{},\"game_udp\":{},\"auto_added\":{},\"flushed\":{},\"flows\":{flows},\"answered\":{},\"reset\":{},\"silent\":{},\"frozen\":{},\"techniques\":[{}],\"recent\":[{}]}}",
+        "{{\"running\":{running},\"gateway\":{gateway},\"time\":\"{}\",\"mode\":\"{}\",\"handled\":{},\"skipped\":{},\"no_ts\":{},\"fallback\":{},\"voice\":{},\"game_udp\":{},\"auto_added\":{},\"flushed\":{},\"flows\":{flows},\"answered\":{},\"reset\":{},\"silent\":{},\"frozen\":{},\"rst\":[{},{},{},{}],\"techniques\":[{}],\"recent\":[{}]}}",
         esc(&sys::clock()),
         esc(mode),
         s.handled,
@@ -338,6 +386,10 @@ pub fn live_json(s: &Stats, flows: usize, recent: &std::collections::VecDeque<cr
         s.reset,
         s.silent,
         s.frozen,
+        s.rst_filter,
+        s.rst_server,
+        s.rst_far,
+        s.rst_blind,
         techs.join(","),
         items.join(",")
     )
@@ -441,21 +493,62 @@ fn prepare_lists(args: &Args, log: &Log) -> Result<Lists, String> {
 }
 
 pub fn run(args: Args) -> Result<(), String> {
+    run_with(args, None)
+}
+
+pub fn run_config(path: PathBuf) -> Result<(), String> {
+    let (args, text) = read_config(&path)?;
+    run_with(args, Some((path, text)))
+}
+
+fn run_with(args: Args, config: Option<(PathBuf, String)>) -> Result<(), String> {
     let log = Arc::new(Log::open(args.log.as_deref()));
     log.line(&format!("RayOfLight {} запускается", env!("CARGO_PKG_VERSION")));
     let hook_log = log.clone();
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current().name().unwrap_or("без имени").to_string();
         hook_log.line(&format!("сбой в потоке {thread}: {info}"));
+        guard::fault();
     }));
-    let r = run_logged(&args, &log);
-    if let Err(e) = &r {
-        log.line(&format!("ошибка: {e}"));
+    let mut args = args;
+    let mut config = config;
+    let mut reloaded = false;
+    loop {
+        match run_logged(&args, &log, config.as_ref()) {
+            Ok(None) => return Ok(()),
+            Ok(Some((a, t))) => {
+                args = a;
+                if let Some(c) = config.as_mut() {
+                    c.1 = t;
+                }
+                reloaded = true;
+            }
+            Err(e) => {
+                log.line(&format!("ошибка: {e}"));
+                if !reloaded {
+                    return Err(e);
+                }
+                log.line("жду исправленных настроек, перехват выключен");
+                let mut bad = None;
+                loop {
+                    if sys::stopping() {
+                        return Ok(());
+                    }
+                    std::thread::sleep(guard::POLL);
+                    if let Some((a, t)) = changed_config(config.as_ref(), &mut bad, &log) {
+                        args = a;
+                        if let Some(c) = config.as_mut() {
+                            c.1 = t;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
-    r
 }
 
-fn run_logged(args: &Args, log: &Arc<Log>) -> Result<(), String> {
+fn run_logged(args: &Args, log: &Arc<Log>, config: Option<&(PathBuf, String)>) -> Result<Option<Loaded>, String> {
     let pattern = std::fs::read(args.bin.join(PATTERN)).map_err(|e| format!("не прочитан {}: {e}", args.bin.join(PATTERN).display()))?;
     let mut cfg = Config::general(pattern).ok_or("шаблон seqovl пустой или встроенный фейк испорчен")?;
     let read = |n: &str| std::fs::read(args.bin.join(n)).map_err(|e| format!("не прочитан {}: {e}", args.bin.join(n).display()));
@@ -486,9 +579,9 @@ fn run_logged(args: &Args, log: &Arc<Log>) -> Result<(), String> {
             lib.check(crate::watch::FORWARD_FILTER, windivert::LAYER_NETWORK_FORWARD)?;
             lib.check(crate::watch::REDIRECT_FILTER, windivert::LAYER_NETWORK)?;
             log.line("проверка без запуска: фильтры наблюдения в порядке");
-            return Ok(());
+            return Ok(None);
         }
-        return crate::watch::run(&lib, args.priority, log);
+        return crate::watch::run(&lib, args.priority, log).map(|_| None);
     }
     if args.dry_run {
         lib.check(&filter_for(args.quic.is_some(), &args.own, &args.game_tcp, &args.game_udp), windivert::LAYER_NETWORK)?;
@@ -502,11 +595,27 @@ fn run_logged(args: &Args, log: &Arc<Log>) -> Result<(), String> {
             log.line("шлюз: фильтры в порядке");
         }
         log.line("проверка без запуска: шаблон, списки, фильтры и WinDivert.dll в порядке");
-        return Ok(());
+        return Ok(None);
     }
     sys::on_stop(shut_current);
+    let mut restarts = guard::Restarts::default();
     let Some(name) = args.follow.as_deref() else {
-        return session(args, &lib, cfg, quic, first, log, None);
+        let mut lists = Some(first);
+        loop {
+            let l = match lists.take() {
+                Some(l) => l,
+                None => prepare_lists(args, log)?,
+            };
+            match guarded(args, &lib, cfg.clone(), quic.clone(), l, log, None, config) {
+                End::Done(r) => return r.map(|_| None),
+                End::Reload(a, t) => return Ok(Some((a, t))),
+                End::Again => {
+                    if !pause(&mut restarts, log) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     };
     log.line(&format!("слежу за службой {name}: перехват работает, только пока она запущена"));
     let mut lists = Some(first);
@@ -526,22 +635,111 @@ fn run_logged(args: &Args, log: &Arc<Log>) -> Result<(), String> {
                 }
             },
         };
-        if let Err(e) = session(args, &lib, cfg.clone(), quic.clone(), l, log, Some(name)) {
-            log.line(&format!("перехват не включился: {e}"));
-            std::thread::sleep(Duration::from_secs(5));
+        match guarded(args, &lib, cfg.clone(), quic.clone(), l, log, Some(name), config) {
+            End::Done(Ok(())) => {}
+            End::Done(Err(e)) => {
+                log.line(&format!("перехват не включился: {e}"));
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            End::Reload(a, t) => return Ok(Some((a, t))),
+            End::Again => {
+                if !pause(&mut restarts, log) {
+                    break;
+                }
+            }
         }
     }
     log.line("RayOfLight остановлен");
-    Ok(())
+    Ok(None)
 }
 
-fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>, lists: Lists, log: &Arc<Log>, follow: Option<&str>) -> Result<(), String> {
-    let track_apps = !lists.apps.is_empty() || args.verbose || args.live.is_some();
-    let handle = {
-        let _lock = sys::GlobalLock::take(WINWS_MUTEX);
-        lib.open(&filter_for(args.quic.is_some(), &args.own, &args.game_tcp, &args.game_udp), windivert::LAYER_NETWORK, args.priority, 0)?
+enum End {
+    Done(Result<(), String>),
+    Again,
+    Reload(Args, String),
+}
+
+fn pause(restarts: &mut guard::Restarts, log: &Log) -> bool {
+    let wait = restarts.next(Instant::now());
+    log.line(&format!("сторож: запускаю перехват заново через {} с (перезапуск {})", wait.as_secs(), restarts.total));
+    let until = Instant::now() + wait;
+    while Instant::now() < until {
+        if sys::stopping() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !sys::stopping()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guarded(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>, lists: Lists, log: &Arc<Log>, follow: Option<&str>, config: Option<&(PathBuf, String)>) -> End {
+    let ended = Arc::new(AtomicBool::new(false));
+    let pulse = Arc::new(Pulse::default());
+    guard::take_fault();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let (args, lib, log, follow, ended, pulse) = (args.clone(), *lib, log.clone(), follow.map(str::to_string), ended.clone(), pulse.clone());
+        std::thread::Builder::new().name("перехват".to_string()).spawn(move || {
+            let _ = tx.send(session(&args, &lib, cfg, quic, lists, &log, follow.as_deref(), ended, pulse));
+        })
     };
-    let h = Arc::new(handle);
+    if let Err(e) = worker {
+        return End::Done(Err(format!("поток перехвата не запустился: {e}")));
+    }
+    let mut watch = guard::Watch::default();
+    let mut last = Instant::now();
+    let mut bad = None;
+    loop {
+        match rx.recv_timeout(guard::POLL) {
+            Ok(r) => return if guard::take_fault() && !sys::stopping() { End::Again } else { End::Done(r) },
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                ended.store(true, Ordering::SeqCst);
+                shut_current();
+                guard::take_fault();
+                log.line("сторож: поток перехвата упал, перехват отпущен");
+                return if sys::stopping() { End::Done(Ok(())) } else { End::Again };
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !sys::stopping() {
+            if let Some((a, t)) = changed_config(config, &mut bad, log) {
+                let mark = stamp_of(&t).map(|m| format!(" (метка {m})")).unwrap_or_default();
+                log.line(&format!("настройки изменились{mark}: открываю перехват заново, служба не останавливается"));
+                ended.store(true, Ordering::SeqCst);
+                shut_current();
+                if matches!(rx.recv_timeout(guard::GRACE), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                    log.line("сторож: прежний поток перехвата не завершился, оставляю его");
+                }
+                guard::take_fault();
+                return End::Reload(a, t);
+            }
+        }
+        let gap = last.elapsed();
+        last = Instant::now();
+        let Some(why) = watch.poll(&pulse, gap, guard::take_fault()) else { continue };
+        if sys::stopping() {
+            continue;
+        }
+        log.line(&format!("сторож: {} — отпускаю перехват, интернет дальше идёт без обхода", why.text()));
+        ended.store(true, Ordering::SeqCst);
+        shut_current();
+        if matches!(rx.recv_timeout(guard::GRACE), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+            log.line("сторож: зависший поток не завершился, оставляю его и открываю перехват заново");
+        }
+        guard::take_fault();
+        return if sys::stopping() { End::Done(Ok(())) } else { End::Again };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>, lists: Lists, log: &Arc<Log>, follow: Option<&str>, ended: Arc<AtomicBool>, pulse: Arc<Pulse>) -> Result<(), String> {
+    let track_apps = !lists.apps.is_empty() || args.verbose || args.live.is_some();
+    let main_filter = filter_for(args.quic.is_some(), &args.own, &args.game_tcp, &args.game_udp);
+    {
+        let _lock = sys::GlobalLock::take(WINWS_MUTEX);
+        drop(lib.open(&main_filter, windivert::LAYER_NETWORK, args.priority, windivert::FLAG_SNIFF | windivert::FLAG_RECV_ONLY)?);
+    }
     let procmap = Arc::new(Mutex::new(None::<ProcMap>));
     let sockets = if track_apps {
         match lib.open("true", windivert::LAYER_SOCKET, 0, windivert::FLAG_SNIFF | windivert::FLAG_RECV_ONLY) {
@@ -566,7 +764,6 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     };
     if let Ok(mut v) = CURRENT.lock() {
         v.clear();
-        v.push(h.shutter());
         if let Some(s) = &sockets {
             v.push(s.shutter());
         }
@@ -577,7 +774,6 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     if sys::stopping() {
         shut_current();
     }
-    let ended = Arc::new(AtomicBool::new(false));
     let watcher = follow.map(|name| {
         let (ended, log, name) = (ended.clone(), log.clone(), name.to_string());
         std::thread::spawn(move || {
@@ -605,7 +801,6 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             }
         })
     });
-    log.line(&format!("перехват включён, приоритет {}", args.priority));
     let gateway = if args.forward {
         match crate::gateway::start(args, lib, cfg.clone(), quic.clone(), log) {
             Ok(g) => {
@@ -634,6 +829,10 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
     eng.autolist = args.autolist.is_some();
     eng.verbose = args.verbose;
     eng.track = args.live.is_some();
+    let warp = args.warp.map(|port| crate::warp::Shared::new(port, args.warp_force.clone()));
+    if let Some(w) = &warp {
+        eng = eng.with_warp(w.clone());
+    }
     if let Some(p) = args.memory.as_deref() {
         let n = eng.load_memory(&std::fs::read_to_string(p).unwrap_or_default());
         if n > 0 {
@@ -644,10 +843,6 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
         let (tcp_map, udp_map) = (procmap.clone(), procmap.clone());
         eng = eng.with_apps(Box::new(move |c, now| tcp_map.lock().ok()?.as_mut()?.owner(c, now)));
         eng = eng.with_udp_apps(Box::new(move |port, now| udp_map.lock().ok()?.as_mut()?.udp_owner(port, now)));
-    }
-    let warp = args.warp.map(|port| crate::warp::Shared::new(port, args.warp_force.clone()));
-    if let Some(w) = &warp {
-        eng = eng.with_warp(w.clone());
     }
     let engine: Arc<Mutex<Engine<Address>>> = Arc::new(Mutex::new(eng));
     if let Some(w) = &warp {
@@ -674,7 +869,28 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             }
         })
     });
+    let h = {
+        let _lock = sys::GlobalLock::take(WINWS_MUTEX);
+        match lib.open(&main_filter, windivert::LAYER_NETWORK, args.priority, 0) {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                ended.store(true, Ordering::SeqCst);
+                shut_current();
+                return Err(e);
+            }
+        }
+    };
+    if let Ok(mut v) = CURRENT.lock() {
+        v.push(h.shutter());
+    }
+    if sys::stopping() || ended.load(Ordering::SeqCst) {
+        shut_current();
+    }
+    log.line(&format!("перехват включён, приоритет {}", args.priority));
+    let meter = Arc::new(Mutex::new(crate::meter::Meter::default()));
+    let clock = crate::meter::Clock::new();
     let ticker = {
+        let meter = meter.clone();
         let gw = gateway.clone();
         let warp_live = warp.clone();
         let (h, engine, log, procmap, ended, live, memory, live_every, autolist) = (
@@ -689,6 +905,9 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             args.autolist.clone(),
         );
         let dns_on = args.dns;
+        let pulse = pulse.clone();
+        let test_dir = args.log.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).filter(|_| guard::TEST);
+        let mut probed = Instant::now();
         std::thread::spawn(move || {
             let mut act = crate::activity::Activity::new(Instant::now());
             let mut last = Instant::now();
@@ -696,8 +915,30 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             let mut written = Instant::now() - Duration::from_secs(10);
             let mut cleaned = Instant::now();
             let mut flushed = Instant::now() - Duration::from_secs(60);
+            let mut stored = String::new();
             while !ended.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
+                pulse.beat();
+                if test_dir.is_some() && probed.elapsed() >= Duration::from_secs(1) {
+                    probed = Instant::now();
+                    match test_dir.as_deref().and_then(guard::take_order) {
+                        Some(guard::Order::Stuck) => {
+                            log.line("проверка сторожа: главный цикл зависнет на следующем пакете");
+                            guard::order_stuck();
+                        }
+                        Some(guard::Order::Ticker) => {
+                            log.line("проверка сторожа: служебный поток зависает");
+                            loop {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                        Some(guard::Order::Panic) => {
+                            log.line("проверка сторожа: сбой в служебном потоке");
+                            panic!("проверка сторожа");
+                        }
+                        None => {}
+                    }
+                }
                 let (out, notes, added, flush) =
                     engine.lock().map(|mut e| (e.expire(Instant::now()), std::mem::take(&mut e.notes), e.take_auto_new(), e.take_flush())).unwrap_or_default();
                 if flush && dns_on && flushed.elapsed() >= Duration::from_secs(30) {
@@ -720,27 +961,31 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
                     let extra = gw.as_ref().map(|g| g.recent());
                     let side = gw.as_ref().map(|g| g.totals()).unwrap_or_default();
                     let mut redeemed = gw.as_ref().map(|g| g.take_redeemed()).unwrap_or_default();
-                    if let Ok(mut e) = engine.lock() {
+                    let now = Instant::now();
+                    let load = (sys::cpu_time(), sys::memory());
+                    let snap = engine.lock().ok().map(|mut e| {
                         redeemed.extend(e.take_redeemed());
                         let s = &e.stats;
-                        let now = Instant::now();
-                        act.update((s.handled + side.0, s.answered + side.1, s.reset + s.silent + s.frozen + side.2), now);
+                        let totals = (s.handled + side.0, s.answered + side.1, s.reset + s.silent + s.frozen + side.2);
+                        (totals, e.stats.clone(), e.flows(), e.recent.clone(), e.mode().name())
+                    });
+                    if let Some((totals, stats, flows, recent, mode)) = snap {
+                        act.update(totals, now);
                         for at in redeemed.drain(..) {
                             act.redeem(at);
                         }
-                        act.load(sys::cpu_time(), sys::memory(), now);
-                        let json = live_json(&e.stats, e.flows(), &crate::gateway::merge(&e.recent, extra), true, e.mode().name(), gw.is_some());
+                        act.load(load.0, load.1, now);
+                        let json = live_json(&stats, flows, &crate::gateway::merge(&recent, extra), true, mode, gw.is_some());
                         let warp_json = warp_live.as_ref().map(|w| w.json(now)).unwrap_or_default();
                         write_live(p, &crate::activity::with_extra(&json, &(act.json() + &warp_json)));
                     }
                 }
                 if let Some(p) = memory.as_deref().filter(|_| saved.elapsed() >= Duration::from_secs(30)) {
                     saved = Instant::now();
-                    if let Ok(e) = engine.lock() {
-                        let text = e.memory_text();
-                        if !text.is_empty() {
-                            write_live(p, &text);
-                        }
+                    let text = engine.lock().map(|e| e.memory_text()).unwrap_or_default();
+                    if !text.is_empty() && text != stored {
+                        write_live(p, &text);
+                        stored = text;
                     }
                 }
                 if cleaned.elapsed() >= Duration::from_secs(60) {
@@ -754,8 +999,12 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
                 }
                 if last.elapsed() >= Duration::from_secs(30) {
                     last = Instant::now();
-                    if let Ok(e) = engine.lock() {
-                        log.line(&format!("{}, ждут итога {}", stats_line(&e.stats, e.flows()), e.pending()));
+                    let line = engine.lock().ok().map(|e| format!("{}, ждут итога {}", stats_line(&e.stats, e.flows()), e.pending()));
+                    if let Some(l) = line {
+                        log.line(&l);
+                    }
+                    for l in meter.lock().map(|mut m| m.take_lines()).unwrap_or_default() {
+                        log.line(&l);
                     }
                     if let Some(g) = &gw {
                         log.line(&g.stats_line());
@@ -765,9 +1014,33 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
         })
     };
     let mut buf = vec![0u8; windivert::MAX_PACKET];
+    let mut asked = Instant::now();
     while let Some((len, addr)) = h.recv(&mut buf) {
+        let got = Instant::now();
+        let wait = clock.since_us(addr.timestamp);
+        pulse.enter();
+        if guard::TEST && guard::take_stuck() {
+            log.line("проверка сторожа: главный цикл завис");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
         let raw = &buf[..len];
-        let act = engine.lock().map(|mut e| e.handle(raw, addr, Instant::now())).unwrap_or(Action::Pass);
+        let mut locked = got;
+        let act = engine
+            .lock()
+            .map(|mut e| {
+                locked = Instant::now();
+                e.handle(raw, addr, locked)
+            })
+            .unwrap_or(Action::Pass);
+        let decided = Instant::now();
+        let kind = match &act {
+            Action::Pass if crate::meter::is_udp(raw) => Some(crate::meter::Kind::Udp),
+            Action::Pass => Some(crate::meter::Kind::Tcp),
+            Action::Send(_) => Some(crate::meter::Kind::Handled),
+            _ => None,
+        };
         match act {
             Action::Pass => {
                 if !h.send(raw, &addr) {
@@ -782,6 +1055,18 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
                 }
             }
         }
+        let total = clock.since_us(addr.timestamp);
+        if let Ok(mut m) = meter.lock() {
+            if let (Some(k), Some(us)) = (kind, total) {
+                m.add(k, us);
+            }
+            if let Some(w) = wait {
+                let us = |d: Duration| d.as_micros() as u64;
+                m.stages(w, us(got.duration_since(asked)), us(locked.duration_since(got)), us(decided.duration_since(locked)), us(decided.elapsed()));
+            }
+        }
+        pulse.leave();
+        asked = Instant::now();
     }
     ended.store(true, Ordering::SeqCst);
     shut_current();
@@ -814,6 +1099,9 @@ fn session(args: &Args, lib: &windivert::Lib, cfg: Config, quic: Option<QuicCfg>
             log.line(&n);
         }
         log.line(&format!("{}, ждут итога {}", stats_line(&e.stats, e.flows()), e.pending()));
+        for l in meter.lock().map(|mut m| m.take_lines()).unwrap_or_default() {
+            log.line(&l);
+        }
         if let Some(p) = args.live.as_deref() {
             write_live(p, &live_json(&e.stats, e.flows(), &crate::gateway::merge(&e.recent, extra), false, e.mode().name(), gateway.is_some()));
         }
@@ -864,6 +1152,41 @@ mod tests {
         assert!(parse_args(s(&["--bin", "b", "--lists", "l", "--priority", "99999"])).is_err());
         assert!(parse_args(s(&["--bin", "b", "--lists", "l", "--what"])).is_err());
         assert!(parse_args(s(&["--bin"])).is_err());
+    }
+
+    #[test]
+    fn config_file_is_one_argument_per_line() {
+        let text = "\u{feff}--bin\r\nC:\\Мой запрет\\bin\r\n--lists\r\nC:\\Мой запрет\\exp-list\r\n\r\n--experiment\r\nadaptive:sni-max\r\n--dns\r\n--stamp\r\n1764170000123\r\n";
+        let a = parse_args(config_tokens(text)).unwrap();
+        assert_eq!((a.bin.clone(), a.experiment.as_str(), a.dns), (PathBuf::from("C:\\Мой запрет\\bin"), "adaptive:sni-max", true));
+        assert_eq!(stamp_of(text).as_deref(), Some("1764170000123"));
+        assert_eq!(a, parse_args(config_tokens(&text.replace("1764170000123", "5"))).unwrap());
+        let cmd: Vec<String> = ["--service", "--config", "C:\\data\\rayoflight-config.txt"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(config_path(&cmd), Some(PathBuf::from("C:\\data\\rayoflight-config.txt")));
+        assert_eq!(config_path(&["--config=x.txt".to_string()]), Some(PathBuf::from("x.txt")));
+        assert_eq!(config_path(&["--bin".to_string()]), None);
+    }
+
+    #[test]
+    fn changed_config_is_noticed_and_broken_one_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("hz-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.txt");
+        let first = "--bin\nb\n--lists\nl\n--stamp\n1\n".to_string();
+        std::fs::write(&path, &first).unwrap();
+        let log = Log::open(None);
+        let cfg = (path.clone(), first.clone());
+        let mut bad = None;
+        assert!(changed_config(Some(&cfg), &mut bad, &log).is_none());
+        std::fs::write(&path, "--bin\nb\n--нет-такого\n").unwrap();
+        assert!(changed_config(Some(&cfg), &mut bad, &log).is_none());
+        assert!(bad.is_some());
+        std::fs::write(&path, first.replace("\n1\n", "\n2\n") + "--dns\n").unwrap();
+        let (a, t) = changed_config(Some(&cfg), &mut bad, &log).unwrap();
+        assert!(a.dns);
+        assert_eq!(stamp_of(&t).as_deref(), Some("2"));
+        assert!(changed_config(None, &mut bad, &log).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

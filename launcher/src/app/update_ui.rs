@@ -253,7 +253,7 @@ impl App {
                 (false, true) => format!("Перейти на релиз {v}?"),
                 (false, false) => format!("Вышла HolyZapret {v}"),
             };
-            ui.label(RichText::new(title).size(17.0).strong());
+            ui.label(RichText::new(title).font(crate::theme::semibold(17.0)).strong());
             ui.add_space(4.0);
             if u.running {
                 let (done, total) = u.progress.get();
@@ -294,7 +294,7 @@ impl App {
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if u.running {
-                    if ui.button("Скрыть").on_hover_text("Обновление продолжится, ход виден в Настройках").clicked() {
+                    if crate::theme::button(ui, "Скрыть").on_hover_text("Обновление продолжится, ход виден в «Настройках»").clicked() {
                         hide = true;
                     }
                 } else {
@@ -306,7 +306,7 @@ impl App {
                     if ui.add(theme::Primary(label.into())).clicked() {
                         go = true;
                     }
-                    if ui.button("Позже").clicked() {
+                    if crate::theme::button(ui, "Позже").clicked() {
                         later = true;
                     }
                 }

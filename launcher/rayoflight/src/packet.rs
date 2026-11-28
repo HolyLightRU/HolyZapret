@@ -346,6 +346,57 @@ pub fn set_ttl(p: &mut [u8], ttl: u8) {
     }
 }
 
+pub fn wscale_in(opts: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => return None,
+            1 => i += 1,
+            kind => {
+                let len = *opts.get(i + 1)? as usize;
+                if len < 2 || i + len > opts.len() {
+                    return None;
+                }
+                if kind == 3 && len == 3 {
+                    return Some(opts[i + 2].min(14));
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
+pub fn wscale(t: &Tcp) -> Option<u8> {
+    wscale_in(t.raw.get(t.ip_len + 20..t.ip_len + t.tcp_len)?)
+}
+
+pub fn with_window(raw: &[u8], win: u16) -> Vec<u8> {
+    let mut p = raw.to_vec();
+    let off = match p.first().map(|b| b >> 4) {
+        Some(4) => (p[0] & 0x0f) as usize * 4,
+        Some(6) => 40,
+        _ => return p,
+    };
+    if p.len() >= off + 20 {
+        p[off + 14..off + 16].copy_from_slice(&win.to_be_bytes());
+        fix_checksums(&mut p);
+    }
+    p
+}
+
+pub fn set_flags(p: &mut [u8], flags: u8) {
+    let off = match p.first().map(|b| b >> 4) {
+        Some(4) => (p[0] & 0x0f) as usize * 4,
+        Some(6) => 40,
+        _ => return,
+    };
+    if p.len() >= off + 20 {
+        p[off + 13] = flags;
+        fix_checksums(p);
+    }
+}
+
 pub fn break_tcp_sum(p: &mut [u8]) {
     let off = match p.first().map(|b| b >> 4) {
         Some(4) => (p[0] & 0x0f) as usize * 4,
@@ -380,6 +431,20 @@ pub fn with_ip_id(raw: &[u8], ip_id: u16) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn window_is_rewritten_and_scale_is_read_from_options() {
+        assert_eq!(wscale_in(&[2, 4, 5, 180, 1, 3, 3, 8, 1, 1, 4, 2]), Some(8));
+        assert_eq!(wscale_in(&[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2]), None);
+        assert_eq!(wscale_in(&[3, 9, 1]), None);
+        assert_eq!(wscale_in(&[]), None);
+        let raw = sample_v4(b"hello", true);
+        assert_eq!((parse(&raw).unwrap().win, wscale(&parse(&raw).unwrap())), (512, None));
+        let small = with_window(&raw, 1);
+        let t = parse(&small).unwrap();
+        assert_eq!((t.win, t.payload(), t.seq), (1, &b"hello"[..], 1000));
+        assert!(checksums_ok(&small));
+    }
 
     pub fn sample_udp(payload: &[u8]) -> Vec<u8> {
         let mut p = vec![0u8; 28 + payload.len()];

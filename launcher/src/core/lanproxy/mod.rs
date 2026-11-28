@@ -529,6 +529,23 @@ async fn request(s: &mut TcpStream, first: u8) -> anyhow::Result<(Request, Vec<u
     Ok((req, rest, user_agent(&head)))
 }
 
+struct Counted(Arc<Stats>);
+
+impl Counted {
+    fn new(stats: &Arc<Stats>, peer: IpAddr) -> Self {
+        stats.active.fetch_add(1, Ordering::Relaxed);
+        stats.total.fetch_add(1, Ordering::Relaxed);
+        stats.clients.lock().unwrap().insert(peer);
+        Counted(stats.clone())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> anyhow::Result<()> {
     let peer = s.peer_addr()?.ip();
     let mut first = [0u8; 1];
@@ -555,6 +572,7 @@ async fn handle(mut s: TcpStream, stats: Arc<Stats>, port: u16, local: bool) -> 
         Request::Local { .. } => "страница",
         Request::Udp => "UDP",
     };
+    let _counted = (!matches!(req, Request::Local { .. }) && stats.sharing.load(Ordering::Relaxed)).then(|| Counted::new(&stats, peer));
     if let (Request::Local { .. }, Some(a)) = (&req, agent.as_deref()) {
         if stats.sharing.load(Ordering::Relaxed) {
             stats.device(peer, |d| {
@@ -647,18 +665,10 @@ async fn serve(listener: TcpListener, stats: Arc<Stats>, port: u16, local: bool,
                 let stats = stats.clone();
                 tokio::spawn(async move {
                     let counted = stats.sharing.load(Ordering::Relaxed);
-                    if counted {
-                        stats.active.fetch_add(1, Ordering::Relaxed);
-                        stats.total.fetch_add(1, Ordering::Relaxed);
-                        stats.clients.lock().unwrap().insert(peer.ip());
-                    }
                     if let Err(e) = handle(s, stats.clone(), port, local).await {
                         if counted {
                             stats.error(e.to_string());
                         }
-                    }
-                    if counted {
-                        stats.active.fetch_sub(1, Ordering::Relaxed);
                     }
                 });
             }
@@ -802,6 +812,31 @@ mod tests {
         assert_eq!(control::visit_line(v), format!("127.0.0.1:{p} · HTTPS · 1 раз · получено 2 Б"));
         assert!(d.errors.iter().any(|e| e.contains("непонятный запрос: FOO bar")), "{:?}", d.errors);
         assert!(d.errors.iter().any(|e| e.contains("обычный HTTP-прокси")), "{:?}", d.errors);
+        handle.stop();
+    }
+
+    #[test]
+    fn opening_the_page_is_not_a_connected_device() {
+        let p = echo();
+        let mut handle = start_on("127.0.0.1", 18898, true).unwrap();
+        let mut page = std::net::TcpStream::connect(("127.0.0.1", 18898)).unwrap();
+        page.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Mozilla/5.0 (Linux; Android 10; K)\r\n\r\n").unwrap();
+        let _ = page.read(&mut [0u8; 64]);
+        drop(page);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(handle.stats.clients.lock().unwrap().is_empty(), "страница с инструкцией не подключение");
+        assert_eq!(handle.stats.total.load(Ordering::Relaxed), 0);
+        let mut h = std::net::TcpStream::connect(("127.0.0.1", 18898)).unwrap();
+        h.write_all(format!("CONNECT 127.0.0.1:{p} HTTP/1.1\r\n\r\nhi").as_bytes()).unwrap();
+        let mut got = vec![0u8; 41];
+        h.read_exact(&mut got).unwrap();
+        drop(h);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(handle.stats.clients.lock().unwrap().len(), 1);
+        assert_eq!(handle.stats.total.load(Ordering::Relaxed), 1);
+        assert_eq!(handle.stats.active.load(Ordering::Relaxed), 0);
+        let devices = handle.stats.devices.lock().unwrap().clone();
+        assert_eq!(device_kind(&devices[&"127.0.0.1".parse::<IpAddr>().unwrap()].agents), Some("Android"), "модель запомнилась со страницы");
         handle.stop();
     }
 

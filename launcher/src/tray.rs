@@ -16,6 +16,7 @@ static EVENTS: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
 static LAST_ACTION: Mutex<Option<Instant>> = Mutex::new(None);
 static CTX: OnceLock<eframe::egui::Context> = OnceLock::new();
 static QUIT: AtomicBool = AtomicBool::new(false);
+static WORKING: AtomicBool = AtomicBool::new(false);
 static PHONE: AtomicBool = AtomicBool::new(false);
 static NOTICE: AtomicU64 = AtomicU64::new(0);
 const NOTICE_ID: u32 = 0x485A;
@@ -34,6 +35,10 @@ pub fn set_ctx(ctx: &eframe::egui::Context) {
 
 pub fn busy() -> bool {
     BUSY.load(Ordering::Relaxed)
+}
+
+pub fn set_working(v: bool) {
+    WORKING.store(v, Ordering::Relaxed);
 }
 
 pub fn claim() -> bool {
@@ -65,6 +70,14 @@ fn report(ok: bool, text: impl Into<String>) {
     wake();
 }
 
+fn mode_label(experiment: &str) -> String {
+    if experiment == "adaptive" {
+        "самоподстройка".to_string()
+    } else {
+        crate::core::ray::experiment_label(experiment).to_string()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub on: bool,
@@ -73,15 +86,14 @@ pub struct View {
 
 impl View {
     pub fn from_status(s: &Status) -> View {
-        let strategy = s.active_strategy().unwrap_or_default().to_string();
         let label = match s.service {
             ServiceState::Running if s.foreign_dir().is_some() => "Работает служба zapret из другой папки".to_string(),
-            ServiceState::Running if strategy.is_empty() => "Защита активна".to_string(),
-            ServiceState::Running => format!("Защита активна · {strategy}"),
+            ServiceState::Running if !s.engine_running => "Служба запущена, но движок не работает".to_string(),
+            ServiceState::Running => format!("Защита активна · {}", mode_label(&settings::ray_experiment())),
             ServiceState::Stopped => "Служба остановлена".to_string(),
             ServiceState::NotInstalled => "Защита выключена".to_string(),
         };
-        View { on: s.service == ServiceState::Running, label }
+        View { on: s.service == ServiceState::Running && s.engine_running, label }
     }
 }
 
@@ -171,6 +183,7 @@ pub fn clear_notice() {
 }
 
 pub fn exit() -> ! {
+    crate::core::warpauto::on_exit();
     clear_notice();
     std::process::exit(0)
 }
@@ -185,12 +198,169 @@ pub fn hide_window() -> bool {
 
 pub fn show_window() {
     let h = HWND.load(Ordering::Relaxed);
-    if h != 0 {
-        unsafe {
-            ShowWindow(h as _, SW_SHOW);
-            ShowWindow(h as _, SW_RESTORE);
-            SetForegroundWindow(h as _);
+    if h == 0 {
+        return;
+    }
+    if COMPACT.load(Ordering::Relaxed) {
+        FULL.store(true, Ordering::Relaxed);
+        cloak(true);
+        unsafe { ShowWindow(h as _, SW_HIDE) };
+        tool_window(false);
+        topmost(false);
+    }
+    unsafe {
+        ShowWindow(h as _, SW_SHOW);
+        ShowWindow(h as _, SW_RESTORE);
+        SetForegroundWindow(h as _);
+    }
+    wake();
+}
+
+static COMPACT: AtomicBool = AtomicBool::new(false);
+static FULL: AtomicBool = AtomicBool::new(false);
+static FLY: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
+static FLY_CLOSED: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn set_compact(v: bool) {
+    COMPACT.store(v, Ordering::Relaxed);
+}
+
+pub fn take_full() -> bool {
+    FULL.swap(false, Ordering::Relaxed)
+}
+
+pub fn take_fly() -> Option<(i32, i32, bool)> {
+    FLY.lock().ok().and_then(|mut g| g.take())
+}
+
+pub fn fly_closed() {
+    if let Ok(mut g) = FLY_CLOSED.lock() {
+        *g = Some(Instant::now());
+    }
+}
+
+fn open_fly(x: i32, y: i32, menu: bool) {
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    if FLY_CLOSED.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed().as_millis() < 350) {
+        return;
+    }
+    if COMPACT.load(Ordering::Relaxed) && window_visible() {
+        hide_window();
+        fly_closed();
+        return;
+    }
+    if window_visible() {
+        show_window();
+        return;
+    }
+    if let Ok(mut g) = FLY.lock() {
+        *g = Some((x, y, menu));
+    }
+    cloak(true);
+    tool_window(true);
+    unsafe {
+        ShowWindow(h as _, SW_SHOW);
+        ShowWindow(h as _, SW_RESTORE);
+        SetForegroundWindow(h as _);
+    }
+    topmost(true);
+    wake();
+}
+
+pub fn cloak(on: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    let v: i32 = on as i32;
+    unsafe {
+        DwmSetWindowAttribute(h as _, DWMWA_CLOAK as _, &v as *const i32 as _, 4);
+    }
+}
+
+fn tool_window(on: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW};
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WS_SYSMENU};
+    unsafe {
+        let style = GetWindowLongPtrW(h as _, GWL_EXSTYLE);
+        let next = if on { (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize) } else { style & !(WS_EX_TOOLWINDOW as isize) };
+        if next != style {
+            SetWindowLongPtrW(h as _, GWL_EXSTYLE, next);
         }
+        let base = GetWindowLongPtrW(h as _, GWL_STYLE);
+        if on {
+            if base & WS_SYSMENU as isize != 0 {
+                SYSMENU.store(true, Ordering::Relaxed);
+                SetWindowLongPtrW(h as _, GWL_STYLE, base & !(WS_SYSMENU as isize));
+            }
+        } else if SYSMENU.swap(false, Ordering::Relaxed) {
+            SetWindowLongPtrW(h as _, GWL_STYLE, base | WS_SYSMENU as isize);
+        }
+        SetWindowPos(h as _, std::ptr::null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+static SYSMENU: AtomicBool = AtomicBool::new(false);
+static POP: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+static POP_CLOSED: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn take_pop() -> Option<(i32, i32)> {
+    POP.lock().ok().and_then(|mut g| g.take())
+}
+
+pub fn pop_closed() {
+    if let Ok(mut g) = POP_CLOSED.lock() {
+        *g = Some(Instant::now());
+    }
+}
+
+pub fn popup_ready(title: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GWL_STYLE, GetWindowLongPtrW, SetWindowLongPtrW, WS_SYSMENU};
+    let name: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let h = FindWindowW(std::ptr::null(), name.as_ptr());
+        if h.is_null() {
+            return false;
+        }
+        let style = GetWindowLongPtrW(h, GWL_STYLE);
+        SetWindowLongPtrW(h, GWL_STYLE, style & !(WS_SYSMENU as isize));
+        crate::window::popup_backdrop(h as isize);
+        SetForegroundWindow(h);
+        true
+    }
+}
+
+pub fn topmost(on: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
+    let h = HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(h as _, if on { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+pub fn work_area(x: i32, y: i32) -> Option<([i32; 4], [i32; 4])> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
+    unsafe {
+        let m = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(m, &mut info) == 0 {
+            return None;
+        }
+        let r = |r: windows_sys::Win32::Foundation::RECT| [r.left, r.top, r.right, r.bottom];
+        Some((r(info.rcMonitor), r(info.rcWork)))
     }
 }
 
@@ -212,7 +382,7 @@ fn dimmed(rgba: &[u8]) -> Vec<u8> {
 fn sync() {
     let view = STATE.lock().ok().and_then(|g| g.clone());
     UI.with(|u| {
-        let mut u = u.borrow_mut();
+        let Ok(mut u) = u.try_borrow_mut() else { return };
         let Some(ui) = u.as_mut() else { return };
         let tg = crate::core::tgproxy::control::running();
         if ui.tg_shown != Some(tg) {
@@ -236,6 +406,10 @@ unsafe extern "system" fn on_timer(_: windows_sys::Win32::Foundation::HWND, _: u
 }
 
 fn toggle(paths: Paths) {
+    if WORKING.load(Ordering::Relaxed) {
+        report(false, "Из трея: сейчас идёт подбор, обновление или другое действие со службой, попробуйте, когда оно закончится");
+        return;
+    }
     if BUSY.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -287,7 +461,7 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
     let status = MenuItem::new("HolyZapret", false, None);
     let toggle_item = MenuItem::new("Включить защиту", paths.is_some(), None);
     let tg_item = MenuItem::new("Включить Telegram-прокси", true, None);
-    let phone = MenuItem::new("Раздача на телефон…", true, None);
+    let phone = MenuItem::new("Устройства…", true, None);
     let open = MenuItem::new("Открыть HolyZapret", true, None);
     let quit = MenuItem::new("Выход", true, None);
     let sep = PredefinedMenuItem::separator();
@@ -306,7 +480,7 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
             show_window();
             wake();
         } else if e.id == quit_id {
-            if crate::core::lanproxy::control::running() {
+            if crate::core::lanproxy::control::running() || WORKING.load(Ordering::Relaxed) || busy() {
                 QUIT.store(true, Ordering::Relaxed);
                 show_window();
                 wake();
@@ -328,11 +502,24 @@ pub fn create(rgba: Vec<u8>, w: u32, h: u32, paths: Option<Paths>) -> bool {
         }
     }));
     TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-            show_window();
+        let TrayIconEvent::Click { button, button_state: MouseButtonState::Up, position, .. } = e else { return };
+        let (x, y) = (position.x as i32, position.y as i32);
+        match button {
+            MouseButton::Left => open_fly(x, y, false),
+            MouseButton::Right if window_visible() && !COMPACT.load(Ordering::Relaxed) => {
+                if POP_CLOSED.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed().as_millis() < 350) {
+                    return;
+                }
+                if let Ok(mut g) = POP.lock() {
+                    *g = Some((x, y));
+                }
+                wake();
+            }
+            MouseButton::Right => open_fly(x, y, true),
+            _ => {}
         }
     }));
-    let Ok(icon) = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("HolyZapret").with_icon(dim.clone()).build() else {
+    let Ok(icon) = TrayIconBuilder::new().with_menu(Box::new(menu)).with_menu_on_left_click(false).with_menu_on_right_click(false).with_tooltip("HolyZapret").with_icon(dim.clone()).build() else {
         return false;
     };
     UI.with(|u| *u.borrow_mut() = Some(TrayUi { icon, status, toggle: toggle_item, tg: tg_item, tg_shown: None, lit, dim, shown: None }));
@@ -360,9 +547,16 @@ mod tests {
 
     #[test]
     fn views() {
-        let v = View::from_status(&status(ServiceState::Running, Some("additional\\general")));
+        let v = View::from_status(&status(ServiceState::Running, Some("rayoflight:adaptive")));
+        assert!(!v.on);
+        assert_eq!(v.label, "Служба запущена, но движок не работает");
+        let mut s = status(ServiceState::Running, Some("rayoflight:adaptive"));
+        s.engine_running = true;
+        let v = View::from_status(&s);
         assert!(v.on);
-        assert_eq!(v.label, "Защита активна · additional\\general");
+        assert!(v.label.starts_with("Защита активна · "));
+        assert!(!v.label.contains("rayoflight:"));
+        assert_eq!(mode_label("adaptive"), "самоподстройка");
         let v = View::from_status(&status(ServiceState::NotInstalled, None));
         assert!(!v.on);
         assert_eq!(v.label, "Защита выключена");

@@ -2,6 +2,7 @@ mod appcheck_ui;
 mod confirm;
 mod crash_ui;
 mod diag_tab;
+mod flyout;
 mod home_ray;
 mod lists_tab;
 mod phone_tab;
@@ -36,6 +37,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use theme::{CYAN, GREEN, PINK, RED, YELLOW};
 
 const TOAST_LIFE: f64 = 4.5;
+
+enum AfterWarp {
+    Pick { full: bool },
+    Sites,
+    SiteRecheck(Vec<String>),
+    Rules,
+    RulesRecheck,
+    Batch(Vec<String>),
+}
 
 const POST_INSTALL: &str = "Проверка после установки";
 const SITE_RETRIES: u8 = 2;
@@ -95,7 +105,7 @@ fn auto_repick_now(p: &Paths, current: Option<&str>, tx: &Sender<Msg>, ctx: &egu
     done.store(true, Ordering::Relaxed);
     let msg = match r {
         Ok(crate::core::picker::Choice::Switch { path, name, from, score }) => match strategies.iter().find(|s| s.path == path) {
-            Some(s) => match service::install(p, s) {
+            Some(s) => match service::install_variant(p, s) {
                 Ok(_) => {
                     let text = match from {
                         Some((old, was)) => format!("Поставлена «{name}» вместо «{old}»: открывает {score} сайтов против {was}"),
@@ -203,13 +213,13 @@ fn notify(tx: &Sender<Msg>, lvl: Lvl, text: impl Into<String>) {
 fn hero_toggle(ui: &mut egui::Ui, title: &str, sub: &str, on: bool, tip: &str) -> Option<bool> {
     let mut v = on;
     let changed = ui
-        .allocate_ui_with_layout(egui::vec2(230.0, 38.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        .allocate_ui_with_layout(egui::vec2(250.0, 38.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let c = theme::toggle(ui, &mut v).changed();
             ui.add_space(4.0);
-            let r = ui.allocate_ui_with_layout(egui::vec2(180.0, 38.0), egui::Layout::top_down(egui::Align::Max), |ui| {
+            let r = ui.allocate_ui_with_layout(egui::vec2(200.0, 38.0), egui::Layout::top_down(egui::Align::Max), |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(title);
-                ui.add(egui::Label::new(RichText::new(sub).weak().size(12.5)).truncate());
+                ui.add(egui::Label::new(title).extend());
+                ui.add(egui::Label::new(RichText::new(sub).weak().size(12.5)).truncate().show_tooltip_when_elided(tip.is_empty()));
             });
             if !tip.is_empty() {
                 r.response.on_hover_text(tip);
@@ -258,7 +268,6 @@ fn lvl_icon(l: Lvl) -> &'static str {
 enum Tab {
     Wizard,
     Main,
-    Picker,
     Sites,
     Diagnostics,
     Tools,
@@ -274,6 +283,7 @@ pub struct App {
     selected: Option<usize>,
     status: Option<Status>,
     tab: Tab,
+    settings_last: Tab,
     log: Vec<Entry>,
     log_filter: usize,
     toasts: Vec<Toast>,
@@ -312,6 +322,12 @@ pub struct App {
     close_to_tray: bool,
     sidebar_open: bool,
     sidebar_peek: bool,
+    nav_origin: egui::Pos2,
+    hero_rect: egui::Rect,
+    fly: flyout::FlyState,
+    after_warp: Option<AfterWarp>,
+    after_warp_armed: bool,
+    pop: Option<flyout::Pop>,
     advanced: bool,
     saved: Settings,
     lists: lists_tab::ListsState,
@@ -329,6 +345,7 @@ pub struct App {
     health_alert: Vec<String>,
     old_folder: Option<std::path::PathBuf>,
     reinstall_later: bool,
+    quit_later: bool,
     unpack: Option<unpack_ui::UnpackState>,
     share: share_ui::ShareState,
     update: update_ui::UpdateUi,
@@ -337,6 +354,51 @@ pub struct App {
     tray: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+}
+
+fn service_upkeep(p: &Paths, tx: &Sender<Msg>, migrated: Option<String>) {
+    use crate::core::service::{self as svc, Owner};
+    crate::core::update::drop_leftovers(p);
+    let legacy = svc::legacy_installed();
+    let st = svc::status(p);
+    if st.service == ServiceState::NotInstalled {
+        if crate::core::ray::installed() {
+            crate::core::ray::remove();
+            notify(tx, Lvl::Info, "Удалена служба rayoflight от прошлой версии: теперь RayOfLight работает внутри службы HolyZapret");
+        }
+        return;
+    }
+    if st.owner != Owner::Ours {
+        return;
+    }
+    let why = if legacy {
+        "Служба переведена на движок RayOfLight, старый движок больше не нужен".to_string()
+    } else if let Some(t) = &migrated {
+        format!(
+            "Служба переведена на самоподстройку: первым шагом идёт «{}», а если сайт на нём не откроется, RayOfLight попробует другие приёмы",
+            crate::core::ray::experiment_label(t)
+        )
+    } else if svc::stale(p) && crate::core::settings::take_refresh(env!("CARGO_PKG_VERSION")) {
+        format!("Служба перезапущена с настройками HolyZapret {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        return;
+    };
+    let id = st.installed_strategy.clone().unwrap_or_default();
+    let all = crate::core::ray::variants(p);
+    let Some(s) = all.iter().find(|s| s.matches(&id)).or_else(|| all.iter().find(|s| s.id == crate::core::ray::DEFAULT_ID)).cloned() else { return };
+    while !tray::claim() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let running = st.service == ServiceState::Running;
+    let r = svc::install(p, &s);
+    if r.is_ok() && !running {
+        crate::core::run_hidden("net", &["stop", svc::SERVICE]);
+    }
+    tray::release();
+    match r {
+        Ok(_) => notify(tx, Lvl::Ok, why),
+        Err(e) => notify(tx, Lvl::Err, format!("Не удалось обновить службу: {e}")),
+    }
 }
 
 impl App {
@@ -359,6 +421,7 @@ impl App {
             selected: None,
             status: None,
             tab: Tab::Main,
+            settings_last: Tab::Tools,
             log: Vec::new(),
             log_filter: 0,
             toasts: Vec::new(),
@@ -400,6 +463,12 @@ impl App {
             close_to_tray: saved.close_to_tray && tray,
             sidebar_open: saved.sidebar_open,
             sidebar_peek: false,
+            nav_origin: egui::Pos2::ZERO,
+            hero_rect: egui::Rect::NOTHING,
+            fly: Default::default(),
+            after_warp: None,
+            after_warp_armed: false,
+            pop: None,
             advanced: saved.advanced,
             saved,
             lists: Default::default(),
@@ -417,6 +486,7 @@ impl App {
             health_alert: Vec::new(),
             old_folder: None,
             reinstall_later: false,
+            quit_later: false,
             unpack: None,
             share: Default::default(),
             update: Default::default(),
@@ -452,7 +522,7 @@ impl App {
         if app.paths.is_none() {
             app.unpack = unpack_ui::UnpackState::detect();
             if app.unpack.is_none() {
-                app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\HolyZapret.exe — положите лаунчер внутрь HolyZapret"));
+                app.log.push(Entry::new(Lvl::Err, "Не найдена папка с bin\\RayOfLight.exe — положите лаунчер внутрь папки HolyZapret"));
             }
         }
         match crate::core::lanproxy::control::autostart() {
@@ -526,42 +596,9 @@ impl App {
             crate::core::warpauto::spawn(p, move |m| notify(&tx, Lvl::Info, m));
         }
         let migrated = crate::core::ray::migrate_fixed_technique();
-        if let (Some(p), Some(t)) = (app.paths.clone().filter(|_| !crate::core::service::legacy_installed()), migrated) {
+        if let Some(p) = app.paths.clone() {
             let tx = app.tx.clone();
-            std::thread::spawn(move || {
-                let st = crate::core::service::status(&p);
-                if st.owner != crate::core::service::Owner::Ours || st.service == ServiceState::NotInstalled {
-                    return;
-                }
-                let Some(s) = crate::core::ray::variants(&p).into_iter().find(|s| s.id == crate::core::ray::DEFAULT_ID) else { return };
-                let label = crate::core::ray::experiment_label(&t).to_string();
-                match crate::core::service::install(&p, &s) {
-                    Ok(_) => notify(&tx, Lvl::Ok, format!("Служба переведена на самоподстройку: первым шагом идёт «{label}», а если сайт на нём не откроется, RayOfLight попробует другие приёмы")),
-                    Err(e) => notify(&tx, Lvl::Err, format!("Не удалось перевести службу на самоподстройку: {e}")),
-                }
-            });
-        }
-        if let Some(p) = app.paths.clone().filter(|_| crate::core::service::legacy_installed()) {
-            let tx = app.tx.clone();
-            std::thread::spawn(move || {
-                let st = crate::core::service::status(&p);
-                if st.service == ServiceState::NotInstalled {
-                    if crate::core::ray::installed() {
-                        crate::core::ray::remove();
-                        notify(&tx, Lvl::Info, "Удалена служба rayoflight от прошлой версии: теперь RayOfLight работает внутри службы HolyZapret");
-                    }
-                    return;
-                }
-                if st.owner != crate::core::service::Owner::Ours {
-                    return;
-                }
-                let id = st.installed_strategy.clone().unwrap_or_default();
-                let Some(s) = crate::core::ray::variants(&p).into_iter().find(|s| s.matches(&id)) else { return };
-                match crate::core::service::install(&p, &s) {
-                    Ok(_) => notify(&tx, Lvl::Ok, "Служба переведена на движок RayOfLight, старый движок больше не нужен"),
-                    Err(e) => notify(&tx, Lvl::Err, format!("Не удалось перевести службу на RayOfLight: {e}")),
-                }
-            });
+            std::thread::spawn(move || service_upkeep(&p, &tx, migrated));
         }
         if std::env::args().any(|a| a == crate::core::unpack::UPDATED_ARG) {
             let v = env!("CARGO_PKG_VERSION");
@@ -745,7 +782,10 @@ impl App {
                     }
                 }
                 Msg::Autostart(on) => self.autostart = Some(on),
-                Msg::Warp(w) => self.warp = Some(w),
+                Msg::Warp(w) => {
+                    self.warp = Some(w);
+                    self.resume_after_warp(ctx);
+                }
                 Msg::TgForeign(f) => self.tg.foreign = f,
                 Msg::TgClient(c) => {
                     if c.is_none() && self.tab == Tab::Telegram {
@@ -868,17 +908,31 @@ impl App {
     fn apply_to_service(&mut self, ctx: &egui::Context, done: String) {
         match self.installed_variant().filter(|_| self.service_installed()) {
             Some(s) if !self.busy && !tray::busy() => {
-                self.toast(ctx, Lvl::Info, format!("{done}. Переустанавливаю службу, чтобы применить"));
+                self.toast(ctx, Lvl::Info, format!("{done}. Применяю"));
                 self.spawn(ctx, move |p, tx| {
-                    result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
+                    result_msg(tx, crate::core::service::refresh(p, &s), "Не удалось переустановить службу");
                 });
             }
             Some(_) => {
                 self.reinstall_later = true;
-                self.toast(ctx, Lvl::Info, format!("{done}. Служба переустановится, как только закончится текущее действие"));
+                self.toast(ctx, Lvl::Info, format!("{done}. Применю, как только закончится текущее действие"));
             }
             None if self.service_installed() => self.toast(ctx, Lvl::Info, format!("{done}. Переустановите службу, чтобы применить")),
             None => self.toast(ctx, Lvl::Info, done),
+        }
+    }
+
+    fn working(&self) -> bool {
+        self.busy || self.picker.running() || self.rules.running() || self.update.running || tray::busy()
+    }
+
+    pub(super) fn request_quit(&mut self, ctx: &egui::Context) {
+        if !self.working() {
+            tray::exit();
+        }
+        if !self.quit_later {
+            self.quit_later = true;
+            self.toast(ctx, Lvl::Info, "Выйду, как только закончится текущее действие: так служба вернётся в рабочее состояние");
         }
     }
 
@@ -888,9 +942,9 @@ impl App {
         }
         self.reinstall_later = false;
         if let Some(s) = self.installed_variant().filter(|_| self.service_installed()) {
-            self.toast(ctx, Lvl::Info, "Применяю новые настройки: переустанавливаю службу");
+            self.toast(ctx, Lvl::Info, "Применяю новые настройки");
             self.spawn(ctx, move |p, tx| {
-                result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
+                result_msg(tx, crate::core::service::refresh(p, &s), "Не удалось переустановить службу");
             });
         }
     }
@@ -933,7 +987,7 @@ impl App {
     fn install_strategy(&mut self, ctx: &egui::Context, s: strategy::Strategy) {
         self.spawn(ctx, move |p, tx| {
             send(tx, Lvl::Info, format!("Устанавливаю службу: {}", crate::core::ray::install_label(&s)));
-            match service::install(p, &s) {
+            match service::install_variant(p, &s) {
                 Ok(m) => {
                     notify(tx, Lvl::Ok, m);
                     match crate::core::ray::wait_ready(p, std::time::Duration::from_secs(15)) {
@@ -975,28 +1029,28 @@ impl App {
         self.window_ready = true;
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui, expand: f32) {
-        ui.add_space(4.0);
+    fn sidebar(&mut self, ui: &mut egui::Ui, expand: f32, overlay: bool) {
+        let origin = ui.cursor().min;
+        if overlay {
+            let shift = self.nav_origin - origin;
+            ui.add_space(4.0 + shift.y.max(0.0));
+        } else {
+            self.nav_origin = origin;
+            ui.add_space(4.0);
+        }
         let mut items = vec![
             (Tab::Main, theme::icon::HOME, "Главная"),
-            (Tab::Picker, theme::icon::PICK, "Подбор"),
         ];
         if self.tg.client.is_some() {
             items.push((Tab::Telegram, theme::icon::TELEGRAM, "Telegram"));
         }
-        items.push((Tab::Phone, theme::icon::PHONE, "Телефон"));
-        items.extend([
-            (Tab::Sites, theme::icon::GLOBE, "Сайты"),
-            (Tab::Diagnostics, theme::icon::DIAGNOSTIC, "Диагностика"),
-            (Tab::Tools, theme::icon::TOOLS, "Инструменты"),
-        ]);
-        if self.advanced {
-            items.push((Tab::Lists, theme::icon::LISTS, "Списки"));
-        }
-        items.push((Tab::Log, theme::icon::LOG, "Журнал"));
+        items.push((Tab::Phone, theme::icon::DEVICES, "Устройства"));
+        items.push((Tab::Sites, theme::icon::GLOBE, "Сайты"));
+        items.push((Tab::Tools, theme::icon::SETTINGS, "Настройки"));
         for (t, glyph, name) in items {
-            if theme::nav_item(ui, self.tab == t, glyph, name, expand).clicked() {
-                self.tab = t;
+            let selected = if t == Tab::Tools { in_settings(self.tab) } else { self.tab == t };
+            if theme::nav_item(ui, selected, glyph, name, expand).clicked() {
+                self.tab = if t == Tab::Tools { self.settings_last } else { t };
             }
         }
         if expand < 0.6 {
@@ -1038,7 +1092,7 @@ impl App {
                     ServiceState::Stopped => "Запустить службу",
                     ServiceState::NotInstalled => "Включить защиту с RayOfLight",
                 };
-                let resp = theme::power_button(ui, running, self.busy || tray::busy()).on_hover_text(tip);
+                let resp = theme::power_button_at(ui, running, self.busy || tray::busy(), 7.0).on_hover_text(tip);
                 if resp.clicked() && !self.busy && !tray::busy() && self.paths.is_some() {
                     if foreign {
                         self.install_general(ctx);
@@ -1047,7 +1101,7 @@ impl App {
                     }
                 }
                 ui.add_space(10.0);
-                let text_w = (ui.available_width() - 230.0).max(180.0);
+                let text_w = (ui.available_width() - 250.0).max(180.0);
                 ui.vertical(|ui| {
                     ui.set_max_width(text_w);
                     ui.add_space(8.0);
@@ -1057,26 +1111,33 @@ impl App {
                         ServiceState::Stopped => "Служба остановлена",
                         ServiceState::NotInstalled => "Защита выключена",
                     };
-                    ui.label(RichText::new(title).size(22.0).strong().color(Color32::WHITE));
-                    let ray_sub = || {
-                        let (q, e) = (settings::ray_quic(), settings::ray_experiment());
-                        if q == "adaptive" && e == "adaptive" {
-                            return match crate::core::ray::start_technique() {
-                                Some(t) => format!("RayOfLight · самоподстройка, первым шагом «{}»", crate::core::ray::experiment_label(&t)),
-                                None => "RayOfLight · самоподстройка".to_string(),
-                            };
+                    ui.label(RichText::new(title).font(crate::theme::semibold(22.0)).strong().color(Color32::WHITE));
+                    let (q, e) = (settings::ray_quic(), settings::ray_experiment());
+                    let (mode, mode_tip) = if q == "adaptive" && e == "adaptive" {
+                        match crate::core::ray::start_technique() {
+                            Some(t) => (
+                                format!("самоподстройка · первым «{}»", crate::core::ray::experiment_label(&t)),
+                                format!("RayOfLight сам подбирает приём для каждого сайта. Первым идёт «{}»: его выбрал подбор", crate::core::ray::experiment_label(&t)),
+                            ),
+                            None => ("самоподстройка".to_string(), "RayOfLight сам подбирает приём для каждого сайта".to_string()),
                         }
-                        format!("RayOfLight · {} · {}", crate::core::ray::experiment_label(&e), crate::core::ray::quic_label(&q))
+                    } else {
+                        let text = format!("{} · {}", crate::core::ray::experiment_label(&e), crate::core::ray::quic_label(&q));
+                        (text.clone(), format!("RayOfLight работает на одном приёме: {text}"))
                     };
                     let sub = match (s.foreign_dir(), s.active_strategy()) {
                         (Some(d), _) => format!("Нажмите кнопку, чтобы поставить службу из этой папки · сейчас она из {}", d.display()),
                         (None, Some(n)) if !n.to_lowercase().starts_with("rayoflight:") => format!("Служба от старой версии HolyZapret: {n}"),
-                        (None, Some(_)) => ray_sub(),
-                        (None, None) => format!("Нажмите кнопку: включится {}", ray_sub()),
+                        _ => match s.service {
+                            ServiceState::Running if s.engine_running => "Сайты из списков открываются через обход".to_string(),
+                            ServiceState::Running => "Служба запущена, но движок не работает".to_string(),
+                            ServiceState::Stopped => "Нажмите, чтобы запустить службу".to_string(),
+                            ServiceState::NotInstalled => "Нажмите, чтобы включить обход".to_string(),
+                        },
                     };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.add(egui::Label::new(RichText::new(&sub).color(Color32::from_gray(160))).truncate()).on_hover_text(&sub);
+                        ui.add(egui::Label::new(RichText::new(&sub).color(Color32::from_gray(160))).truncate());
                         if let Some((text, hover)) = &extra {
                             let link = ui
                                 .add(egui::Label::new(RichText::new(text).color(theme::CYAN)).sense(egui::Sense::click()))
@@ -1095,24 +1156,27 @@ impl App {
                         if s.foreign_dir().is_some() {
                             theme::chip(ui, "Чужая служба", YELLOW)
                                 .on_hover_text("Служба установлена из другой папки. Кнопка старта поставит вместо неё службу из этой папки");
-                        } else if !s.foreign_engines.is_empty() {
+                        } else {
+                            theme::chip(ui, &mode, PINK).on_hover_text(&mode_tip);
+                        }
+                        if !s.foreign_engines.is_empty() {
                             theme::chip(ui, "Запущен другой обход", YELLOW).on_hover_text(
                                 s.foreign_engines.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join("\n"),
                             );
-                        } else if s.engine_running {
-                            theme::chip(ui, "Движок работает", GREEN);
-                        } else {
-                            theme::chip(ui, "Движок остановлен", RED);
                         }
-                        let (c, t) = match s.windivert {
-                            ServiceState::Running => (GREEN, "WinDivert загружен"),
-                            ServiceState::Stopped => (YELLOW, "WinDivert на паузе"),
-                            ServiceState::NotInstalled => (RED, "WinDivert не загружен"),
-                        };
-                        theme::chip(ui, t, c);
-                        if s.windivert != ServiceState::NotInstalled
-                            && !s.engine_running
-                            && theme::icon_button(ui, theme::icon::EJECT, "Выгрузить драйвер WinDivert").clicked()
+                        if running && !s.engine_running {
+                            theme::chip(ui, "Движок остановлен", RED).on_hover_text("Служба запущена, но RayOfLight не работает. Последняя строка его журнала — ниже на главной");
+                        }
+                        if running && s.windivert == ServiceState::NotInstalled {
+                            theme::chip(ui, "WinDivert не загружен", RED).on_hover_text("Драйвер перехвата не загружен: обход не работает");
+                        }
+                        let stuck = s.windivert != ServiceState::NotInstalled && !s.engine_running;
+                        if stuck {
+                            let t = if s.windivert == ServiceState::Stopped { "WinDivert на паузе" } else { "WinDivert загружен" };
+                            theme::chip(ui, t, YELLOW).on_hover_text("Драйвер перехвата остался в памяти без движка. Его можно выгрузить кнопкой рядом");
+                        }
+                        if stuck
+                            && theme::icon_button_at(ui, theme::icon::EJECT, "Выгрузить драйвер WinDivert", -4.0).clicked()
                             && !self.busy
                         {
                             self.spawn(ctx, |_, tx| {
@@ -1123,7 +1187,10 @@ impl App {
                                 )
                             });
                         }
-                        if theme::icon_button(ui, theme::icon::REFRESH, "Обновить статус").clicked() {
+                        let near = ui.ctx().input(|i| i.pointer.hover_pos()).is_some_and(|p| self.hero_rect.contains(p));
+                        if !near {
+                            ui.allocate_exact_size(egui::Vec2::splat(30.0), egui::Sense::hover());
+                        } else if theme::icon_button_at(ui, theme::icon::REFRESH, "Обновить статус", -4.0).clicked() {
                             self.refresh(ctx);
                         }
                     });
@@ -1132,7 +1199,7 @@ impl App {
                 let mut game_on = None;
                 let mut warp_on = None;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.allocate_ui_with_layout(egui::vec2(230.0, if warp_row { 92.0 } else { 44.0 }), egui::Layout::top_down(egui::Align::Max), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(250.0, if warp_row { 92.0 } else { 44.0 }), egui::Layout::top_down(egui::Align::Max), |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         if let Some(v) = hero_toggle(ui, "Игровой фильтр", &s.game.summary(), s.game.enabled(), "") {
                             game_on = Some(v);
@@ -1155,6 +1222,8 @@ impl App {
                     self.set_warp_fallback(ctx, on);
                 }
             });
+            self.warp_line(ui, ctx);
+            self.hero_rect = ui.min_rect();
         });
         if to_sites {
             self.tab = Tab::Sites;
@@ -1165,20 +1234,20 @@ impl App {
         self.home.refresh(self.paths.as_ref());
         self.health_card(ui, ctx);
         self.hero(ui, ctx);
-        self.warp_row(ui, ctx);
+        ui.add_space(2.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.ray_home(ui, ctx));
     }
 
     fn log_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Журнал").size(17.0).strong());
+                ui.label(RichText::new("Журнал").font(crate::theme::semibold(17.0)).strong());
                 ui.label(RichText::new(format!("{}", self.log.len())).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::icon_button(ui, theme::icon::DELETE, "Очистить журнал").clicked() {
                         self.log.clear();
                     }
-                    if ui.add_enabled(self.paths.is_some() && !self.busy, egui::Button::new("Отчёт для разработчика")).on_hover_text("Соберёт всё о вашей системе и обходе в один файл на рабочем столе, его можно отправить разработчику").clicked() {
+                    if ui.add_enabled(self.paths.is_some() && !self.busy, crate::theme::GlassButton::new("Отчёт для разработчика")).on_hover_text("Соберёт всё о вашей системе и обходе в один файл на рабочем столе, его можно отправить разработчику").clicked() {
                         self.open_report();
                     }
                     if theme::icon_button(ui, theme::icon::COPY, "Скопировать всё").clicked() {
@@ -1374,6 +1443,10 @@ fn title_text(ui: &egui::Ui, center_x: f32, center_y: f32, version: &str) {
     p.galley(egui::pos2(left + title.size().x + gap, v_top), ver, Color32::from_gray(140));
 }
 
+fn in_settings(t: Tab) -> bool {
+    matches!(t, Tab::Diagnostics | Tab::Tools | Tab::Lists | Tab::Log)
+}
+
 fn resize_edges(ctx: &egui::Context) {
     if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
         return;
@@ -1418,12 +1491,24 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.setup_window(frame);
         self.poll(&ctx);
+        self.fly_update(&ctx);
         self.reinstall_if_waiting(&ctx);
         if tray::take_phone() && self.paths.is_some() {
             self.tab = Tab::Phone;
         }
+        tray::set_working(self.working());
         if tray::take_quit() {
-            self.confirm = Some(confirm::Confirm::QuitSharing);
+            if crate::core::lanproxy::control::running() {
+                self.confirm = Some(confirm::Confirm::QuitSharing);
+            } else {
+                self.request_quit(&ctx);
+            }
+        }
+        if self.quit_later {
+            if !self.working() {
+                tray::exit();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         let tray_events = tray::take_events();
         if !tray_events.is_empty() {
@@ -1454,21 +1539,24 @@ impl eframe::App for App {
             } else if crate::core::lanproxy::control::running() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.confirm = Some(confirm::Confirm::QuitSharing);
-            } else if self.picker.running() {
+            } else if self.working() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.toast(
-                    &ctx,
-                    Lvl::Info,
-                    "Идёт подбор: дождитесь окончания или отмените его, чтобы служба вернулась в прежнее состояние",
-                );
+                self.request_quit(&ctx);
             }
         }
 
         theme::backdrop(&ctx.layer_painter(egui::LayerId::background()), ctx.content_rect());
 
+        if self.fly.compact {
+            self.flyout_ui(ui, &ctx);
+            self.draw_toasts(&ctx);
+            self.ui_busy.store(self.busy || self.picker.running || self.update.running, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+
         egui::Panel::top("title")
             .exact_size(TITLE_H)
-            .frame(Frame::new().fill(Color32::from_black_alpha(30)))
+            .frame(Frame::new().fill(Color32::from_black_alpha(14)))
             .show(ui, |ui| {
                 let mut version = self.local_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
                 if crate::core::TEST_BUILD {
@@ -1481,25 +1569,27 @@ impl eframe::App for App {
         let panel = egui::Panel::left("nav")
             .exact_size(64.0 + 136.0 * expand)
             .resizable(false)
-            .frame(Frame::new().fill(Color32::from_black_alpha(70)).inner_margin(Margin::same(12)))
-            .show(ui, |ui| self.sidebar(ui, expand));
+            .frame(Frame::new().fill(Color32::from_black_alpha(34)).inner_margin(Margin::same(12)))
+            .show(ui, |ui| self.sidebar(ui, expand, false));
         if !self.sidebar_open && self.confirm.is_none() {
             let base = panel.response.rect;
-            let peek = ctx.animate_bool_with_time(ui.make_persistent_id("sidebar_peek"), self.sidebar_peek, 0.16);
+            let peek = ctx.animate_bool_with_time(ui.make_persistent_id("sidebar_peek"), self.sidebar_peek, 0.2);
+            let solid = peek * peek * (3.0 - 2.0 * peek);
             let width = 64.0 + 136.0 * peek;
             let zone = egui::Rect::from_min_size(base.min, egui::vec2(width, base.height()));
             self.sidebar_peek = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| zone.contains(p));
             if peek > 0.01 {
                 egui::Area::new(egui::Id::NULL.with("nav_peek")).order(egui::Order::Middle).fixed_pos(base.min).show(&ctx, |ui| {
                     Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(20, 16, 26, 246))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(18 + (10.0 * peek) as u8)))
-                        .shadow(egui::epaint::Shadow { offset: [6, 0], blur: 18, spread: 0, color: Color32::from_black_alpha((90.0 * peek) as u8) })
-                        .inner_margin(Margin::same(12))
+                        .fill(Color32::from_rgba_unmultiplied(27, 22, 33, (255.0 * solid) as u8))
+                        .corner_radius(CornerRadius { nw: 0, ne: theme::CARD_RADIUS, sw: 0, se: theme::CARD_RADIUS })
+                        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha((28.0 * solid) as u8)))
+                        .shadow(egui::epaint::Shadow { offset: [6, 0], blur: 18, spread: 0, color: Color32::from_black_alpha((90.0 * solid) as u8) })
+                        .inner_margin(Margin { left: 11, right: 12, top: 12, bottom: 12 })
                         .show(ui, |ui| {
                             ui.set_width(width - 24.0);
                             ui.set_height(base.height() - 24.0);
-                            self.sidebar(ui, peek);
+                            self.sidebar(ui, peek, true);
                         });
                 });
             }
@@ -1514,14 +1604,10 @@ impl eframe::App for App {
             .show(ui, |ui| match self.tab {
                 Tab::Wizard => self.wizard_tab(ui, &ctx),
                 Tab::Main => self.main_tab(ui, &ctx),
-                Tab::Picker => self.picker_tab(ui, &ctx),
                 Tab::Sites => self.sites_tab(ui, &ctx),
-                Tab::Diagnostics => self.diag_tab(ui, &ctx),
-                Tab::Tools => self.tools_tab(ui, &ctx),
+                Tab::Diagnostics | Tab::Tools | Tab::Lists | Tab::Log => self.settings_tab(ui, &ctx),
                 Tab::Telegram => self.tg_tab(ui, &ctx),
                 Tab::Phone => self.phone_tab(ui, &ctx),
-                Tab::Lists => self.lists_tab(ui, &ctx),
-                Tab::Log => self.log_tab(ui, &ctx),
             });
         self.draw_toasts(&ctx);
         self.draw_confirm(&ctx);
@@ -1533,6 +1619,7 @@ impl eframe::App for App {
         if self.confirm.is_none() && self.tab != Tab::Wizard && self.unpack.is_none() {
             self.draw_whats_new(&ctx);
         }
+        self.popup_update(&ctx);
         self.ui_busy.store(self.busy || self.picker.running || self.update.running, std::sync::atomic::Ordering::Relaxed);
         let now = Settings {
             advanced: self.advanced,

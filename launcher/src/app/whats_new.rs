@@ -3,6 +3,7 @@ use crate::theme::{self, CYAN};
 use eframe::egui::{self, Color32, CornerRadius, RichText};
 
 pub const RELEASES: &str = "https://github.com/HolyLightRU/HolyZapret/releases/tag/v";
+pub const REPO: &str = "https://github.com/HolyLightRU/HolyZapret";
 
 pub enum Line {
     Heading(String),
@@ -58,7 +59,7 @@ impl App {
                     match l {
                         Line::Heading(t) => {
                             ui.add_space(4.0);
-                            ui.label(RichText::new(t).size(15.0).strong());
+                            ui.label(RichText::new(t).font(crate::theme::semibold(15.0)).strong());
                         }
                         Line::Bullet(t) => {
                             ui.horizontal_top(|ui| {
@@ -72,12 +73,24 @@ impl App {
                     }
                 }
             });
-            ui.add_space(12.0);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new("Нравится HolyZapret?").color(Color32::from_gray(150)).size(12.5));
+                let star = ui
+                    .add(egui::Label::new(RichText::new("Поставьте звезду на GitHub ★").color(CYAN).size(12.5)).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Так HolyZapret проще найти другим");
+                if star.clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(REPO));
+                }
+            });
+            ui.add_space(8.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(theme::Primary("Понятно".into())).clicked() {
                     close = true;
                 }
-                if ui.button("Открыть на GitHub").clicked() {
+                if crate::theme::button(ui, "Открыть на GitHub").clicked() {
                     ctx.open_url(egui::OpenUrl::new_tab(format!("{RELEASES}{version}")));
                 }
             });

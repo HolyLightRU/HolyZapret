@@ -1,4 +1,4 @@
-use super::{Action, Engine, IDLE, Key, MAX_MEMORY, Memory, Outcome, Pending, REASM_WAIT, SWITCH_AFTER};
+use super::{Action, Engine, IDLE, Key, Memory, Outcome, Pending, REASM_WAIT, SWITCH_AFTER};
 use crate::desync::{SNI_POOL, pick};
 use crate::{packet, profiles, quic, tls};
 use std::time::Instant;
@@ -14,12 +14,13 @@ pub enum QuicMode {
     Block,
     Pass,
     Adaptive,
+    Split,
 }
 
 pub const ROTATION: [QuicMode; 4] = [QuicMode::Fake, QuicMode::Random, QuicMode::Pass, QuicMode::Block];
 
 impl QuicMode {
-    pub const NAMES: [&'static str; 5] = ["general", "random", "shuffle", "block", "adaptive"];
+    pub const NAMES: [&'static str; 6] = ["general", "random", "shuffle", "block", "adaptive", "split"];
 
     pub fn parse(s: &str) -> Option<QuicMode> {
         match s.to_ascii_lowercase().as_str() {
@@ -28,6 +29,7 @@ impl QuicMode {
             "shuffle" => Some(QuicMode::Shuffle),
             "block" => Some(QuicMode::Block),
             "adaptive" => Some(QuicMode::Adaptive),
+            "split" => Some(QuicMode::Split),
             _ => None,
         }
     }
@@ -40,6 +42,7 @@ impl QuicMode {
             QuicMode::Block => "quic-block",
             QuicMode::Pass => "quic-none",
             QuicMode::Adaptive => "quic-adaptive",
+            QuicMode::Split => "quic-split",
         }
     }
 }
@@ -129,6 +132,36 @@ pub fn shuffle(d: &[u8], cut: Option<u64>, rnd: &mut dyn FnMut(&mut [u8])) -> Op
     }
     out.extend_from_slice(&d[i.size..]);
     Some(out)
+}
+
+const SPLIT_PIECE: usize = 1100;
+
+pub fn split_datagrams(first: &[u8], stream: &[u8], cut: usize) -> Option<Vec<Vec<u8>>> {
+    let i = quic::open_initial(first)?;
+    if cut == 0 || cut >= stream.len() {
+        return None;
+    }
+    let mut pieces: Vec<(usize, usize)> = vec![(0, cut)];
+    let mut at = cut;
+    while at < stream.len() {
+        let end = (at + SPLIT_PIECE).min(stream.len());
+        pieces.push((at, end));
+        at = end;
+    }
+    let n = pieces.len() as u64;
+    let base = if i.pn + 1 >= n { i.pn + 1 - n } else { i.pn };
+    let size = i.size.max(quic::MIN_DATAGRAM);
+    Some(
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(k, (from, to))| {
+                let mut frames = Vec::new();
+                quic::crypto_frame(&mut frames, *from as u64, &stream[*from..*to]);
+                quic::seal_initial(&i.dcid, &i.scid, &i.token, base + k as u64, &frames, size)
+            })
+            .collect(),
+    )
 }
 
 impl<A: Clone> Engine<A> {
@@ -275,6 +308,13 @@ impl<A: Clone> Engine<A> {
                 }
                 out.extend(held);
             }
+            QuicMode::Split => {
+                let cut = tls::sni_range(&quic::as_record(hello)).map(|(at, len)| at - 5 + len / 2);
+                match cut.and_then(|c| split_datagrams(first.payload(), hello, c)) {
+                    Some(parts) => out.extend(parts.iter().map(|p| (packet::udp_like(&first, p), meta.clone()))),
+                    None => out.extend(held),
+                }
+            }
             QuicMode::Shuffle => {
                 let cut = tls::sni_range(&quic::as_record(hello)).map(|(at, len)| (at - 5 + len / 2) as u64);
                 for (raw, m) in held {
@@ -283,7 +323,7 @@ impl<A: Clone> Engine<A> {
                 }
             }
         }
-        self.pending.insert(key, Pending { host, tech, since: now, id, ack0: None, dcid, bg: false });
+        self.pending.insert(key, Pending { host, tech, since: now, id, ack0: None, dcid, bg: false, node: None, fname: None });
         Action::Send(out)
     }
 
@@ -297,11 +337,11 @@ impl<A: Clone> Engine<A> {
 
     pub(super) fn quic_learn(&mut self, p: &Pending, outcome: Outcome) {
         let Some(h) = p.host.clone() else { return };
-        if !self.quic_adaptive() || (self.qmemory.len() >= MAX_MEMORY && !self.qmemory.contains_key(&h)) {
+        if !self.quic_adaptive() {
             return;
         }
         let cur = ROTATION.iter().position(|m| m.tech() == p.tech);
-        let m = self.qmemory.entry(h).or_default();
+        let m = self.qmemory.entry_or(&h, Memory::default);
         let here = cur == Some(m.idx.min(ROTATION.len() - 1));
         if outcome == Outcome::Answered {
             m.ok += 1;
@@ -324,15 +364,15 @@ impl<A: Clone> Engine<A> {
         if !self.quic_adaptive() {
             return Vec::new();
         }
-        self.qmemory.iter().map(|(h, m)| (h.clone(), format!("{}\t{}\t{}", ROTATION[m.idx.min(ROTATION.len() - 1)].tech(), m.ok, m.fails))).collect()
+        self.qmemory.by_age().into_iter().map(|(h, m)| (h.clone(), format!("{}\t{}\t{}", ROTATION[m.idx.min(ROTATION.len() - 1)].tech(), m.ok, m.fails))).collect()
     }
 
     pub(super) fn quic_load(&mut self, host: &str, tech: &str, ok: u32, fails: u32) -> bool {
-        if !self.quic_adaptive() || self.qmemory.len() >= MAX_MEMORY {
+        if !self.quic_adaptive() {
             return false;
         }
         let Some(idx) = ROTATION.iter().position(|m| m.tech() == tech) else { return false };
-        self.qmemory.insert(host.to_string(), Memory { idx, ok, fails, streak: 0 });
+        self.qmemory.insert(host, Memory { idx, ok, fails, ..Default::default() });
         true
     }
 

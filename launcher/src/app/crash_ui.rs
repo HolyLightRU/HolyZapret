@@ -17,7 +17,7 @@ impl App {
             .inner_margin(egui::Margin::same(20));
         let modal = egui::Modal::new(egui::Id::NULL.with("crash")).frame(frame).show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.label(RichText::new("Лаунчер в прошлый раз закрылся с ошибкой").size(17.0).strong());
+            ui.label(RichText::new("Лаунчер в прошлый раз закрылся с ошибкой").font(crate::theme::semibold(17.0)).strong());
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
@@ -40,7 +40,7 @@ impl App {
                 if ui.add(theme::Primary("Сохранить отчёт".into())).clicked() {
                     save = true;
                 }
-                if ui.button("Закрыть").clicked() {
+                if crate::theme::button(ui, "Закрыть").clicked() {
                     close = true;
                 }
             });

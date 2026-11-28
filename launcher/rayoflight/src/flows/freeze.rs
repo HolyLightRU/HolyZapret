@@ -1,4 +1,4 @@
-use super::{Engine, Key, MAX_MEMORY, Mode, Outcome};
+use super::{Engine, Key, Memory, Mode, Outcome};
 use crate::desync;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub const FREEZE_LO: u32 = 12 * 1024;
 pub const FREEZE_HI: u32 = 32 * 1024;
 pub const FREEZE_STALL: Duration = Duration::from_secs(3);
+pub const FREEZE_RESEND: Duration = Duration::from_secs(2);
 pub const FREEZE_KEEP: Duration = Duration::from_secs(30 * 60);
 pub const FREEZE_TO_WARP: u32 = 2;
 const MAX_FROZEN: usize = 512;
@@ -21,6 +22,7 @@ pub struct Watch {
     rcv: Option<u32>,
     since: Instant,
     next_seq: u32,
+    resend_from: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -28,6 +30,29 @@ pub struct Frozen {
     pub ips: Vec<IpAddr>,
     pub count: u32,
     pub last: Option<Instant>,
+    pub checked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fetch {
+    Passed(usize),
+    Stalled(usize),
+    Short(usize),
+    Failed,
+}
+
+pub const FETCH_WANT: usize = 64 * 1024;
+pub const FETCH_PASS: usize = 32 * 1024;
+pub const FETCH_LOW: usize = 6 * 1024;
+pub const CHECK_WITHIN: Duration = Duration::from_secs(300);
+
+pub fn fetch_verdict(got: usize, ended: bool) -> Fetch {
+    match (got, ended) {
+        (n, _) if n >= FETCH_PASS => Fetch::Passed(n),
+        (n, true) => Fetch::Short(n),
+        (n, false) if n >= FETCH_LOW => Fetch::Stalled(n),
+        _ => Fetch::Failed,
+    }
 }
 
 pub type FrozenMap = HashMap<String, Frozen>;
@@ -40,7 +65,7 @@ impl<A: Clone> Engine<A> {
         }
         let Some(h) = host else { return };
         if let Some(f) = self.flows.get_mut(key) {
-            f.watch = Some(Watch { host: h.clone(), tech, id, dst, rcv: None, since: now, next_seq });
+            f.watch = Some(Watch { host: h.clone(), tech, id, dst, rcv: None, since: now, next_seq, resend_from: None });
         }
     }
 
@@ -56,13 +81,19 @@ impl<A: Clone> Engine<A> {
         let resent = (end.wrapping_sub(w.next_seq) as i32) <= 0;
         if !resent {
             w.next_seq = end;
+            w.resend_from = None;
         }
         if w.rcv != Some(rcv) {
             w.rcv = Some(rcv);
             w.since = now;
+            w.resend_from = None;
             return;
         }
-        if !resent || rcv < FREEZE_LO || now.saturating_duration_since(w.since) < FREEZE_STALL {
+        if !resent {
+            return;
+        }
+        let first = *w.resend_from.get_or_insert(now);
+        if rcv < FREEZE_LO || now.saturating_duration_since(w.since) < FREEZE_STALL || now.saturating_duration_since(first) < FREEZE_RESEND {
             return;
         }
         if let Some(w) = f.watch.take() {
@@ -112,16 +143,43 @@ impl<A: Clone> Engine<A> {
         }
     }
 
+    pub fn freeze_targets(&mut self, now: Instant) -> Vec<String> {
+        if self.forward {
+            return Vec::new();
+        }
+        let pick = self.frozen.iter().find(|(_, f)| !f.checked && f.last.is_some_and(|l| now.saturating_duration_since(l) < CHECK_WITHIN)).map(|(h, _)| h.clone());
+        if let Some(f) = pick.as_ref().and_then(|h| self.frozen.get_mut(h)) {
+            f.checked = true;
+        }
+        pick.into_iter().collect()
+    }
+
+    pub fn freeze_verdict(&mut self, host: &str, v: Fetch) {
+        let text = match v {
+            Fetch::Passed(n) => {
+                self.frozen.remove(host);
+                format!("проверка заморозки: {host} — скачано {} КБ без обрыва, заморозка не подтвердилась", n / 1024)
+            }
+            Fetch::Stalled(n) => format!("проверка заморозки: {host} — загрузка оборвалась на {} КБ, заморозка подтверждена", n / 1024),
+            Fetch::Short(n) => format!("проверка заморозки: {host} — главная страница всего {} КБ, по ней не проверить", n / 1024),
+            Fetch::Failed => format!("проверка заморозки: {host} — соединиться для проверки не удалось"),
+        };
+        if self.notes.len() < 1000 {
+            self.notes.push(text);
+        }
+    }
+
+    pub fn is_frozen(&self, host: &str) -> bool {
+        self.frozen.contains_key(host)
+    }
+
     fn warp_step(&mut self, host: &str) -> bool {
         if self.warp.is_none() {
             return false;
         }
         let Mode::Adaptive(list) = &self.mode else { return false };
         let Some(idx) = list.iter().position(|t| t.name == desync::WARP.name) else { return false };
-        if self.memory.len() >= MAX_MEMORY && !self.memory.contains_key(host) {
-            return false;
-        }
-        let m = self.memory.entry(host.to_string()).or_default();
+        let m = self.memory.entry_or(host, Memory::default);
         m.idx = idx;
         m.streak = 0;
         true

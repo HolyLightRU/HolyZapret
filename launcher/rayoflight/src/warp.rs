@@ -207,6 +207,17 @@ pub fn redirect_filter(listen: u16, ips: &[IpAddr]) -> Option<String> {
     ))
 }
 
+fn redirect_new(shared: &Shared, dst: &IpAddr, now: Instant) -> bool {
+    if !shared.has_ip(dst) {
+        return false;
+    }
+    if shared.ready() {
+        return true;
+    }
+    shared.want(now);
+    false
+}
+
 fn handle_packet(shared: &Shared, h: &Handle, buf: &mut [u8], addr: &Address) {
     let listen = shared.listen.load(Ordering::Relaxed);
     let Some(ihl) = v4_tcp(buf) else {
@@ -227,7 +238,7 @@ fn handle_packet(shared: &Shared, h: &Handle, buf: &mut [u8], addr: &Address) {
     let dst = IpAddr::V4(Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]));
     let syn = flags & 0x02 != 0 && flags & 0x10 == 0;
     let now = Instant::now();
-    if syn && shared.has_ip(&dst) {
+    if syn && redirect_new(shared, &dst, now) {
         if let Ok(mut c) = shared.conns.lock() {
             c.insert(sport, (dst, dport, now));
         }
@@ -509,5 +520,22 @@ mod tests {
         assert!(s.wanted(now) && !s.wanted(now + WANT_HOLD));
         s.prune(now + IP_KEEP);
         assert_eq!(s.ip_count(), 0);
+    }
+
+    #[test]
+    fn new_connections_go_direct_and_ask_for_warp_while_proxy_is_down() {
+        let s = Shared::new(40000, vec![]);
+        let ip: IpAddr = "104.16.1.1".parse().unwrap();
+        let other: IpAddr = "104.16.1.2".parse().unwrap();
+        let now = Instant::now();
+        s.add_ip(ip, now);
+        s.set_listen(40400);
+        assert!(!redirect_new(&s, &other, now));
+        assert!(!s.wanted(now));
+        s.set_ready(false);
+        assert!(!redirect_new(&s, &ip, now));
+        assert!(s.wanted(now));
+        s.set_ready(true);
+        assert!(redirect_new(&s, &ip, now));
     }
 }

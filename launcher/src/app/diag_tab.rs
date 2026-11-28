@@ -53,7 +53,7 @@ impl App {
         let mut fix = None;
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Диагностика").size(17.0).strong());
+                ui.label(RichText::new("Диагностика").font(crate::theme::semibold(17.0)).strong());
                 ui.add_space(4.0);
                 if self.diag.running {
                     ui.spinner();
@@ -110,26 +110,6 @@ impl App {
                 }
             });
         });
-        let mut clear = false;
-        theme::card(ui, |ui| {
-            theme::row(ui, 46.0, |ui| {
-                ui.label(RichText::new(theme::icon::CHAT).font(theme::icon_font(18.0)).color(Color32::from_gray(200)));
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Кэш Discord").strong());
-                    ui.label(
-                        RichText::new("Закроет Discord и очистит Cache, Code Cache и GPUCache у Stable, PTB, Canary и Development")
-                            .weak()
-                            .size(12.5),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(!self.busy, egui::Button::new("Очистить")).clicked() {
-                        clear = true;
-                    }
-                });
-            });
-        });
         if rerun {
             self.run_diag(ctx);
         }
@@ -137,9 +117,6 @@ impl App {
             if !self.busy {
                 self.apply_fix(ctx, f);
             }
-        }
-        if clear {
-            self.spawn(ctx, |_, tx| result_msg(tx, diagnostics::clear_discord_cache(), "Кэш Discord"));
         }
     }
 

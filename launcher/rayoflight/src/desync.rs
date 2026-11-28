@@ -4,6 +4,8 @@ use crate::tls;
 pub const FAKE_DEFAULT: &[u8] = include_bytes!("../assets/fake_tls_default.bin");
 pub const PATTERN_MAX_RU: &[u8] = include_bytes!("../assets/pattern_max_ru.bin");
 pub const PATTERN_4PDA: &[u8] = include_bytes!("../assets/pattern_4pda.bin");
+pub const FAKE_NAMES: [&str; 8] = ["max.ru", "fonts.google.com", "gosuslugi.ru", "yandex.ru", "sberbank.ru", "mail.ru", "vk.com", "www.microsoft.com"];
+pub const NAME_TRIES: usize = 3;
 pub const SNI_POOL: [&str; 8] = ["www.google.com", "www.microsoft.com", "www.bing.com", "yandex.ru", "vk.com", "mail.ru", "www.apple.com", "ok.ru"];
 pub const BADSEQ_INCREMENT: i32 = -10000;
 pub const BADSEQ_ACK_INCREMENT: i32 = -66000;
@@ -43,6 +45,11 @@ pub struct Technique {
     pub decoys: usize,
     pub autottl: bool,
     pub pattern: Option<&'static [u8]>,
+    pub wssize: bool,
+    pub copy: bool,
+    pub pooled: bool,
+    pub pause_ms: u16,
+    pub rst_first: bool,
 }
 
 pub const GENERAL: Technique = Technique {
@@ -61,6 +68,11 @@ pub const GENERAL: Technique = Technique {
     decoys: 0,
     autottl: false,
     pattern: None,
+    wssize: false,
+    copy: false,
+    pooled: false,
+    pause_ms: 0,
+    rst_first: false,
 };
 pub const SNI_VK: Technique = Technique { name: "sni-vk", label: "фейк с именем vk.com", sni: Some("vk.com"), ..GENERAL };
 pub const SNI_FONTS: Technique = Technique { name: "sni-fonts", label: "фейк с именем fonts.google.com", sni: Some("fonts.google.com"), ..GENERAL };
@@ -78,6 +90,23 @@ pub const OVERLAP: Technique = Technique { name: "overlap", label: "наложе
 pub const OVERLAP_MAX: Technique = Technique { name: "overlap-max", label: "наложение с узором max.ru", pattern: Some(PATTERN_MAX_RU), ..OVERLAP };
 pub const FAKE_ONLY: Technique =
     Technique { name: "fake-only", label: "только фейки", fooling: Fooling::Badseq, repeats: (6, 6), whole: true, seq_shift: 2, sni: Some("www.microsoft.com"), ..GENERAL };
+pub const PAUSE: Technique = Technique { name: "pause", label: "пауза после фейка", pause_ms: 250, ..GENERAL };
+pub const FAKE_RST: Technique = Technique { name: "fake-rst", label: "ложный сброс перед ClientHello", rst_first: true, ..GENERAL };
+pub const RST_REPEATS: usize = 2;
+pub const POOLED: Technique = Technique { name: "sni-pool", label: "фейк с другим именем", pooled: true, ..GENERAL };
+pub const FAKE_COPY: Technique = Technique { name: "fake-copy", label: "фейк — копия ClientHello", copy: true, ..GENERAL };
+pub const WSSIZE: Technique = Technique { name: "wssize", label: "сжатое окно", wssize: true, ..GENERAL };
+pub const WSS_BYTES: u16 = 256;
+pub const WSS_PACKETS: u8 = 64;
+
+pub fn wss_window(scale: Option<u8>) -> u16 {
+    match scale {
+        Some(s) => (WSS_BYTES >> s.min(15)).max(1),
+        None => WSS_BYTES,
+    }
+}
+
+pub const SPLIT: Technique = Technique { name: "split", label: "разрез без фейков", repeats: (0, 0), seqovl: Some(0), split: Split::SniMiddle, ..GENERAL };
 pub const SNI_SPLIT: Technique = Technique { name: "sni-split", label: "разрез по имени сайта", split: Split::SniMiddle, ..GENERAL };
 pub const RANDOM: Technique = Technique { name: "random", label: "случайный рисунок", repeats: (6, 10), random_sni: true, split: Split::Random, ..GENERAL };
 pub const BADSEQ: Technique = Technique { name: "badseq", label: "фейк с неверным seq", fooling: Fooling::Badseq, ..GENERAL };
@@ -87,7 +116,7 @@ pub const BADSUM: Technique = Technique { name: "badsum", label: "фейк с н
 pub const DISORDER: Technique = Technique { name: "disorder", label: "части в обратном порядке", disorder: true, ..GENERAL };
 pub const NONE: Technique = Technique { name: "none", label: "без обхода", ..GENERAL };
 pub const WARP: Technique = Technique { name: "warp", label: "через WARP", ..GENERAL };
-pub const TECHNIQUES: [Technique; 19] = [
+pub const TECHNIQUES: [Technique; 25] = [
     GENERAL,
     SNI_SPLIT,
     RANDOM,
@@ -107,6 +136,12 @@ pub const TECHNIQUES: [Technique; 19] = [
     OVERLAP_2,
     OVERLAP_SLD,
     FAKE_TS,
+    SPLIT,
+    WSSIZE,
+    POOLED,
+    FAKE_COPY,
+    PAUSE,
+    FAKE_RST,
 ];
 pub const MIN_FAKE_TTL: u8 = 3;
 pub const MAX_FAKE_TTL: u8 = 20;
@@ -173,6 +208,17 @@ pub fn fake_from(base: &[u8], hello: &[u8], rnd: &mut dyn FnMut(&mut [u8])) -> V
     f
 }
 
+pub fn copy_fake(hello: &[u8], name: &str) -> Option<Vec<u8>> {
+    let f = tls::with_sni(hello, name)?;
+    Some(tls::resized(&f, hello.len()).unwrap_or(f))
+}
+
+pub fn named_fake(cfg: &Config, tech: &Technique, hello: &[u8], name: &str, rnd: &mut dyn FnMut(&mut [u8])) -> Vec<u8> {
+    let template = || tls::with_sni(&cfg.fake, name).unwrap_or_else(|| cfg.fake.clone());
+    let base = if tech.copy { copy_fake(hello, name).filter(|c| c.len() >= 44).unwrap_or_else(template) } else { template() };
+    fake_from(&base, hello, rnd)
+}
+
 pub fn fake_for(cfg: &Config, hello: &[u8], rnd: &mut dyn FnMut(&mut [u8])) -> Vec<u8> {
     fake_from(&cfg.fake, hello, rnd)
 }
@@ -218,6 +264,7 @@ pub struct Out {
     pub next_ip_id: u16,
     pub split_pos: usize,
     pub fallback: Option<&'static str>,
+    pub fakes: usize,
 }
 
 fn fooling_for(tech: &Technique, has_ts: bool, ttl: Option<u8>) -> (Fooling, Option<&'static str>) {
@@ -279,9 +326,17 @@ pub fn first_segment_with(
             packet::break_tcp_sum(pkt);
         }
     };
+    if tech.rst_first {
+        let mut rst = packet::segment_ex(orig, orig.seq.wrapping_add(BADSEQ_INCREMENT as u32), orig.ack, &plain, ip_id, &[]);
+        packet::set_flags(&mut rst, 0x14);
+        for _ in 0..RST_REPEATS {
+            packets.push(rst.clone());
+        }
+    }
     if repeats > 0 {
         let fake = match fake_blob {
             Some(f) => f.to_vec(),
+            None if tech.copy => named_fake(cfg, tech, hello, tech.sni.unwrap_or("www.google.com"), rnd),
             None => {
                 let base = match tech.sni {
                     Some(name) => tls::with_sni(&cfg.fake, name).unwrap_or_else(|| cfg.fake.clone()),
@@ -290,15 +345,23 @@ pub fn first_segment_with(
                 fake_from(&base, hello, rnd)
             }
         };
-        let mut pkt = packet::segment_ex(orig, seq, ack, &opts, ip_id, &fake);
-        dress(&mut pkt);
+        let round: Vec<Vec<u8>> = fake
+            .chunks(MAX_PART)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut pkt = packet::segment_ex(orig, seq.wrapping_add((i * MAX_PART) as u32), ack, &opts, ip_id, chunk);
+                dress(&mut pkt);
+                pkt
+            })
+            .collect();
         for _ in 0..repeats {
-            packets.push(pkt.clone());
+            packets.extend(round.iter().cloned());
         }
         if !orig.v6 {
             ip_id = next_ip_id(ip_id);
         }
     }
+    let fakes = packets.len();
     if tech.whole {
         for (i, chunk) in data.chunks(MAX_PART).enumerate() {
             packets.push(packet::segment(orig, orig.seq.wrapping_add((i * MAX_PART) as u32), orig.ts, ip_id, chunk));
@@ -306,7 +369,7 @@ pub fn first_segment_with(
                 ip_id = next_ip_id(ip_id);
             }
         }
-        return Some(Out { packets, next_ip_id: ip_id, split_pos: data.len(), fallback });
+        return Some(Out { packets, next_ip_id: ip_id, split_pos: data.len(), fallback, fakes });
     }
     let room = MAX_PART.saturating_sub(pos);
     let want = tech.seqovl.unwrap_or(cfg.seqovl);
@@ -339,7 +402,7 @@ pub fn first_segment_with(
             ip_id = next_ip_id(ip_id);
         }
     }
-    Some(Out { packets, next_ip_id: ip_id, split_pos: pos, fallback })
+    Some(Out { packets, next_ip_id: ip_id, split_pos: pos, fallback, fakes })
 }
 
 fn midsld(hello: &[u8]) -> Option<usize> {
@@ -538,6 +601,49 @@ mod tests {
         let very = Technique { split: Split::Pos(1380), ..GENERAL };
         let out = first_segment(&o, &data, &c, &very, None, &mut rnd).unwrap();
         assert_eq!(packet::parse(&out.packets[8]).unwrap().payload().len(), 1380);
+    }
+
+    #[test]
+    fn fake_copy_keeps_the_shape_of_the_real_hello() {
+        let c = Config::general(google()).unwrap();
+        let real = tls::with_padding(&tls::with_sni(FAKE_DEFAULT, "media.soundcloud.example.com").unwrap(), 900).unwrap();
+        let mut rnd = zeros;
+        for name in FAKE_NAMES {
+            let f = named_fake(&c, &FAKE_COPY, &real, name, &mut rnd);
+            assert_eq!((f.len(), tls::sni(&f).as_deref()), (real.len(), Some(name)), "{name}");
+            assert_eq!(tls::record_len(&f), Some(f.len()));
+            assert_eq!(tls::session_id(&f), tls::session_id(&real));
+        }
+        let plain = named_fake(&c, &POOLED, &real, "max.ru", &mut rnd);
+        assert_eq!((plain.len(), tls::sni(&plain).as_deref()), (c.fake.len() - "www.google.com".len() + "max.ru".len(), Some("max.ru")));
+        let long = tls::with_padding(&real, 1800).unwrap();
+        let shorter = tls::resized(&long, 1700).unwrap();
+        assert_eq!((shorter.len(), tls::record_len(&shorter), tls::sni(&shorter)), (1700, Some(1700), tls::sni(&long)));
+        let raw = sample_v4(&long[..1400], true);
+        let o = packet::parse(&raw).unwrap();
+        let out = first_segment(&o, &long, &c, &FAKE_COPY, None, &mut rnd).unwrap();
+        let fakes: Vec<_> = out.packets.iter().map(|p| packet::parse(p).unwrap()).filter(|t| t.ts.map(|x| x.val) != o.ts.map(|x| x.val)).collect();
+        assert_eq!(fakes.len(), 2 * GENERAL.repeats.0);
+        assert_eq!((fakes[0].seq, fakes[0].payload().len(), fakes[1].seq, fakes[1].payload().len()), (o.seq, 1400, o.seq + 1400, 400));
+        assert_eq!(tls::sni(&[fakes[0].payload(), fakes[1].payload()].concat()).as_deref(), Some("www.google.com"));
+    }
+
+    #[test]
+    fn fake_rst_goes_first_and_cannot_close_the_real_connection() {
+        let c = Config::general(google()).unwrap();
+        let hello = tls::with_sni(FAKE_DEFAULT, "www.youtube.com").unwrap();
+        let raw = sample_v4(&hello, true);
+        let o = packet::parse(&raw).unwrap();
+        let mut rnd = zeros;
+        let out = first_segment(&o, &hello, &c, &FAKE_RST, None, &mut rnd).unwrap();
+        let plain = first_segment(&o, &hello, &c, &GENERAL, None, &mut rnd).unwrap();
+        assert_eq!((out.packets.len(), out.fakes, plain.fakes), (plain.packets.len() + RST_REPEATS, plain.fakes + RST_REPEATS, GENERAL.repeats.0));
+        for p in &out.packets[..RST_REPEATS] {
+            let t = packet::parse(p).unwrap();
+            assert_eq!((t.flags, t.payload().len(), t.seq, t.ack), (0x14, 0, o.seq.wrapping_add(BADSEQ_INCREMENT as u32), o.ack));
+            assert!(packet::checksums_ok(p));
+        }
+        assert_eq!(&out.packets[RST_REPEATS..], &plain.packets[..]);
     }
 
     #[test]

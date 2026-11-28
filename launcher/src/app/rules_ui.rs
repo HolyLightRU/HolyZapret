@@ -148,8 +148,8 @@ impl App {
         }
     }
 
-    fn start_recheck(&mut self, ctx: &egui::Context) {
-        if self.warp_blocks_checks() {
+    pub(super) fn start_recheck(&mut self, ctx: &egui::Context) {
+        if self.warp_blocks_checks(super::AfterWarp::RulesRecheck) {
             return;
         }
         if self.picker.running {
@@ -186,7 +186,7 @@ impl App {
     }
 
     pub(super) fn start_batch(&mut self, ctx: &egui::Context, urls: Vec<String>) {
-        if self.busy || self.rules.running() || self.warp_blocks_checks() || urls.is_empty() {
+        if self.busy || self.rules.running() || urls.is_empty() || self.warp_blocks_checks(super::AfterWarp::Batch(urls.clone())) {
             return;
         }
         if self.picker.running {
@@ -211,8 +211,8 @@ impl App {
         });
     }
 
-    fn start_rule_check(&mut self, ctx: &egui::Context) {
-        if self.busy || self.rules.running() || self.warp_blocks_checks() {
+    pub(super) fn start_rule_check(&mut self, ctx: &egui::Context) {
+        if self.busy || self.rules.running() || self.warp_blocks_checks(super::AfterWarp::Rules) {
             return;
         }
         if self.picker.running {
@@ -351,7 +351,7 @@ impl App {
                 }
                 if matches!(v.advice, Advice::Nothing) {
                     ui.add_space(6.0);
-                    if ui.add_enabled(enabled, egui::Button::new("Открыть подбор для сайта")).clicked() {
+                    if ui.add_enabled(enabled, crate::theme::GlassButton::new("Открыть подбор для сайта")).clicked() {
                         act = Some(Act::Picker);
                     }
                 }
@@ -362,7 +362,7 @@ impl App {
     fn rules_input(&mut self, ui: &mut egui::Ui, act: &mut Option<Act>) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if self.rules.running() {
-                if ui.button("Отменить").clicked() {
+                if crate::theme::button(ui, "Отменить").clicked() {
                     *act = Some(Act::Cancel);
                 }
             } else if ui.add_enabled(!self.busy, theme::Primary("Проверить".into())).clicked() {
@@ -387,7 +387,7 @@ impl App {
         theme::card(ui, |ui| {
             let wide = ui.available_width() >= 640.0;
             theme::row(ui, 38.0, |ui| {
-                ui.label(RichText::new("Правила для сайтов").size(17.0).strong()).on_hover_text(
+                ui.label(RichText::new("Правила для сайтов").font(crate::theme::semibold(17.0)).strong()).on_hover_text(
                     "Если сайт не работает, лаунчер проверит его без обхода и с приёмами RayOfLight по очереди и подскажет: не обходить его или какой приём ему подходит. Самоподстройка начнёт с этого приёма и сменит его, если сайт перестанет отвечать",
                 );
                 if !self.rules.list.is_empty() {
@@ -441,10 +441,10 @@ impl App {
                         let picked = self.rules.batch.iter().filter(|(v, on)| *on && batch_rule(v).is_some()).count();
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(picked > 0 && !busy, egui::Button::new(format!("Применить отмеченные · {picked}"))).clicked() {
+                            if ui.add_enabled(picked > 0 && !busy, crate::theme::GlassButton::new(format!("Применить отмеченные · {picked}"))).clicked() {
                                 act = Some(Act::ApplyBatch);
                             }
-                            if ui.button("Скрыть").clicked() {
+                            if crate::theme::button(ui, "Скрыть").clicked() {
                                 act = Some(Act::DismissBatch);
                             }
                         });
@@ -456,7 +456,7 @@ impl App {
                     ui.label(muted("Проверить с RayOfLight, какие правила помогают, а какие больше не нужны"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can = !self.busy && !self.rules.running();
-                        if ui.add_enabled(can, egui::Button::new("Перепроверить все")).clicked() {
+                        if ui.add_enabled(can, crate::theme::GlassButton::new("Перепроверить все")).clicked() {
                             act = Some(Act::Recheck);
                         }
                     });
@@ -491,7 +491,7 @@ impl App {
                                 }
                                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                     ui.add_space(4.0);
-                                    ui.add(egui::Label::new(RichText::new(r.domains.join(", ")).size(13.5)).truncate())
+                                    ui.add(egui::Label::new(RichText::new(r.domains.join(", ")).size(13.5)).truncate().show_tooltip_when_elided(false))
                                         .on_hover_text(r.domains.join("
 "));
                                 });
@@ -517,7 +517,7 @@ impl App {
                 if let Some(v) = self.rules.verdict.take() {
                     self.picker.scope = 1;
                     self.picker.sites = v.url;
-                    self.tab = super::Tab::Picker;
+                    self.tab = super::Tab::Sites;
                 }
             }
             Some(Act::Remove(i)) => {

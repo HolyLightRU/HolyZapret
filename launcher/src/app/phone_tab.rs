@@ -21,6 +21,8 @@ pub struct PhoneState {
     gw_live: Option<(bool, bool, Vec<crate::core::ray::AppActivity>)>,
     gw_live_at: Option<std::time::Instant>,
     gw_page: bool,
+    folds: [bool; 4],
+    help: [bool; 3],
 }
 
 fn fix_label(f: &Fix) -> &'static str {
@@ -40,42 +42,25 @@ fn finding_row(ui: &mut egui::Ui, f: &Finding, enabled: bool) -> bool {
     };
     let mut clicked = false;
     theme::row(ui, 30.0, |ui| {
-        ui.label(RichText::new("●").color(col).size(13.0));
-        ui.label(RichText::new(&f.title).color(Color32::from_gray(225)));
+        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 4.0, col);
+        ui.label(RichText::new(&f.title).color(Color32::from_gray(228)).size(14.0));
         if let Some(fix) = &f.fix {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                clicked = ui.add_enabled(enabled, egui::Button::new(fix_label(fix))).clicked();
+                clicked = ui.add_enabled(enabled, crate::theme::GlassButton::new(fix_label(fix))).clicked();
             });
         }
     });
     ui.horizontal(|ui| {
-        ui.add_space(20.0);
+        ui.add_space(18.0);
         ui.add(egui::Label::new(muted(&f.text)).wrap());
     });
     ui.add_space(6.0);
     clicked
 }
 
-fn alert(ui: &mut egui::Ui, color: Color32, text: &str, button: Option<&str>) -> bool {
-    let mut clicked = false;
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.12))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(12, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(text).color(color).size(13.0)).wrap());
-            if let Some(b) = button {
-                ui.add_space(4.0);
-                clicked = ui.button(b).clicked();
-            }
-        });
-    clicked
-}
-
 fn muted(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).color(Color32::from_gray(165)).size(12.5)
+    RichText::new(text.into()).color(Color32::from_gray(175)).size(13.0)
 }
 
 pub(super) fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
@@ -101,9 +86,60 @@ pub(super) fn qr(ui: &mut egui::Ui, text: &str, side: f32) {
 
 fn step(ui: &mut egui::Ui, n: usize, text: &str) {
     ui.horizontal_top(|ui| {
-        ui.label(RichText::new(format!("{n}.")).color(CYAN).strong());
-        ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(205))).wrap());
+        let (r, _) = ui.allocate_exact_size(Vec2::new(22.0, 22.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 10.0, theme::PINK.gamma_multiply(0.18));
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, n.to_string(), theme::semibold(11.5), Color32::from_rgb(245, 181, 218));
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(220)).size(13.5)).wrap());
+        });
     });
+    ui.add_space(2.0);
+}
+
+fn stat(ui: &mut egui::Ui, value: &str, caption: &str, divider: bool) {
+    let r = ui
+        .vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(RichText::new(value).font(theme::semibold(19.0)).strong());
+            ui.label(muted(caption).size(12.5));
+        })
+        .response
+        .rect;
+    if divider {
+        ui.add_space(14.0);
+        let x = ui.cursor().left();
+        ui.painter().vline(x, r.top() + 4.0..=r.bottom() - 4.0, egui::Stroke::new(1.0, Color32::from_white_alpha(14)));
+        ui.add_space(14.0);
+    }
+}
+
+fn mode_tile(ui: &mut egui::Ui, glyph: &str, on: bool, title: &str, sub: &str, state: (&str, Color32), tip: &str, enabled: bool) -> Option<bool> {
+    let mut out = None;
+    theme::card(ui, |ui| {
+        let r = ui
+            .horizontal(|ui| {
+                theme::emblem(ui, on, glyph, 58.0);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width((ui.available_width() - 56.0).max(80.0));
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(RichText::new(title).font(theme::semibold(15.0)).strong().color(Color32::WHITE));
+                    ui.add(egui::Label::new(muted(sub)).truncate());
+                    theme::chip(ui, state.0, state.1);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut v = on;
+                    if ui.add_enabled_ui(enabled, |ui| theme::toggle(ui, &mut v)).inner.changed() {
+                        out = Some(v);
+                    }
+                });
+            })
+            .response;
+        r.on_hover_text(tip);
+    });
+    out
 }
 
 enum Act {
@@ -112,6 +148,7 @@ enum Act {
     Port,
     MakePrivate(u32),
     Diag(Option<Fix>),
+    Protect,
 }
 
 impl PhoneState {
@@ -120,20 +157,39 @@ impl PhoneState {
     }
 }
 
-fn kv(ui: &mut egui::Ui, key: &str, value: &str) -> bool {
-    let mut copy = false;
-    theme::row(ui, 28.0, |ui| {
-        theme::row_label(ui, key, 170.0);
-        ui.label(RichText::new(value).size(14.0).strong());
-        if !value.contains(' ') && theme::icon_button(ui, theme::icon::COPY, "Скопировать").clicked() {
-            copy = true;
+fn kv(ui: &mut egui::Ui, first: bool, key: &str, value: &str, copy: bool) -> bool {
+    if !first {
+        let y = ui.cursor().top();
+        ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, Color32::from_white_alpha(10)));
+    }
+    let mut clicked = false;
+    theme::row(ui, 32.0, |ui| {
+        theme::row_label(ui, key, 160.0);
+        let strong = copy;
+        let text = if strong { RichText::new(value).font(theme::semibold(14.5)).strong() } else { RichText::new(value).color(Color32::from_gray(210)).size(14.0) };
+        ui.label(text);
+        if copy {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::icon_button(ui, theme::icon::COPY, "Скопировать").clicked() {
+                    clicked = true;
+                }
+            });
         }
     });
-    copy
+    clicked
+}
+
+struct GwView {
+    on: bool,
+    ray_ok: bool,
+    iface: Option<crate::core::gateway::Iface>,
+    devices: Vec<crate::core::ray::AppActivity>,
+    page_addr: Option<String>,
+    problem: Option<(String, Option<&'static str>)>,
 }
 
 impl App {
-    fn gateway_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn gateway_view(&mut self, ctx: &egui::Context) -> GwView {
         use crate::core::{gateway, ray, settings};
         let on = *self.phone.gw_on.get_or_insert_with(settings::ray_gateway);
         if self.phone.gw_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(15)) {
@@ -168,108 +224,119 @@ impl App {
         let ray_ok = running && gw_active;
         let foreign = self.status.as_ref().and_then(|s| s.foreign_dir().map(|d| d.display().to_string()));
         let installed = self.status.as_ref().is_some_and(|s| s.service != crate::core::service::ServiceState::NotInstalled);
-        let problem: Option<(String, Option<&str>)> = if !on || ray_ok {
+        let problem: Option<(String, Option<&'static str>)> = if !on || ray_ok {
             None
         } else if let Some(d) = &foreign {
             Some((format!("Служба zapret сейчас установлена из другой папки: {d}. Шлюз работает только со службой из этой папки, поэтому устройства выходят в интернет без обхода."), Some("Установить службу отсюда")))
         } else if !installed {
-            Some(("Служба не установлена: устройства выходят в интернет через компьютер, но без обхода. Шлюз работает, пока включена защита.".into(), Some("Включить защиту")))
+            Some(("Защита не включена: устройства выходят в интернет через компьютер, но без обхода.".into(), Some("Включить защиту")))
         } else if running {
             Some(("RayOfLight работает, но без шлюза: служба установлена до того, как режим включили. Переустановите её, и обход заработает для устройств.".into(), Some("Переустановить службу")))
         } else {
-            Some(("Обход для устройств работает вместе с RayOfLight. Сейчас RayOfLight не работает: устройства выходят в интернет через компьютер, но без обхода.".into(), None))
+            Some(("RayOfLight сейчас не работает: устройства выходят в интернет через компьютер, но без обхода.".into(), None))
         };
+        GwView { on, ray_ok, iface, devices, page_addr, problem }
+    }
+
+    fn gateway_toggle(&mut self, ctx: &egui::Context, v: bool) {
+        use crate::core::{gateway, settings};
+        settings::set_ray_gateway(v);
+        self.phone.gw_on = Some(v);
+        self.phone.gw_at = None;
+        self.phone.gw_page = false;
+        let installed = self.status.as_ref().is_some_and(|s| s.service != crate::core::service::ServiceState::NotInstalled);
+        let strategy = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
+        self.spawn(ctx, move |p, tx| {
+            match gateway::apply(v) {
+                Ok(m) => super::notify(tx, Lvl::Ok, m),
+                Err(e) => super::notify(tx, Lvl::Err, format!("Пересылка на сетевой карте не изменилась: {e}")),
+            }
+            if let (true, Some(s)) = (installed, strategy) {
+                super::result_msg(tx, crate::core::service::refresh(p, &s), "Не удалось переустановить службу");
+            }
+        });
+    }
+
+    fn gateway_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, view: &GwView) {
+        use crate::core::{gateway, ray};
         let mut fix = false;
-        let mut toggle = None;
         let mut copy = None;
         theme::card(ui, |ui| {
-            theme::row(ui, 32.0, |ui| {
-                ui.label(RichText::new(theme::icon::GLOBE).font(theme::icon_font(17.0)).color(CYAN));
-                ui.add_space(2.0);
-                ui.label(RichText::new("Компьютер как шлюз").size(15.5).strong());
-                match (on, ray_ok) {
-                    (true, true) => theme::chip(ui, "Работает", GREEN),
-                    (true, false) => theme::chip(ui, "Без обхода", YELLOW),
-                    (false, _) => theme::chip(ui, "Выключен", Color32::from_gray(160)),
-                };
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut v = on;
-                    if ui.add_enabled_ui(!self.busy, |ui| theme::toggle(ui, &mut v)).inner.changed() {
-                        toggle = Some(v);
-                    }
-                });
-            });
-            ui.add(
-                egui::Label::new(muted(
-                    "Для приставок и телевизоров, где прокси не помогает: PlayStation, Xbox, Switch, телевизоры. В настройках сети устройства этот компьютер указывается как шлюз, и всё, что открывает устройство, идёт через обход. Самому устройству прокси не нужен.",
-                ))
-                .wrap(),
-            );
-            if !on {
-                return;
-            }
-            if let Some((text, button)) = &problem {
-                ui.add_space(6.0);
-                if alert(ui, YELLOW, text, *button) && !self.busy {
+            ui.label(RichText::new("Компьютер как шлюз: что указать в настройках сети устройства").font(theme::semibold(15.0)).strong());
+            if let Some((text, button)) = &view.problem {
+                ui.add_space(4.0);
+                if theme::soft_note(ui, YELLOW, text, button.map(|b| (b, !self.busy))) {
                     fix = true;
                 }
             }
-            ui.add_space(6.0);
-            match &iface {
-                Some(i) => {
-                    ui.label(RichText::new("Что указать в настройках сети устройства (вручную)").strong());
-                    kv(ui, "IP-адрес", "тот, что устройство получило само");
-                    if kv(ui, "Маска подсети", &gateway::mask(i.prefix)) {
-                        copy = Some(gateway::mask(i.prefix));
+            ui.add_space(4.0);
+            ui.horizontal_top(|ui| {
+                let qr_w = if view.page_addr.is_some() { 150.0 } else { 0.0 };
+                ui.vertical(|ui| {
+                    ui.set_width((ui.available_width() - qr_w).max(260.0));
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    match &view.iface {
+                        Some(i) => {
+                            kv(ui, true, "IP-адрес", "тот, что устройство получило само", false);
+                            if kv(ui, false, "Маска подсети", &gateway::mask(i.prefix), true) {
+                                copy = Some(gateway::mask(i.prefix));
+                            }
+                            if kv(ui, false, "Шлюз («Роутер»)", &i.ip, true) {
+                                copy = Some(i.ip.clone());
+                            }
+                            kv(ui, false, "DNS", "8.8.8.8 и 1.1.1.1", false);
+                            kv(ui, false, "Прокси", "не использовать", false);
+                            let state = if i.forwarding { "пересылка включена" } else { "пересылка включится вместе с RayOfLight" };
+                            ui.add_space(6.0);
+                            ui.label(muted(format!("Сетевая карта «{}», роутер {}, {state}", i.alias, i.router)).size(12.5));
+                        }
+                        None => {
+                            ui.label(muted("Ищу сетевую карту с выходом в интернет…"));
+                        }
                     }
-                    if kv(ui, "Шлюз («Роутер»)", &i.ip) {
-                        copy = Some(i.ip.clone());
-                    }
-                    kv(ui, "DNS", "8.8.8.8 и 1.1.1.1");
-                    kv(ui, "Прокси", "не использовать");
-                    let state = if i.forwarding { "пересылка включена" } else { "пересылка выключена, включится вместе с RayOfLight" };
-                    ui.label(muted(format!("Сетевая карта «{}», роутер {}, {state}", i.alias, i.router)));
-                }
-                None => {
-                    ui.label(muted("Ищу сетевую карту с выходом в интернет…"));
-                }
-            }
-            if let Some(a) = &page_addr {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    qr(ui, &format!("http://{a}/gateway"), 132.0);
-                    ui.add_space(14.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Инструкция на телефоне").strong());
-                        ui.add(
-                            egui::Label::new(muted(
-                                "Наведите камеру телефона на код: откроется пошаговая настройка для PlayStation, Xbox, Switch и телевизоров с этими значениями и кнопками «Копировать».",
-                            ))
-                            .wrap(),
-                        );
-                        ui.label(muted(format!("Или откройте в браузере: http://{a}/gateway")));
-                    });
                 });
-            }
-            ui.add_space(6.0);
-            if devices.is_empty() {
-                ui.label(muted("Устройств через шлюз пока не видно. Они появятся здесь, когда откроют сайт из списков."));
+                if let Some(a) = &view.page_addr {
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        qr(ui, &format!("http://{a}/gateway"), 128.0);
+                        ui.add_space(2.0);
+                        ui.add(egui::Label::new(muted("инструкция на телефоне").size(12.0)).wrap())
+                            .on_hover_text(format!("Наведите камеру телефона: откроется пошаговая настройка для PlayStation, Xbox, Switch и телевизоров с этими значениями. Или откройте в браузере: http://{a}/gateway"));
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            if view.devices.is_empty() {
+                ui.label(muted("Устройств через шлюз пока не видно: они появятся здесь, когда откроют сайт из списков").size(12.5));
             } else {
-                ui.label(RichText::new(format!("Через шлюз: {}", devices.len())).strong());
-                for d in &devices {
-                    let name = d.app.trim_start_matches(ray::DEVICE);
-                    let hosts = d.hosts.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
-                    let text = format!("{name} · обработано {} · {hosts}", d.handled);
-                    ui.add(egui::Label::new(muted(text)).truncate());
+                ui.label(muted(format!("Через шлюз · {}", view.devices.len())));
+                for d in &view.devices {
+                    let name = d.app.trim_start_matches(ray::DEVICE).to_string();
+                    let hosts = d.hosts.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                    let rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), 32.0));
+                    ui.painter().rect_filled(rect, CornerRadius::same(10), Color32::from_white_alpha(6));
+                    theme::row(ui, 32.0, |ui| {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(theme::icon::GAME).font(theme::icon_font(14.0)).color(CYAN));
+                        ui.label(RichText::new(name).size(13.5));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            ui.add(egui::Label::new(muted(format!("{} · {hosts}", d.handled)).size(12.5)).truncate());
+                        });
+                    });
                 }
             }
             ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(muted(
-                    "Компьютер должен быть включён: без него у устройства не будет интернета. Если роутер выдаст компьютеру другой адрес, шлюз на устройстве нужно поменять, поэтому адрес компьютера лучше закрепить в настройках роутера. Вернуть как было: в настройках сети устройства выберите «Автоматически». Не работает в гостевой сети Wi-Fi и если роутер изолирует устройства друг от друга.",
-                ))
-                .wrap(),
-            );
+            theme::fold_row(ui, false, "Важно знать: компьютер должен быть включён, как вернуть настройки", &mut self.phone.folds[3]);
+            if self.phone.folds[3] {
+                ui.add(
+                    egui::Label::new(muted(
+                        "Компьютер должен быть включён: без него у устройства не будет интернета. Если роутер выдаст компьютеру другой адрес, шлюз на устройстве нужно поменять, поэтому адрес компьютера лучше закрепить в настройках роутера. Вернуть как было: в настройках сети устройства выберите «Автоматически». Не работает в гостевой сети Wi-Fi и если роутер изолирует устройства друг от друга.",
+                    ))
+                    .wrap(),
+                );
+                ui.add_space(4.0);
+            }
         });
         if let Some(c) = copy {
             ctx.copy_text(c);
@@ -286,28 +353,12 @@ impl App {
                 None => self.toast(ctx, Lvl::Err, "Нет файла bin\\RayOfLight.exe: скачайте HolyZapret заново"),
             }
         }
-        if let Some(v) = toggle {
-            settings::set_ray_gateway(v);
-            self.phone.gw_on = Some(v);
-            self.phone.gw_at = None;
-            self.phone.gw_page = false;
-            let installed = self.status.as_ref().is_some_and(|s| s.service != crate::core::service::ServiceState::NotInstalled);
-            let strategy = self.status.as_ref().and_then(|s| s.active_strategy().map(String::from)).and_then(|id| self.strategies.iter().find(|s| s.matches(&id)).cloned());
-            self.spawn(ctx, move |p, tx| {
-                match gateway::apply(v) {
-                    Ok(m) => super::notify(tx, Lvl::Ok, m),
-                    Err(e) => super::notify(tx, Lvl::Err, format!("Пересылка на сетевой карте не изменилась: {e}")),
-                }
-                if let (true, Some(s)) = (installed, strategy) {
-                    super::result_msg(tx, crate::core::service::install(p, &s), "Не удалось переустановить службу");
-                }
-            });
-        }
     }
 
     pub(super) fn phone_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.phone.loaded {
             self.phone.port = control::load().port.to_string();
+            self.phone.help[0] = true;
             self.phone.loaded = true;
         }
         let snap = control::snapshot();
@@ -326,211 +377,220 @@ impl App {
         let public = self.phone.net.lock().unwrap().clone().filter(|p| p.public && snap.is_some());
         let fw_error = control::firewall_error().filter(|_| snap.is_some());
         let protected = self.status.as_ref().is_some_and(|s| s.engine_running);
+        let gw = self.gateway_view(ctx);
         let mut act = None;
+        let mut gw_toggle = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            theme::card(ui, |ui| {
-                theme::row(ui, 32.0, |ui| {
-                    ui.label(RichText::new(theme::icon::PHONE).font(theme::icon_font(17.0)).color(CYAN));
-                    ui.add_space(2.0);
-                    ui.label(RichText::new("Раздача на телефон").size(15.5).strong());
-                    match &snap {
-                        Some(_) => theme::chip(ui, "Работает", GREEN),
-                        None => theme::chip(ui, "Выключена", Color32::from_gray(160)),
-                    };
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut on = snap.is_some();
-                        if theme::toggle(ui, &mut on).changed() {
-                            act = Some(Act::Toggle(on));
-                        }
-                    });
-                });
-                ui.add(
-                    egui::Label::new(muted(
-                        "Телефоны и другие устройства в вашей домашней сети получают обход HolyZapret через этот компьютер: без root, VPN-серверов и приложений на компьютере. Доступ только из локальной сети.",
-                    ))
-                    .wrap(),
-                );
-                if snap.is_some() && !protected {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new("Защита сейчас выключена: телефон получит интернет через компьютер, но без обхода").color(YELLOW).size(12.5));
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.columns(2, |c| {
+                for col in c.iter_mut() {
+                    col.spacing_mut().item_spacing.x = 10.0;
                 }
-                if let Some(p) = &public {
-                    ui.add_space(6.0);
-                    let name = if p.name.is_empty() { String::new() } else { format!(" «{}»", p.name) };
-                    let text = format!(
-                        "Windows считает сеть{name} общественной и не пускает к компьютеру другие устройства, поэтому телефон может не подключиться. Если это ваша домашняя сеть, сделайте её частной. В кафе и гостиницах так делать не стоит."
-                    );
-                    if alert(ui, RED, &text, Some("Сделать сеть частной")) {
-                        act = Some(Act::MakePrivate(p.index));
-                    }
+                let share_state = match &snap {
+                    Some(s) if s.clients > 0 => (format!("работает · устройств {}", s.clients), GREEN),
+                    Some(_) => ("работает".to_string(), GREEN),
+                    None => ("выключена".to_string(), Color32::from_gray(170)),
+                };
+                if let Some(v) = mode_tile(
+                    &mut c[0],
+                    theme::icon::PHONE,
+                    snap.is_some(),
+                    "Раздача на телефон",
+                    "Телефоны и планшеты",
+                    (&share_state.0, share_state.1),
+                    "Телефоны и другие устройства в вашей домашней сети получают обход HolyZapret через этот компьютер: без root, VPN-серверов и приложений на компьютере. Доступ только из локальной сети.",
+                    true,
+                ) {
+                    act = Some(Act::Toggle(v));
                 }
-                if let Some(e) = &fw_error {
-                    ui.add_space(6.0);
-                    alert(ui, RED, &format!("Windows не дал открыть порт раздачи в брандмауэре, телефон может не подключиться. Ответ Windows: {e}"), None);
+                let gw_state = match (gw.on, gw.ray_ok) {
+                    (true, true) if !gw.devices.is_empty() => (format!("работает · устройств {}", gw.devices.len()), GREEN),
+                    (true, true) => ("работает".to_string(), GREEN),
+                    (true, false) => ("без обхода".to_string(), YELLOW),
+                    (false, _) => ("выключен".to_string(), Color32::from_gray(170)),
+                };
+                if let Some(v) = mode_tile(
+                    &mut c[1],
+                    theme::icon::TV,
+                    gw.on,
+                    "Компьютер как шлюз",
+                    "Приставки и телевизоры",
+                    (&gw_state.0, gw_state.1),
+                    "Для приставок и телевизоров, где прокси не помогает: PlayStation, Xbox, Switch, телевизоры. В настройках сети устройства этот компьютер указывается как шлюз, и всё, что открывает устройство, идёт через обход.",
+                    !self.busy,
+                ) {
+                    gw_toggle = Some(v);
                 }
-                if snap.is_some() {
-                    ui.add_space(6.0);
-                    egui::Frame::new()
-                        .fill(YELLOW.gamma_multiply(0.12))
-                        .stroke(egui::Stroke::new(1.0, YELLOW.gamma_multiply(0.45)))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new("Пока на телефоне включён этот прокси, его Wi-Fi работает только с включённым компьютером и открытым HolyZapret. Android не подскажет, что дело в прокси.")
-                                        .color(YELLOW)
-                                        .size(13.0),
-                                )
-                                .wrap(),
-                            );
-                            ui.add(egui::Label::new(muted("Чтобы вернуть интернет на телефоне: Настройки → Wi-Fi → ваша сеть → Изменить → Дополнительно → Прокси → Нет. С приложением v2rayNG такой проблемы нет: выключили его, и интернет идёт напрямую.")).wrap());
-                        });
-                }
-                if let (Some(s), Some(a)) = (&snap, &addr) {
-                    ui.add_space(8.0);
-                    let labels = ["Страница настройки".to_string(), "Ссылка для v2rayNG".to_string()];
-                    theme::segmented(ui, &labels, &mut self.phone.qr_mode);
-                    ui.add_space(8.0);
-                    let v2 = page::v2ray_link(a);
-                    let code = if self.phone.qr_mode == 1 { v2.clone() } else { format!("http://{a}/") };
-                    ui.horizontal(|ui| {
-                        qr(ui, &code, 176.0);
-                        ui.add_space(14.0);
+            });
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if let (Some(s), Some(a)) = (&snap, &addr) {
+                ui.add_space(2.0);
+                theme::card(ui, |ui| {
+                    ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(muted("Адрес прокси"));
+                            let v2 = page::v2ray_link(a);
+                            let code = if self.phone.qr_mode == 1 { v2 } else { format!("http://{a}/") };
+                            qr(ui, &code, 150.0);
+                            ui.add_space(6.0);
+                            theme::segmented(ui, &["Страница".to_string(), "v2rayNG".to_string()], &mut self.phone.qr_mode);
+                        });
+                        ui.add_space(16.0);
+                        ui.vertical(|ui| {
+                            ui.label(muted("Адрес раздачи"));
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(a).size(22.0).strong());
+                                ui.label(RichText::new(a).font(theme::semibold(22.0)).strong().color(Color32::WHITE));
                                 if theme::icon_button(ui, theme::icon::COPY, "Скопировать адрес").clicked() {
                                     act = Some(Act::Copy(a.clone(), "Адрес скопирован"));
                                 }
                             });
-                            ui.add_space(4.0);
                             let hint = if self.phone.qr_mode == 1 {
-                                "В v2rayNG на телефоне: плюс в правом верхнем углу → «Сканировать QR-код», наведите на этот код. Затем выберите сервер HolyZapret и нажмите запуск. Через компьютер пойдёт всё, включая звонки Discord."
+                                "В v2rayNG: плюс в правом верхнем углу → «Сканировать QR-код», наведите на этот код. Затем выберите сервер HolyZapret и нажмите запуск"
                             } else {
-                                "Наведите камеру телефона на QR-код: откроется страница с настройкой для Android, iPhone, телевизора и PlayStation"
+                                "Наведите камеру телефона: откроется пошаговая настройка для Android, iPhone, телевизора и PlayStation"
                             };
-                            ui.add(egui::Label::new(RichText::new(hint).color(Color32::from_gray(205))).wrap());
+                            ui.add(egui::Label::new(muted(hint)).wrap());
                             if self.phone.qr_mode == 1 {
+                                let v2 = page::v2ray_link(a);
                                 ui.horizontal(|ui| {
-                                    ui.label(muted(&v2));
+                                    ui.add(egui::Label::new(muted(&v2).size(12.0)).truncate());
                                     if theme::icon_button(ui, theme::icon::COPY, "Скопировать ссылку").clicked() {
                                         act = Some(Act::Copy(v2.clone(), "Ссылка для v2rayNG скопирована"));
                                     }
                                 });
                             }
-                            ui.add_space(6.0);
-                            ui.label(muted(format!(
-                                "Устройств: {} · соединений сейчас {} · всего {} · ↑ {} ↓ {}",
-                                s.clients,
-                                s.active,
-                                s.total,
-                                human(s.up),
-                                human(s.down)
-                            )));
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                stat(ui, &s.clients.to_string(), "устройств", true);
+                                stat(ui, &s.active.to_string(), &format!("соединений · всего {}", s.total), true);
+                                stat(ui, &format!("↓ {}", human(s.down)), &format!("↑ {}", human(s.up)), false);
+                            });
                             if s.failed > 0 && !s.last_error.is_empty() {
-                                ui.add(egui::Label::new(muted(format!("Последняя ошибка: {}", s.last_error))).truncate());
+                                ui.add(egui::Label::new(muted(format!("Последняя ошибка: {}", s.last_error)).size(12.5)).truncate());
                             }
                         });
                     });
+                    if !protected {
+                        ui.add_space(6.0);
+                        if theme::soft_note(ui, YELLOW, "Защита сейчас выключена: телефон получит интернет через компьютер, но без обхода", Some(("Включить защиту", !self.busy))) {
+                            act = Some(Act::Protect);
+                        }
+                    }
+                    if let Some(p) = &public {
+                        ui.add_space(6.0);
+                        let name = if p.name.is_empty() { String::new() } else { format!(" «{}»", p.name) };
+                        let text = format!("Windows считает сеть{name} общественной и не пускает к компьютеру другие устройства. Если это ваша домашняя сеть, сделайте её частной. В кафе и гостиницах так делать не стоит.");
+                        if theme::soft_note(ui, RED, &text, Some(("Сделать сеть частной", true))) {
+                            act = Some(Act::MakePrivate(p.index));
+                        }
+                    }
+                    if let Some(e) = &fw_error {
+                        ui.add_space(6.0);
+                        theme::soft_note(ui, RED, &format!("Windows не дал открыть порт раздачи в брандмауэре, телефон может не подключиться. Ответ Windows: {e}"), None);
+                    }
+                    ui.add_space(6.0);
+                    let r = ui
+                        .scope(|ui| {
+                            theme::soft_note(ui, YELLOW, "Пока на телефоне включён этот прокси, его Wi-Fi работает только с включённым компьютером и открытым HolyZapret", None);
+                        })
+                        .response;
+                    r.on_hover_text("Чтобы вернуть интернет на телефоне: Настройки → Wi-Fi → ваша сеть → Изменить → Дополнительно → Прокси → Нет. С приложением v2rayNG такой проблемы нет: выключили его, и интернет идёт напрямую.");
+                    ui.add_space(4.0);
                     let devices = control::devices();
                     if !devices.is_empty() {
-                        ui.add_space(8.0);
-                        egui::CollapsingHeader::new(RichText::new(format!("Что запрашивают устройства: {}", devices.len())).size(14.0))
-                            .id_salt("lan_devices")
-                            .show(ui, |ui| {
-                                for (ip, d) in &devices {
-                                    ui.label(RichText::new(control::device_title(ip, d)).size(14.0).strong());
-                                    if let Some(a) = d.agents.first() {
-                                        ui.add(egui::Label::new(muted(format!("Программа: {a}"))).truncate());
-                                    }
-                                    for e in d.errors.iter().take(2) {
-                                        ui.add(egui::Label::new(RichText::new(format!("Ошибка запроса: {e}")).color(RED).size(12.5)).wrap());
-                                    }
-                                    for v in d.visits.iter().take(12) {
-                                        let text = control::visit_line(v);
-                                        let label = if v.error.is_some() { RichText::new(text).color(YELLOW).size(12.5) } else { muted(text) };
-                                        ui.add(egui::Label::new(label).truncate());
-                                    }
-                                    if d.visits.len() > 12 {
-                                        ui.label(muted(format!("и ещё {}, все — в отчёте для разработчика", d.visits.len() - 12)));
-                                    }
-                                    ui.add_space(6.0);
+                        theme::fold_row(ui, false, &format!("Что запрашивают устройства · {}", devices.len()), &mut self.phone.folds[0]);
+                        if self.phone.folds[0] {
+                            for (ip, d) in &devices {
+                                ui.label(RichText::new(control::device_title(ip, d)).font(theme::semibold(14.0)).strong());
+                                if let Some(a) = d.agents.first() {
+                                    ui.add(egui::Label::new(muted(format!("Программа: {a}")).size(12.5)).truncate());
                                 }
-                            });
-                    }
-                }
-                ui.add_space(6.0);
-                theme::row(ui, 36.0, |ui| {
-                    theme::row_label(ui, "Порт", 50.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.phone.port).desired_width(64.0));
-                    if ui.button("Сохранить").clicked() {
-                        act = Some(Act::Port);
-                    }
-                });
-            });
-            if snap.is_some() {
-                ui.add_space(10.0);
-                let running = self.phone.diag_running.load(std::sync::atomic::Ordering::Relaxed);
-                let found = self.phone.diag.lock().unwrap().clone();
-                theme::card(ui, |ui| {
-                    theme::row(ui, 32.0, |ui| {
-                        ui.label(RichText::new(theme::icon::DIAGNOSTIC).font(theme::icon_font(17.0)).color(CYAN));
-                        ui.add_space(2.0);
-                        ui.label(RichText::new("Телефон не подключается?").size(15.5).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if running {
-                                ui.spinner();
-                            } else if ui.add_enabled(!self.busy, egui::Button::new(if found.is_some() { "Проверить ещё раз" } else { "Проверить" })).clicked() {
-                                act = Some(Act::Diag(None));
-                            }
-                        });
-                    });
-                    ui.add(
-                        egui::Label::new(muted(
-                            "Лаунчер проверит, отвечает ли раздача, тип сети, брандмауэр Windows, антивирус и VPN, и подскажет, что мешает телефону. Проверка занимает несколько секунд.",
-                        ))
-                        .wrap(),
-                    );
-                    if let Some(list) = &found {
-                        ui.add_space(6.0);
-                        for item in list {
-                            if finding_row(ui, item, !running && !self.busy) {
-                                act = Some(Act::Diag(item.fix.clone()));
+                                for e in d.errors.iter().take(2) {
+                                    ui.add(egui::Label::new(RichText::new(format!("Ошибка запроса: {e}")).color(RED).size(12.5)).wrap());
+                                }
+                                for v in d.visits.iter().take(12) {
+                                    let text = control::visit_line(v);
+                                    let label = if v.error.is_some() { RichText::new(text).color(YELLOW).size(12.5) } else { muted(text).size(12.5) };
+                                    ui.add(egui::Label::new(label).truncate());
+                                }
+                                if d.visits.len() > 12 {
+                                    ui.label(muted(format!("и ещё {}, все — в отчёте для разработчика", d.visits.len() - 12)).size(12.5));
+                                }
+                                ui.add_space(6.0);
                             }
                         }
                     }
+                    let running = self.phone.diag_running.load(std::sync::atomic::Ordering::Relaxed);
+                    let found = self.phone.diag.lock().unwrap().clone();
+                    theme::fold_row(ui, false, "Телефон не подключается?", &mut self.phone.folds[1]);
+                    if self.phone.folds[1] {
+                        theme::row(ui, 34.0, |ui| {
+                            ui.add(egui::Label::new(muted("Проверю, отвечает ли раздача, тип сети, брандмауэр Windows, антивирус и VPN. Несколько секунд")).truncate());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if running {
+                                    ui.spinner();
+                                } else if ui.add_enabled(!self.busy, crate::theme::GlassButton::new(if found.is_some() { "Проверить ещё раз" } else { "Проверить" })).clicked() {
+                                    act = Some(Act::Diag(None));
+                                }
+                            });
+                        });
+                        if let Some(list) = &found {
+                            ui.add_space(4.0);
+                            for item in list {
+                                if finding_row(ui, item, !running && !self.busy) {
+                                    act = Some(Act::Diag(item.fix.clone()));
+                                }
+                            }
+                        }
+                    }
+                    theme::fold_row(ui, false, "Дополнительно: порт", &mut self.phone.folds[2]);
+                    if self.phone.folds[2] {
+                        theme::row(ui, 36.0, |ui| {
+                            theme::row_label(ui, "Порт", 50.0);
+                            ui.add(egui::TextEdit::singleline(&mut self.phone.port).desired_width(72.0));
+                            if crate::theme::button(ui, "Сохранить").clicked() {
+                                act = Some(Act::Port);
+                            }
+                        });
+                    }
                 });
             }
-            ui.add_space(10.0);
-            self.gateway_card(ui, ctx);
-            ui.add_space(10.0);
+            if gw.on {
+                ui.add_space(2.0);
+                self.gateway_card(ui, ctx, &gw);
+            }
+            ui.add_space(2.0);
+            let a = addr.clone().unwrap_or_else(|| "адрес_компьютера:порт".into());
             theme::card(ui, |ui| {
-                theme::row(ui, 32.0, |ui| {
-                    ui.label(RichText::new(theme::icon::INFO).font(theme::icon_font(17.0)).color(CYAN));
-                    ui.add_space(2.0);
-                    ui.label(RichText::new("Как подключить телефон").size(15.5).strong());
-                });
-                let a = addr.clone().unwrap_or_else(|| "адрес_компьютера:порт".into());
-                ui.add(egui::Label::new(muted("Телефон должен быть в той же Wi-Fi сети, что и компьютер.")).wrap());
-                ui.add_space(6.0);
-                ui.label(RichText::new("Через приложение v2rayNG (рекомендуем)").strong());
-                step(ui, 1, "Установите v2rayNG из Google Play или с GitHub.");
-                step(ui, 2, "Переключите QR-код выше на «Ссылка для v2rayNG». В v2rayNG: плюс → «Сканировать QR-код». Или плюс → «Вручную: SOCKS» с адресом и портом раздачи без пароля.");
-                step(ui, 3, "Выберите сервер HolyZapret, нажмите запуск внизу и разрешите VPN.");
-                ui.add(egui::Label::new(muted("Через компьютер пойдёт всё, включая звонки Discord. Выключили v2rayNG — интернет на телефоне снова напрямую.")).wrap());
-                ui.add_space(8.0);
-                ui.label(RichText::new("Через прокси в настройках Wi-Fi, без приложений").strong());
-                step(ui, 1, "Настройки → Wi-Fi → ваша сеть → Изменить → Дополнительно → Прокси → Автоматическая настройка (PAC).");
-                step(ui, 2, &format!("Адрес PAC: http://{a}/proxy.pac. С ним при выключенной раздаче телефон идёт в интернет напрямую, пока лаунчер открыт."));
-                step(ui, 3, &format!("Или Прокси → Вручную: имя хоста и порт из адреса {a}."));
-                ui.add(egui::Label::new(muted("Так работают браузер и большинство приложений, но не звонки.")).wrap());
-                ui.add_space(8.0);
-                ui.add(egui::Label::new(muted("iPhone, телевизор с Android TV или PlayStation: откройте страницу из QR-кода и выберите устройство, там пошагово.")).wrap());
+                ui.label(RichText::new("Как подключить").font(theme::semibold(15.0)).strong());
+                ui.add(egui::Label::new(muted("Устройство должно быть в той же сети, что и компьютер")).wrap());
+                ui.add_space(2.0);
+                theme::fold_row(ui, true, "Телефон через приложение v2rayNG — рекомендуем", &mut self.phone.help[0]);
+                if self.phone.help[0] {
+                    step(ui, 1, "Включите раздачу и установите v2rayNG из Google Play или с GitHub");
+                    step(ui, 2, "Переключите QR-код на «v2rayNG». В приложении: плюс → «Сканировать QR-код». Или плюс → «Вручную: SOCKS» с адресом и портом раздачи без пароля");
+                    step(ui, 3, "Выберите сервер HolyZapret, нажмите запуск внизу и разрешите VPN");
+                    ui.add(egui::Label::new(muted("Через компьютер пойдёт всё, включая звонки Discord. Выключили v2rayNG — интернет на телефоне снова напрямую.").size(12.5)).wrap());
+                    ui.add_space(6.0);
+                }
+                theme::fold_row(ui, false, "Телефон через прокси в настройках Wi-Fi, без приложений", &mut self.phone.help[1]);
+                if self.phone.help[1] {
+                    step(ui, 1, "Настройки → Wi-Fi → ваша сеть → Изменить → Дополнительно → Прокси → Автоматическая настройка (PAC)");
+                    step(ui, 2, &format!("Адрес PAC: http://{a}/proxy.pac. С ним при выключенной раздаче телефон идёт в интернет напрямую, пока лаунчер открыт"));
+                    step(ui, 3, &format!("Или Прокси → Вручную: имя хоста и порт из адреса {a}"));
+                    ui.add(egui::Label::new(muted("Так работают браузер и большинство приложений, но не звонки.").size(12.5)).wrap());
+                    ui.add_space(6.0);
+                }
+                theme::fold_row(ui, false, "PlayStation, Xbox, Switch, телевизор, iPhone", &mut self.phone.help[2]);
+                if self.phone.help[2] {
+                    step(ui, 1, "Приставки и телевизоры: включите «Компьютер как шлюз» и впишите значения из его карточки в настройки сети устройства. Пошаговая инструкция — по QR-коду в той же карточке");
+                    step(ui, 2, "iPhone и Android TV: включите раздачу и откройте страницу из QR-кода, там пошагово для каждого устройства");
+                    ui.add_space(6.0);
+                }
             });
         });
+        if let Some(v) = gw_toggle {
+            self.gateway_toggle(ctx, v);
+        }
         match act {
             Some(Act::Toggle(false)) => self.confirm = Some(super::confirm::Confirm::StopSharing),
             Some(Act::Toggle(true)) => match control::enable(true) {
@@ -582,6 +642,7 @@ impl App {
                     Err(e) => super::notify(tx, Lvl::Err, format!("Не удалось сделать сеть частной: {e}")),
                 });
             }
+            Some(Act::Protect) => self.install_general(ctx),
             None => {}
         }
     }

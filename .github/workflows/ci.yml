@@ -19,15 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Сверить версии
+      - name: Проверить версию и файлы для обновления
         run: |
-          $manager = (Get-Content scripts/manager.bat -Raw) -match 'set "LOCAL_VERSION=([^"]+)"'
-          if (-not $manager) { throw "В scripts/manager.bat не найден LOCAL_VERSION" }
-          $managerVersion = $Matches[1]
           $cargo = (Get-Content launcher/Cargo.toml -Raw) -match '(?m)^version\s*=\s*"([^"]+)"'
           if (-not $cargo) { throw "В launcher/Cargo.toml не найдена version" }
-          $cargoVersion = $Matches[1]
-          if ($managerVersion -ne $cargoVersion) { throw "Версии расходятся: scripts/manager.bat $managerVersion, launcher/Cargo.toml $cargoVersion" }
+          if (-not (Test-Path bin/HolyZapret.exe)) { throw "Нет bin/HolyZapret.exe: без этого файла-пустышки версии 3.2.0 и старше не примут архив обновления" }
+          if ((Get-Item bin/HolyZapret.exe).Length -gt 4096) { throw "bin/HolyZapret.exe должен быть пустышкой, а не настоящим движком" }
 
       - uses: dtolnay/rust-toolchain@stable
 

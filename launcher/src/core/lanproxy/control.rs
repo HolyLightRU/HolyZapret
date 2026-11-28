@@ -226,7 +226,8 @@ pub fn snapshot() -> Option<Snapshot> {
 pub fn devices() -> Vec<(std::net::IpAddr, super::Device)> {
     let g = PROXY.lock().unwrap();
     let Some(h) = g.as_ref() else { return Vec::new() };
-    let mut v: Vec<(std::net::IpAddr, super::Device)> = h.stats.devices.lock().unwrap().iter().map(|(k, d)| (*k, d.clone())).collect();
+    let mut v: Vec<(std::net::IpAddr, super::Device)> =
+        h.stats.devices.lock().unwrap().iter().filter(|(_, d)| !d.visits.is_empty() || !d.errors.is_empty()).map(|(k, d)| (*k, d.clone())).collect();
     v.sort_by(|a, b| b.1.last.cmp(&a.1.last));
     v
 }

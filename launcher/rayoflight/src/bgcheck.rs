@@ -10,6 +10,7 @@ pub const LONG: usize = 1800;
 const CONNECT: Duration = Duration::from_secs(5);
 const ANSWER: Duration = Duration::from_secs(6);
 const TICK: Duration = Duration::from_secs(2);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn hello(host: &str, long: bool) -> Option<Vec<u8>> {
     let mut h = tls::with_sni(desync::FAKE_DEFAULT, host)?;
@@ -49,6 +50,16 @@ pub fn spawn<A: Clone + Send + 'static>(engine: Arc<Mutex<Engine<A>>>, ended: Ar
             for (host, addr, parts) in targets {
                 let engine = engine.clone();
                 std::thread::spawn(move || check(&engine, &host, addr, parts >= 2));
+            }
+            let hosts = engine.lock().map(|mut e| e.freeze_targets(Instant::now())).unwrap_or_default();
+            for host in hosts {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let (got, ended) = crate::dns::download(&host, crate::flows::FETCH_WANT, FETCH_TIMEOUT);
+                    if let Ok(mut e) = engine.lock() {
+                        e.freeze_verdict(&host, crate::flows::fetch_verdict(got, ended));
+                    }
+                });
             }
         }
     })

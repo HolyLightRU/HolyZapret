@@ -30,6 +30,7 @@ pub fn install() {
         let trace = std::backtrace::Backtrace::force_capture().to_string();
         write_to(&file(), &describe(info, env!("CARGO_PKG_VERSION"), &crate::log::now_stamp(), &thread, &trace));
         prev(info);
+        std::process::abort();
     }));
 }
 

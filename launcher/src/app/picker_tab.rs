@@ -23,7 +23,7 @@ pub struct PickerState {
     phase_name: String,
     done: usize,
     targets: Vec<Target>,
-    results: Vec<Outcome>,
+    pub(super) results: Vec<Outcome>,
     chosen: Option<usize>,
     optimal: Option<usize>,
     pub(super) scope: usize,
@@ -274,7 +274,7 @@ impl App {
         self.picker.report_form = Some((isp, city, String::new()));
     }
 
-    pub(super) fn picker_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(super) fn picker_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some(p) = &self.paths {
             if self.picker.default_targets.is_empty() {
                 self.picker.default_targets = picker::load_targets(p);
@@ -283,29 +283,36 @@ impl App {
                 self.picker.optimal = Some(picker::optimal(p, &self.strategies).len());
             }
         }
+        let notes = self.picker_notes();
+        let summary = self.picker_summary();
         theme::card(ui, |ui| {
-            theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Подбор приёма").size(17.0).strong());
+            theme::row(ui, 34.0, |ui| {
+                ui.label(RichText::new("Подбор приёма").font(theme::semibold(15.0)).strong());
+                if !self.picker.running {
+                    ui.label(muted(summary));
+                    ui.label(RichText::new(theme::icon::INFO).font(theme::icon_font(13.0)).color(Color32::from_gray(150)))
+                        .on_hover_text(notes.join("\n\n"));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.picker.running {
-                        if ui.button("Отменить").clicked() {
+                        if crate::theme::button(ui, "Отменить").clicked() {
                             if let Some(c) = &self.picker.cancel {
                                 c.store(true, Ordering::Relaxed);
                             }
                         }
-                    } else {
-                        ui.add_enabled_ui(!self.busy && self.paths.is_some(), |ui| {
-                            if ui.add(theme::Primary("Начать подбор".into())).clicked() {
-                                self.start_pick(ctx);
-                            }
-                            if crate::core::TEST_BUILD
-                                && ui
+                    } else if crate::core::TEST_BUILD {
+                        let free = !self.busy && self.paths.is_some();
+                        ui.add_enabled_ui(free, |ui| {
+                            ui.menu_button(RichText::new("···").size(14.0), |ui| {
+                                if ui
                                     .button("Полный подбор и отчёт")
                                     .on_hover_text("Все приёмы на всех сайтах, а в конце отчёт для разработчика сам сохранится на рабочий стол. Можно нажать и отойти от компьютера")
                                     .clicked()
-                            {
-                                self.start_full_report(ctx);
-                            }
+                                {
+                                    ui.close();
+                                    self.start_full_report(ctx);
+                                }
+                            });
                         });
                     }
                 });
@@ -316,100 +323,85 @@ impl App {
                 self.picker_setup(ui);
             }
         });
-        if !self.picker.results.is_empty() {
-            self.picker_results(ui, ctx);
-        }
     }
 
-    fn picker_setup(&mut self, ui: &mut egui::Ui) {
-        let optimal = self.picker.optimal.unwrap_or(0);
-        let all = self.strategies.len();
-        theme::row(ui, 36.0, |ui| {
-            theme::row_label(ui, "Набор", 110.0);
-            let labels = vec![format!("Быстрый · {optimal}"), format!("Все · {all}")];
-            if self.picker.mode > 1 {
-                self.picker.mode = 1;
-            }
-            theme::segmented(ui, &labels, &mut self.picker.mode);
-        });
-        theme::row(ui, 36.0, |ui| {
-            theme::row_label(ui, "Проверять", 110.0);
-            let labels = vec!["Все сайты".to_string(), "Только мои".to_string()];
-            if theme::segmented(ui, &labels, &mut self.picker.scope) {
-                self.picker.priority = 0;
-            }
-        });
-        let mut bad = Vec::new();
-        if self.picker.scope == 1 {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let w = 110.0 - ui.spacing().item_spacing.x;
-                        theme::row_label(ui, "Сайты", w)
-                    });
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.picker.sites)
-                        .hint_text("Ссылки или домены через пробел или с новой строки: rutracker.org, https://site.ru/page")
-                        .desired_rows(3)
-                        .desired_width(ui.available_width()),
-                );
-            });
-            bad = picker::parse_sites(&self.picker.sites).1;
-            theme::row(ui, 30.0, |ui| {
-                theme::row_label(ui, "", 110.0);
-                let mut add = !self.picker.skip_lists;
-                ui.checkbox(&mut add, "Добавить заблокированные в «Мои домены»")
-                    .on_hover_text("RayOfLight обходит блокировку для доменов из списков. Добавятся только сайты, которые не открылись без обхода: обход рабочих сайтов может их сломать");
-                self.picker.skip_lists = !add;
-            });
+    pub(super) fn picker_start_label(&self) -> &'static str {
+        if self.picker.running { "Идёт подбор…" } else { "Подобрать приём" }
+    }
+
+    fn picker_count(&self) -> usize {
+        if self.picker.mode == 0 { self.picker.optimal.unwrap_or(0) } else { self.strategies.len() }
+    }
+
+    fn picker_summary(&self) -> String {
+        let n = self.picker_count();
+        let checks = self.picker.preview_targets().len();
+        if self.picker.scope == 1 && checks == 0 {
+            return "впишите сайты, которые не открываются".into();
         }
-        let preview = self.picker.preview_targets();
-        let cats = picker::categories(&preview);
-        if cats.len() > 1 {
-            theme::row(ui, 36.0, |ui| {
-                theme::row_label(ui, "Важнее всего", 110.0);
-                let mut labels = vec!["Всё сразу".to_string()];
-                labels.extend(cats);
-                theme::segmented(ui, &labels, &mut self.picker.priority);
-            });
-        } else {
-            self.picker.priority = 0;
-        }
-        let n = if self.picker.mode == 0 { optimal } else { all };
         let minutes = ((n + 1) * SECONDS_PER_STRATEGY).div_ceil(60);
-        let mut notes = Vec::new();
-        if self.picker.scope == 1 && preview.is_empty() {
-            notes.push("Впишите хотя бы один сайт, который не открывается.".to_string());
-        } else {
-            notes.push(format!(
-                "RayOfLight по очереди запускается с каждым приёмом и проходит {} проверок. Займёт около {minutes} мин.",
-                preview.len()
-            ));
-        }
+        format!("{n} {} · {checks} {} · ≈ {minutes} мин", plural(n, ["приём", "приёма", "приёмов"]), plural(checks, ["проверка", "проверки", "проверок"]))
+    }
+
+    fn picker_notes(&self) -> Vec<String> {
+        let mut notes = vec!["RayOfLight по очереди запускается с каждым приёмом и проверяет сайты. Подбор сначала проверяет их без обхода, чтобы понять, что заблокировано.".to_string()];
         if self.picker.mode == 0 {
             notes.push("Быстрый набор сравнивает приёмы самоподстройки. Набор «Все» добавляет приёмы из старых батников ALT и R, приёмы для QUIC и 4 проверки QUIC.".to_string());
         } else {
-            notes.push("Все приёмы для TCP и QUIC, плюс 4 проверки QUIC. Лучший можно сразу поставить.".to_string());
+            notes.push("Все приёмы для TCP и QUIC, плюс 4 проверки QUIC. Лучший можно сразу включить.".to_string());
         }
+        notes.push("Справа — какие сайты важнее всего при выборе лучшего приёма.".to_string());
         if self.picker.scope == 1 {
-            notes.push("Если сайт после подбора открывается не полностью, найдите его дополнительные домены во вкладке «Списки».".into());
+            notes.push("Если сайт после подбора открывается не полностью, найдите его дополнительные домены в «Настройках → Списки» (включите продвинутый режим).".into());
         }
         if self.status.as_ref().is_some_and(|s| s.service == ServiceState::Running) {
             notes.push("Служба будет остановлена на время подбора и запущена снова.".into());
         } else if self.status.as_ref().is_some_and(|s| s.engine_running) {
             notes.push("Запущенный обход будет остановлен на время подбора.".into());
         }
-        notes.push("Подбор сначала проверяет сайты без обхода, чтобы понять, что заблокировано.".into());
         if !picker::tls13_supported() {
             notes.push("В curl этой версии Windows нет TLS 1.3, поэтому TLS 1.3 проверяется по ответу сайта на первое сообщение, без загрузки страницы.".into());
         }
-        for e in bad.iter().take(3) {
-            ui.label(RichText::new(e).color(RED).size(12.5));
+        notes
+    }
+
+    fn picker_setup(&mut self, ui: &mut egui::Ui) {
+        let optimal = self.picker.optimal.unwrap_or(0);
+        let all = self.strategies.len();
+        if self.picker.mode > 1 {
+            self.picker.mode = 1;
         }
-        for n in notes {
-            ui.label(RichText::new(n).weak().size(12.5));
+        let preview = self.picker.preview_targets();
+        let cats = picker::categories(&preview);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+            theme::segmented(ui, &[format!("Быстрый · {optimal}"), format!("Все · {all}")], &mut self.picker.mode);
+            if theme::segmented(ui, &["Все сайты".to_string(), "Только мои".to_string()], &mut self.picker.scope) {
+                self.picker.priority = 0;
+            }
+            if cats.len() > 1 {
+                let mut labels = vec!["Всё сразу".to_string()];
+                labels.extend(cats);
+                priority_picker(ui, &labels, &mut self.picker.priority);
+            } else {
+                self.picker.priority = 0;
+            }
+        });
+        if self.picker.scope == 1 {
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.picker.sites)
+                    .hint_text("Сайты, которые не открываются: ссылки или домены через пробел или с новой строки")
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+            for e in picker::parse_sites(&self.picker.sites).1.iter().take(3) {
+                ui.label(RichText::new(e).color(RED).size(12.5));
+            }
+            let mut add = !self.picker.skip_lists;
+            ui.checkbox(&mut add, "Добавить заблокированные в «Мои домены»")
+                .on_hover_text("RayOfLight обходит блокировку для доменов из списков. Добавятся только сайты, которые не открылись без обхода: обход рабочих сайтов может их сломать");
+            self.picker.skip_lists = !add;
         }
     }
 
@@ -418,24 +410,24 @@ impl App {
         let steps = st.strategies + 1;
         let checks = st.checks.max(1);
         let frac = ((st.phase * checks + st.done) as f32 / (steps * checks) as f32).clamp(0.0, 1.0);
-        ui.add_space(4.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, CornerRadius::same(5), Color32::from_white_alpha(18));
+        ui.add_space(2.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, CornerRadius::same(4), Color32::from_white_alpha(16));
         if frac > 0.01 {
             let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height()));
-            theme::gradient_rect(ui.painter(), fill, 5.0, PINK, CYAN);
+            theme::gradient_rect(ui.painter(), fill, 4.0, PINK, CYAN);
         }
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(format!("Шаг {} из {steps}: {}", st.phase + 1, st.phase_name));
-            ui.label(RichText::new(format!("проверок {}/{}", st.done, st.checks)).weak());
+        let left = steps.saturating_sub(st.phase) * SECONDS_PER_STRATEGY;
+        theme::row(ui, 26.0, |ui| {
+            ui.label(muted(format!("Шаг {} из {steps} · «{}»", st.phase + 1, st.phase_name)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(format!("{:.0}%", frac * 100.0)).color(Color32::from_gray(170)));
+                let rest = if left >= 90 { format!("ещё ~{} мин", left.div_ceil(60)) } else { "почти готово".into() };
+                ui.label(muted(format!("{:.0}% · {rest}", frac * 100.0)));
             });
         });
     }
 
-    fn picker_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(super) fn picker_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let targets = self.picker.targets.clone();
         let cats = picker::categories(&targets);
         let ranked = self.picker.ranked();
@@ -461,11 +453,11 @@ impl App {
         });
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Результаты").size(17.0).strong());
-                ui.label(RichText::new(format!("{}", ranked.len())).weak());
+                ui.label(RichText::new("Результаты").font(theme::semibold(15.0)).strong());
+                ui.label(muted(format!("{}", ranked.len())));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add_enabled(!self.picker.running && !self.busy, egui::Button::new("Сохранить отчёт"))
+                        .add_enabled(!self.picker.running && !self.busy, crate::theme::GlassButton::new("Сохранить отчёт"))
                         .on_hover_text("Подробный отчёт для разбора приёмов: сохранится на рабочий стол")
                         .clicked()
                     {
@@ -477,9 +469,8 @@ impl App {
                 let (ok, total) = b.score();
                 if total > 0 && ok == total {
                     egui::Frame::new()
-                        .fill(YELLOW.gamma_multiply(0.12))
-                        .stroke(egui::Stroke::new(1.0, YELLOW.gamma_multiply(0.45)))
-                        .corner_radius(CornerRadius::same(10))
+                        .fill(YELLOW.gamma_multiply(0.10))
+                        .corner_radius(CornerRadius::same(12))
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -524,9 +515,8 @@ impl App {
             if let (Some(b), Some(plan)) = (&base, &plan) {
                 ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(CYAN.gamma_multiply(0.10))
-                    .stroke(egui::Stroke::new(1.0, CYAN.gamma_multiply(0.40)))
-                    .corner_radius(CornerRadius::same(10))
+                    .fill(CYAN.gamma_multiply(0.09))
+                    .corner_radius(CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -546,7 +536,7 @@ impl App {
                             ui.label(RichText::new(format!("• {} — как в «{}»", domains.join(", "), self.picker.results[*ri].name)).size(12.5));
                         }
                         ui.add_space(2.0);
-                        if ui.add_enabled(!self.busy, egui::Button::new("Собрать")).on_hover_text("Правила появятся на вкладке «Сайты», служба перезапустится").clicked() {
+                        if ui.add_enabled(!self.busy, crate::theme::GlassButton::new("Собрать")).on_hover_text("Правила появятся на вкладке «Сайты», служба перезапустится").clicked() {
                             build = Some(plan.clone());
                         }
                     });
@@ -555,7 +545,7 @@ impl App {
                 theme::row(ui, 30.0, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(!self.busy, egui::Button::new("Не обходить их"))
+                            .add_enabled(!self.busy, crate::theme::GlassButton::new("Не обходить их"))
                             .on_hover_text("Добавит правило на вкладке «Сайты»: обход не будет трогать эти сайты")
                             .clicked()
                         {
@@ -574,8 +564,8 @@ impl App {
                     });
                 });
             }
-            let h = (ui.available_height() - 52.0).max(120.0);
-            egui::ScrollArea::vertical().max_height(h).auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 if let (Some(b), Some(bi)) = (&baseline, base_idx) {
                     let sel = self.picker.chosen == Some(bi) || (self.picker.chosen.is_none() && best == Some(bi));
@@ -598,18 +588,18 @@ impl App {
                 let hint = if pick_is_base {
                     "Обход не нужен: без него результат не хуже"
                 } else {
-                    "По умолчанию выбрана лучшая, кликните по строке, чтобы выбрать другую"
+                    "Лучший выбран сам, можно нажать на другой"
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let free = !self.busy && !self.picker.running;
                     if pick_is_base {
-                        if installed && ui.add_enabled(free, egui::Button::new("Удалить службу")).clicked() {
+                        if installed && ui.add_enabled(free, crate::theme::GlassButton::new("Удалить службу")).clicked() {
                             remove = true;
                         }
                     } else {
                         ui.add_enabled_ui(pick.is_some() && free, |ui| {
                             let name = pick.map(|i| self.picker.results[i].name.clone()).unwrap_or_default();
-                            let btn = ui.add(theme::Primary(format!("Установить «{}»", theme::ellipsize(&name, 34))));
+                            let btn = ui.add(theme::Primary(format!("Включить «{}»", theme::ellipsize(&name, 34))));
                             if btn.on_hover_text(&name).clicked() {
                                 install = pick;
                             }
@@ -653,7 +643,7 @@ impl App {
                     notify(tx, Lvl::Err, format!("Не удалось сохранить правила: {e}"));
                     return;
                 }
-                match crate::core::service::install(p, &base) {
+                match crate::core::service::install_variant(p, &base) {
                     Ok(_) => notify(tx, Lvl::Ok, format!("Собрано: «{}» + {}. Служба перезапущена", base.name, made.join("; "))),
                     Err(e) => notify(tx, Lvl::Err, format!("Правила сохранены, но службу не удалось перезапустить: {e}")),
                 }
@@ -686,7 +676,7 @@ impl App {
             .inner_margin(egui::Margin::same(20));
         let modal = egui::Modal::new(egui::Id::NULL.with("report_form")).frame(frame).show(ctx, |ui| {
             ui.set_width(400.0);
-            ui.label(RichText::new("Отчёт для разработчика").size(17.0).strong());
+            ui.label(RichText::new("Отчёт для разработчика").font(crate::theme::semibold(17.0)).strong());
             ui.add_space(2.0);
             ui.add(
                 egui::Label::new(
@@ -711,7 +701,7 @@ impl App {
                 if ui.add(theme::Primary("Сохранить".into())).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Отмена").clicked() {
+                if crate::theme::button(ui, "Отмена").clicked() {
                     answer = Some(false);
                 }
             });
@@ -731,13 +721,15 @@ impl App {
         }
     }
 
-    fn start_full_report(&mut self, ctx: &egui::Context) {
+    pub(super) fn start_full_report(&mut self, ctx: &egui::Context) {
         self.picker.mode = 1;
         self.picker.scope = 0;
         self.picker.priority = 0;
+        self.picker.full_report = true;
         self.start_pick(ctx);
-        if self.picker.running {
-            self.picker.full_report = true;
+        if !self.picker.running {
+            self.picker.full_report = false;
+        } else {
             self.toast(ctx, Lvl::Info, "Полный подбор запущен. Когда он закончится, отчёт сам сохранится на рабочий стол");
         }
     }
@@ -875,7 +867,7 @@ impl App {
     pub(super) fn repick(&mut self, ctx: &egui::Context) {
         self.picker.mode = 0;
         self.picker.scope = 0;
-        self.tab = Tab::Picker;
+        self.tab = Tab::Sites;
         if !self.picker.running && !self.busy {
             self.start_pick(ctx);
         }
@@ -910,9 +902,9 @@ impl App {
             picker::Choice::Keep(Some(name)) => self.toast(
                 ctx,
                 Lvl::Info,
-                format!("Лучше «{name}» в быстром наборе ничего нет, оставил её. Можно запустить полный подбор: набор «Все» на вкладке «Подбор»"),
+                format!("Лучше «{name}» в быстром наборе ничего нет, оставил её. Можно запустить полный подбор: набор «Все» на вкладке «Сайты»"),
             ),
-            picker::Choice::Keep(None) => self.toast(ctx, Lvl::Err, "Подбор не нашёл рабочего приёма. Попробуйте полный подбор: набор «Все» на вкладке «Подбор»"),
+            picker::Choice::Keep(None) => self.toast(ctx, Lvl::Err, "Подбор не нашёл рабочего приёма. Попробуйте полный подбор: набор «Все» на вкладке «Сайты»"),
             picker::Choice::Switch { path, name, from, score } => {
                 let target = self.install_target(path);
                 if let Some(idx) = target.and_then(|p| self.strategies.iter().position(|s| s.path == p)) {
@@ -960,13 +952,13 @@ impl App {
                     {
                         act = 4;
                     }
-                    if ui.add_enabled(!self.busy && !self.picker.running, egui::Button::new("Открыть подбор")).clicked() {
+                    if ui.add_enabled(!self.busy && !self.picker.running, crate::theme::GlassButton::new("Открыть подбор")).clicked() {
                         act = 1;
                     }
-                    if ui.button("Проверить ещё раз").clicked() {
+                    if crate::theme::button(ui, "Проверить ещё раз").clicked() {
                         act = 2;
                     }
-                    if ui.button("Скрыть").clicked() {
+                    if crate::theme::button(ui, "Скрыть").clicked() {
                         act = 3;
                     }
                 });
@@ -984,13 +976,44 @@ impl App {
         }
     }
 
-    pub(super) fn warp_blocks_checks(&mut self) -> bool {
+    pub(super) fn warp_in_the_way(&self) -> bool {
         use crate::core::warp::{Conn, Mode};
-        let on = self.warp.as_ref().is_some_and(|w| w.mode == Mode::Warp && matches!(w.conn, Conn::Connected | Conn::Connecting));
+        self.warp.as_ref().is_some_and(|w| w.mode == Mode::Warp && matches!(w.conn, Conn::Connected | Conn::Connecting))
+    }
+
+    pub(super) fn warp_blocks_checks(&mut self, then: super::AfterWarp) -> bool {
+        let on = self.warp_in_the_way();
         if on {
+            self.after_warp = Some(then);
+            self.after_warp_armed = false;
             self.confirm = Some(super::confirm::Confirm::WarpBlocksCheck);
         }
         on
+    }
+
+    pub(super) fn resume_after_warp(&mut self, ctx: &egui::Context) {
+        if !self.after_warp_armed || self.warp_in_the_way() {
+            return;
+        }
+        self.after_warp_armed = false;
+        let Some(then) = self.after_warp.take() else { return };
+        match then {
+            super::AfterWarp::Pick { full } => {
+                self.toast(ctx, Lvl::Info, "WARP отключён, запускаю подбор");
+                if full {
+                    self.start_full_report(ctx);
+                } else {
+                    self.start_pick(ctx);
+                }
+            }
+            super::AfterWarp::Sites => self.start_site_check(ctx),
+            super::AfterWarp::SiteRecheck(urls) => {
+                self.start_site_recheck(ctx, urls);
+            }
+            super::AfterWarp::Rules => self.start_rule_check(ctx),
+            super::AfterWarp::RulesRecheck => self.start_recheck(ctx),
+            super::AfterWarp::Batch(urls) => self.start_batch(ctx, urls),
+        }
     }
 
     fn install_target(&mut self, path: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -1001,7 +1024,7 @@ impl App {
     }
 
     pub(super) fn start_pick(&mut self, ctx: &egui::Context) {
-        if self.warp_blocks_checks() {
+        if self.warp_blocks_checks(super::AfterWarp::Pick { full: self.picker.full_report }) {
             return;
         }
         let Some(p) = self.paths.clone() else { return };
@@ -1083,6 +1106,52 @@ impl App {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn muted(text: impl Into<String>) -> RichText {
+    RichText::new(text.into()).color(Color32::from_gray(175)).size(13.0)
+}
+
+fn plural(n: usize, forms: [&str; 3]) -> &str {
+    let (d, h) = (n % 10, n % 100);
+    if d == 1 && h != 11 {
+        forms[0]
+    } else if (2..=4).contains(&d) && !(12..=14).contains(&h) {
+        forms[1]
+    } else {
+        forms[2]
+    }
+}
+
+fn segment_width(ui: &egui::Ui, labels: &[String]) -> f32 {
+    let font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
+    labels.iter().map(|l| ui.painter().layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x + 20.0).sum::<f32>()
+        + 2.0 * labels.len().saturating_sub(1) as f32
+        + 8.0
+}
+
+fn priority_picker(ui: &mut egui::Ui, labels: &[String], selected: &mut usize) {
+    let room = ui.available_width();
+    if segment_width(ui, labels) <= room {
+        theme::segmented(ui, labels, selected);
+        return;
+    }
+    let mut shown = labels.len();
+    while shown > 1 && segment_width(ui, &labels[..shown]) + 110.0 > room {
+        shown -= 1;
+    }
+    let mut local = if *selected < shown { *selected } else { usize::MAX };
+    if theme::segmented(ui, &labels[..shown], &mut local) {
+        *selected = local;
+    }
+    let text = if *selected >= shown { labels[*selected].clone() } else { format!("ещё {}", labels.len() - shown) };
+    egui::ComboBox::from_id_salt("priority_more").selected_text(text).width(100.0).show_ui(ui, |ui| {
+        for (i, l) in labels.iter().enumerate().skip(shown) {
+            if ui.selectable_label(*selected == i, l.as_str()).clicked() {
+                *selected = i;
+            }
+        }
+    });
+}
+
 fn result_row(
     ui: &mut egui::Ui,
     rank: Option<usize>,
@@ -1093,26 +1162,51 @@ fn result_row(
     selected: bool,
     best: bool,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::click());
+    let hover = ui.ctx().animate_bool_responsive(resp.id.with("hover"), resp.hovered());
     let p = ui.painter();
     if selected {
-        theme::gradient_rect(p, rect, 10.0, PINK, CYAN);
-        p.rect_filled(rect.shrink(1.5), CornerRadius::same(9), Color32::from_rgba_unmultiplied(24, 20, 32, 245));
-        p.rect_filled(rect.shrink(1.5), CornerRadius::same(9), Color32::from_white_alpha(8));
+        p.rect_filled(rect, CornerRadius::same(14), PINK.gamma_multiply(0.10));
+        p.rect_stroke(rect, CornerRadius::same(14), egui::Stroke::new(1.5, PINK.gamma_multiply(0.55)), egui::StrokeKind::Inside);
     } else {
-        let a = if rank.is_none() { 3 } else if resp.hovered() { 14 } else { 6 };
-        p.rect_filled(rect, CornerRadius::same(10), Color32::from_white_alpha(a));
+        let a = if rank.is_none() { 3.0 } else { 6.0 + 6.0 * hover };
+        p.rect_filled(rect, CornerRadius::same(14), Color32::from_white_alpha(a as u8));
     }
-    let y1 = rect.top() + 17.0;
-    let y2 = rect.bottom() - 15.0;
+    let y1 = rect.top() + 19.0;
+    let y2 = rect.bottom() - 17.0;
     let rank_text = rank.map(|r| r.to_string()).unwrap_or_else(|| "—".into());
     p.text(egui::pos2(rect.left() + 22.0, rect.center().y), egui::Align2::CENTER_CENTER, rank_text, egui::FontId::proportional(14.0), Color32::from_gray(130));
-    let name_col = if rank.is_none() { Color32::from_gray(160) } else { Color32::WHITE };
-    p.text(egui::pos2(rect.left() + 44.0, y1), egui::Align2::LEFT_CENTER, &o.name, egui::FontId::proportional(15.0), name_col);
+    let name_col = if rank.is_none() { Color32::from_gray(165) } else { Color32::WHITE };
+    let name = p.layout_no_wrap(o.name.clone(), theme::semibold(14.5), name_col);
+    let name_w = name.size().x;
+    p.galley(egui::pos2(rect.left() + 44.0, y1 - name.size().y / 2.0), name, name_col);
     let (ok, total) = o.score_without(noisy);
-    let meta = if o.error.is_some() { String::new() } else { format!("{ok}/{total} · {} мс", o.avg_ms()) };
-    let meta = p.layout_no_wrap(meta, egui::FontId::proportional(12.5), Color32::from_gray(170));
-    let limit = rect.right() - 16.0 - meta.size().x - 14.0;
+    let right = rect.right() - 16.0;
+    let mut limit = right;
+    if o.error.is_none() && total > 0 {
+        let r = ok as f32 / total as f32;
+        let col = if rank.is_none() { Color32::from_gray(170) } else if r >= 0.9 { Color32::WHITE } else if r >= 0.7 { YELLOW } else { RED };
+        let score = p.layout_no_wrap(format!("{ok}/{total}"), theme::semibold(17.0), col);
+        let sw = score.size().x;
+        p.galley(egui::pos2(right - sw, y1 - score.size().y / 2.0), score, col);
+        let bar_w = 84.0;
+        let bar = egui::Rect::from_min_size(egui::pos2(right - bar_w, y2 - 3.0), egui::vec2(bar_w, 6.0));
+        p.rect_filled(bar, CornerRadius::same(3), Color32::from_white_alpha(18));
+        if ok > 0 {
+            let fill = egui::Rect::from_min_size(bar.min, egui::vec2(bar_w * r, 6.0));
+            theme::gradient_rect(p, fill, 3.0, PINK, CYAN);
+        }
+        let ms = p.layout_no_wrap(format!("{} мс", o.avg_ms()), egui::FontId::proportional(12.0), Color32::from_gray(160));
+        let mw = ms.size().x;
+        p.galley(egui::pos2(bar.left() - 10.0 - mw, y2 - ms.size().y / 2.0), ms, Color32::from_gray(160));
+        limit = bar.left() - 22.0 - mw;
+    }
+    let mut pill_x = rect.left() + 44.0 + name_w + 10.0;
+    for (text, col) in [(best.then(|| "лучший".to_string()), GREEN), ((o.frozen() > 0).then(|| format!("заморозка {}", o.frozen())), YELLOW)] {
+        if let Some(t) = text {
+            pill_x = left_pill(p, egui::pos2(pill_x, y1), &t, col) + 6.0;
+        }
+    }
     let mut x = rect.left() + 44.0;
     if let Some(e) = &o.error {
         let mut short: String = e.chars().take(70).collect();
@@ -1132,40 +1226,34 @@ fn result_row(
             })
             .collect();
         for (i, (text, col)) in shown.iter().enumerate() {
-            let g = p.layout_no_wrap(text.clone(), egui::FontId::proportional(12.0), *col);
-            let more = p.layout_no_wrap(format!("ещё {}", shown.len() - i), egui::FontId::proportional(12.0), Color32::from_gray(150));
+            let w = pill_width(p, text);
+            let more = format!("ещё {}", shown.len() - i);
             let last = i + 1 == shown.len();
-            if x + g.size().x > limit || (!last && x + g.size().x + 14.0 + more.size().x > limit) {
-                if x + more.size().x <= limit {
-                    p.galley(egui::pos2(x, y2 - more.size().y / 2.0), more, Color32::from_gray(150));
+            if x + w > limit || (!last && x + w + 6.0 + pill_width(p, &more) > limit) {
+                if x + pill_width(p, &more) <= limit {
+                    left_pill(p, egui::pos2(x, y2), &more, Color32::from_gray(150));
                 }
                 break;
             }
-            let w = g.size().x;
-            p.galley(egui::pos2(x, y2 - g.size().y / 2.0), g, *col);
-            x += w + 14.0;
+            x = left_pill(p, egui::pos2(x, y2), text, *col) + 6.0;
         }
-    }
-    let bar_w = 120.0;
-    let bar = egui::Rect::from_min_size(egui::pos2(rect.right() - 16.0 - bar_w, y1 - 3.0), egui::vec2(bar_w, 6.0));
-    p.rect_filled(bar, CornerRadius::same(3), Color32::from_white_alpha(18));
-    if total > 0 && ok > 0 {
-        let fill = egui::Rect::from_min_size(bar.min, egui::vec2(bar_w * ok as f32 / total as f32, 6.0));
-        theme::gradient_rect(p, fill, 3.0, PINK, CYAN);
-    }
-    let mx = rect.right() - 16.0 - meta.size().x;
-    p.galley(egui::pos2(mx, y2 - meta.size().y / 2.0), meta, Color32::from_gray(170));
-    let mut pill_right = egui::pos2(bar.left() - 12.0, y1);
-    if best {
-        let r = theme::paint_pill(p, pill_right, "Лучшая", GREEN);
-        pill_right.x = r.left() - 8.0;
-    }
-    if o.frozen() > 0 {
-        theme::paint_pill(p, pill_right, &format!("заморозка {}", o.frozen()), YELLOW);
     }
     resp.on_hover_ui(|ui| {
         ui.label(tip_text(o, targets, cats, noisy));
     })
+}
+
+fn pill_width(p: &egui::Painter, text: &str) -> f32 {
+    p.layout_no_wrap(text.to_string(), egui::FontId::proportional(11.5), Color32::WHITE).size().x + 14.0
+}
+
+fn left_pill(p: &egui::Painter, left_center: egui::Pos2, text: &str, color: Color32) -> f32 {
+    let g = p.layout_no_wrap(text.to_string(), egui::FontId::proportional(11.5), color);
+    let size = g.size() + egui::vec2(14.0, 4.0);
+    let rect = egui::Rect::from_min_size(egui::pos2(left_center.x, left_center.y - size.y / 2.0), size);
+    p.rect_filled(rect, CornerRadius::same(9), color.gamma_multiply(0.14));
+    p.galley(rect.center() - g.size() / 2.0, g, color);
+    rect.right()
 }
 
 fn masked(targets: &[Target], cat: &str, noisy: &[bool]) -> bool {

@@ -36,7 +36,7 @@ fn has_strategy(dir: &Path) -> bool {
 fn signed_dir(dir: &Path, name: &str) -> bool {
     match name {
         "bin" => ENGINES.iter().any(|e| dir.join(e).is_file()),
-        "scripts" => dir.join("manager.bat").is_file() || has_strategy(dir),
+        "scripts" => dir.join("manager.bat").is_file() || dir.join("service_remove.bat").is_file() || has_strategy(dir),
         "lists" => dir.join("hosts-list.txt").is_file() || dir.join("ipset-all.txt").is_file(),
         "exp-list" => dir.join("ipset-all.txt").is_file() || dir.join("list-general.txt").is_file(),
         "utils" => dir.join("targets.txt").is_file(),

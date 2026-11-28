@@ -99,6 +99,32 @@ pub fn with_sni(fake: &[u8], host: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+pub fn resized(hello: &[u8], total: usize) -> Option<Vec<u8>> {
+    if hello.len() <= total {
+        return with_padding(hello, total);
+    }
+    let cut = hello.len() - total;
+    let e = find_ext(hello, 0x15)?;
+    let len = be16(hello, e.at - 2)?;
+    if len < cut {
+        return None;
+    }
+    let ext_total = extensions_at(hello)?;
+    let mut out = hello.to_vec();
+    out[e.at - 2..e.at].copy_from_slice(&u16::try_from(len - cut).ok()?.to_be_bytes());
+    out.drain(e.at..e.at + cut);
+    let drop16 = |b: &mut [u8], at: usize| -> Option<()> {
+        let v = u16::try_from(be16(b, at)?.checked_sub(cut)?).ok()?;
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        Some(())
+    };
+    drop16(&mut out, 3)?;
+    drop16(&mut out, ext_total)?;
+    let hs = u32::try_from(be24(&out, 6)?.checked_sub(cut)?).ok()?;
+    out[6..9].copy_from_slice(&hs.to_be_bytes()[1..]);
+    Some(out)
+}
+
 pub fn with_padding(hello: &[u8], total: usize) -> Option<Vec<u8>> {
     if hello.len() >= total {
         return Some(hello.to_vec());

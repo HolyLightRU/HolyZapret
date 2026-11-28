@@ -93,7 +93,7 @@ impl App {
             .inner_margin(egui::Margin::same(20));
         let modal = egui::Modal::new(egui::Id::NULL.with("unpack")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0);
-            ui.label(RichText::new("HolyZapret запущен прямо из архива").size(17.0).strong());
+            ui.label(RichText::new("HolyZapret запущен прямо из архива").font(crate::theme::semibold(17.0)).strong());
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
@@ -149,17 +149,17 @@ impl App {
                     if ui.add(theme::Primary("Открыть установленный".into())).clicked() {
                         open = Some(exe.clone());
                     }
-                    if ui.button("Всё равно распаковать").clicked() {
+                    if crate::theme::button(ui, "Всё равно распаковать").clicked() {
                         go = true;
                     }
-                    if ui.button("Закрыть").clicked() {
+                    if crate::theme::button(ui, "Закрыть").clicked() {
                         close = true;
                     }
                 } else {
                     if ui.add(theme::Primary("Распаковать".into())).clicked() {
                         go = true;
                     }
-                    if ui.button("Закрыть").clicked() {
+                    if crate::theme::button(ui, "Закрыть").clicked() {
                         close = true;
                     }
                 }

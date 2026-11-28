@@ -1,6 +1,6 @@
 [package]
 name = "holyzapret-launcher"
-version = "3.2.1"
+version.workspace = true
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -37,7 +37,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+panic = "unwind"
 
 [profile.fast]
 inherits = "release"
@@ -48,3 +48,6 @@ incremental = true
 
 [workspace]
 members = ["rayoflight"]
+
+[workspace.package]
+version = "3.3.0"

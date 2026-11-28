@@ -127,7 +127,7 @@ impl App {
                 }
             }
             if let Some(s) = target {
-                match service::install(p, &s) {
+                match service::install_variant(p, &s) {
                     Ok(_) => done.push(format!("служба запущена с «{}»", s.name)),
                     Err(e) => notify(tx, Lvl::Err, format!("Службу не удалось установить: {e}")),
                 }
@@ -156,7 +156,7 @@ impl App {
         let st = &mut self.share;
         let modal = egui::Modal::new(egui::Id::NULL.with("share")).frame(frame).show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.label(RichText::new("Настройка от друга").size(17.0).strong());
+            ui.label(RichText::new("Настройка от друга").font(crate::theme::semibold(17.0)).strong());
             ui.add_space(4.0);
             match st.preview.as_mut() {
                 None => {
@@ -172,7 +172,7 @@ impl App {
                         if ui.add_enabled(!st.input.trim().is_empty(), theme::Primary("Посмотреть".into())).clicked() {
                             check = true;
                         }
-                        if ui.button("Отмена").clicked() {
+                        if crate::theme::button(ui, "Отмена").clicked() {
                             close = true;
                         }
                     });
@@ -220,7 +220,7 @@ impl App {
                         if ui.add_enabled(any && !busy, theme::Primary("Применить".into())).clicked() {
                             apply = true;
                         }
-                        if ui.button("Назад").clicked() {
+                        if crate::theme::button(ui, "Назад").clicked() {
                             back = true;
                         }
                     });

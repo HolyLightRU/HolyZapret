@@ -2,6 +2,7 @@
 
 mod app;
 mod core;
+mod glass;
 mod instance;
 mod log;
 mod theme;

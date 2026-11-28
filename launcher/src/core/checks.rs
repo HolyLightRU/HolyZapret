@@ -133,20 +133,63 @@ pub fn tls13_hello(host: &str) -> Option<Vec<u8>> {
     Some(h)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    Plain,
+    Records,
+    RecordsApart,
+}
+
+pub fn split_records(hello: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (at, len) = rayoflight::tls::sni_range(hello)?;
+    let cut = at + len / 2;
+    let body = hello.get(5..)?;
+    let cut = cut.checked_sub(5).filter(|c| *c > 0 && *c < body.len())?;
+    let record = |part: &[u8]| {
+        let mut r = vec![0x16, hello[1], hello[2]];
+        r.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        r.extend_from_slice(part);
+        r
+    };
+    Some((record(&body[..cut]), record(&body[cut..])))
+}
+
 pub fn tls13_probe(host: &str, timeout: std::time::Duration) -> (Result<Hello, i32>, u128) {
+    tls13_probe_as(host, timeout, Shape::Plain)
+}
+
+pub fn tls13_probe_as(host: &str, timeout: std::time::Duration, shape: Shape) -> (Result<Hello, i32>, u128) {
     use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     let start = std::time::Instant::now();
     let ms = || start.elapsed().as_millis();
-    let Some(addr) = (host, 443).to_socket_addrs().ok().and_then(|mut a| a.next()) else { return (Err(6), ms()) };
+    let addrs: Vec<SocketAddr> = (host, 443).to_socket_addrs().map(|a| a.collect()).unwrap_or_default();
+    let Some(addr) = addrs.first().copied() else { return (Err(6), ms()) };
     let Some(hello) = tls13_hello(host) else { return (Err(-1), ms()) };
-    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
+    let connected = TcpStream::connect_timeout(&addr, timeout);
+    let mut s = match connected {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return (Err(28), ms()),
         Err(_) => return (Err(7), ms()),
     };
     let _ = s.set_read_timeout(Some(timeout.saturating_sub(start.elapsed()).max(std::time::Duration::from_millis(200))));
-    if s.write_all(&hello).is_err() {
+    let sent = match shape {
+        Shape::Plain => s.write_all(&hello).is_ok(),
+        Shape::Records => match split_records(&hello) {
+            Some((a, b)) => s.write_all(&[a, b].concat()).is_ok(),
+            None => return (Err(-1), ms()),
+        },
+        Shape::RecordsApart => match split_records(&hello) {
+            Some((a, b)) => {
+                let _ = s.set_nodelay(true);
+                let first = s.write_all(&a).is_ok();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                first && s.write_all(&b).is_ok()
+            }
+            None => return (Err(-1), ms()),
+        },
+    };
+    if !sent {
         return (Err(56), ms());
     }
     let mut buf = [0u8; 16];
@@ -220,6 +263,31 @@ mod tests {
         let again = tls13_hello("www.youtube.com").unwrap();
         assert_ne!(h[11..43], again[11..43]);
         assert_eq!(curl_error(-1), "не удалось собрать запрос");
+    }
+
+    #[test]
+    fn hello_splits_into_two_records_through_the_name() {
+        let h = tls13_hello("www.youtube.com").unwrap();
+        let (a, b) = split_records(&h).unwrap();
+        let (at, len) = rayoflight::tls::sni_range(&h).unwrap();
+        assert_eq!((a[0], b[0], &a[1..3], &b[1..3]), (0x16, 0x16, &h[1..3], &h[1..3]));
+        assert_eq!(u16::from_be_bytes([a[3], a[4]]) as usize, a.len() - 5);
+        assert_eq!(u16::from_be_bytes([b[3], b[4]]) as usize, b.len() - 5);
+        assert_eq!(a.len() - 5, at + len / 2 - 5);
+        assert_eq!([&a[5..], &b[5..]].concat(), h[5..].to_vec());
+        assert!(rayoflight::tls::sni(&a).is_none());
+        assert!(split_records(b"short").is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn split_record_probe_live() {
+        for host in ["discord.com", "www.google.com", "www.youtube.com", "rutracker.org"] {
+            for shape in [Shape::Records, Shape::RecordsApart] {
+                let (r, ms) = tls13_probe_as(host, std::time::Duration::from_secs(6), shape);
+                assert_eq!(r, Ok(Hello::Answered), "{host} {shape:?} {ms}");
+            }
+        }
     }
 
     #[test]

@@ -192,7 +192,7 @@ impl App {
         let mut act = None;
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Проверка программы").size(17.0).strong());
+                ui.label(RichText::new("Проверка программы").font(crate::theme::semibold(17.0)).strong());
                 ui.add_space(4.0);
                 if let Some(t) = self.check.started.filter(|_| running) {
                     ui.spinner();
@@ -201,7 +201,7 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if running {
-                        if ui.button("Остановить").clicked() {
+                        if crate::theme::button(ui, "Остановить").clicked() {
                             act = Some(Act::Stop);
                         }
                     } else if ui.add_enabled(self.paths.is_some(), theme::Primary(if seen.is_empty() { "Начать" } else { "Начать заново" }.into())).clicked() {
@@ -293,7 +293,7 @@ impl App {
         if let Some(app) = shown {
             ui.add_space(10.0);
             theme::card(ui, |ui| {
-                ui.label(RichText::new(&app.name).size(15.5).strong());
+                ui.label(RichText::new(&app.name).font(crate::theme::semibold(15.5)).strong());
                 let judged: Vec<Judged> = match &self.check.target {
                     Some(t) => app
                         .flows
@@ -357,7 +357,7 @@ impl App {
                     }
                     if !missing.is_empty()
                         && ui
-                            .add_enabled(enabled, egui::Button::new(format!("Добавить адреса в «Мои IP» · {}", missing.len())))
+                            .add_enabled(enabled, crate::theme::GlassButton::new(format!("Добавить адреса в «Мои IP» · {}", missing.len())))
                             .on_hover_text("Обход начнёт обрабатывать игровой трафик к этим серверам")
                             .clicked()
                     {
@@ -365,7 +365,7 @@ impl App {
                     }
                     if !all.is_empty()
                         && ui
-                            .add_enabled(enabled, egui::Button::new(format!("Исключить программу · {}", all.len())))
+                            .add_enabled(enabled, crate::theme::GlassButton::new(format!("Исключить программу · {}", all.len())))
                             .on_hover_text("Адреса её серверов попадут в «Мои исключения IP». Обход перестанет трогать эти адреса для всех программ, а правила по имени сайта продолжат работать")
                             .clicked()
                     {
@@ -398,7 +398,7 @@ impl App {
                 return;
             }
             if installed {
-                result_msg(tx, service::install(p, &s).map(|_| "Игровой фильтр включён, служба переустановлена".into()), "Игровой фильтр включён, но служба не переустановилась");
+                result_msg(tx, service::refresh(p, &s).map(|_| "Игровой фильтр включён и уже работает".into()), "Игровой фильтр включён, но служба не переустановилась");
             } else {
                 notify(tx, Lvl::Ok, "Игровой фильтр включён");
             }

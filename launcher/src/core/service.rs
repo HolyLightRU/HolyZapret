@@ -135,6 +135,13 @@ pub fn legacy_installed() -> bool {
     }) || super::ray::installed()
 }
 
+pub fn stale(paths: &Paths) -> bool {
+    match (installed_command(), super::ray::command(paths)) {
+        (Some(old), Some(fresh)) => !same_command(&old, &fresh) || !super::ray::config_current(paths),
+        _ => false,
+    }
+}
+
 fn same_command(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     norm(a) == norm(b)
@@ -163,6 +170,7 @@ pub fn resume(paths: &Paths, p: Paused) -> anyhow::Result<String> {
         anyhow::bail!("варианта «{}» больше нет, служба осталась прежней", p.strategy);
     };
     let fresh = command(paths, &s)?;
+    super::ray::write_config(paths, &super::ray::new_stamp())?;
     if installed_command().is_some_and(|old| same_command(&old, &fresh)) {
         if p.running {
             start()?;
@@ -177,19 +185,38 @@ pub fn resume(paths: &Paths, p: Paused) -> anyhow::Result<String> {
     Ok(format!("Служба переустановлена с «{}»", s.name))
 }
 
-pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
-    super::lists::ensure_user_files(&paths.exp_lists())?;
+pub fn install_variant(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
     apply_variant(s);
-    remove_quiet();
+    install(paths, s)
+}
+
+static OP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    OP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
+    let _op = exclusive();
+    super::lists::ensure_user_files(&paths.exp_lists())?;
+    let command = command(paths, s)?;
+    let exists = query(SERVICE) != ServiceState::NotInstalled;
+    if exists {
+        let out = sc_raw(&sc_args("config", &command))?;
+        if !out.status.success() {
+            anyhow::bail!("sc config: {}. Служба осталась прежней", String::from_utf8_lossy(&out.stdout).trim());
+        }
+        run_hidden("net", &["stop", SERVICE]);
+    }
     super::ray::remove();
     stop_engines();
+    super::ray::write_config(paths, &super::ray::new_stamp())?;
     super::rules::seed_memory(paths);
-    let command = command(paths, s)?;
-    let bin_path = command.replace('"', "\\\"");
-    let raw = format!("create {SERVICE} binPath= \"{bin_path}\" DisplayName= \"HolyZapret\" start= auto");
-    let out = Command::new("sc").raw_arg(raw).creation_flags(CREATE_NO_WINDOW).output()?;
-    if !out.status.success() {
-        anyhow::bail!("sc create: {}", String::from_utf8_lossy(&out.stdout));
+    if !exists {
+        let out = sc_raw(&sc_args("create", &command))?;
+        if !out.status.success() {
+            anyhow::bail!("sc create: {}", String::from_utf8_lossy(&out.stdout).trim());
+        }
     }
     run_hidden("sc", &["description", SERVICE, "HolyZapret: обход блокировок, движок RayOfLight"]);
     let (ok, o) = run_hidden("sc", &["start", SERVICE]);
@@ -205,6 +232,28 @@ pub fn install(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
     );
     super::settings::set_last_strategy(&s.id);
     Ok(format!("Служба установлена: {}", super::ray::install_label(s)))
+}
+
+pub const APPLIED: &str = "Настройки применены, служба не перезапускалась";
+
+fn apply_live(paths: &Paths) -> bool {
+    let _op = exclusive();
+    let Some(fresh) = super::ray::command(paths) else { return false };
+    if query(SERVICE) != ServiceState::Running || !installed_command().is_some_and(|old| same_command(&old, &fresh)) {
+        return false;
+    }
+    if super::lists::ensure_user_files(&paths.exp_lists()).is_err() {
+        return false;
+    }
+    let stamp = super::ray::new_stamp();
+    super::ray::write_config(paths, &stamp).is_ok() && super::ray::applied(paths, &stamp, std::time::Duration::from_secs(6))
+}
+
+pub fn refresh(paths: &Paths, s: &Strategy) -> anyhow::Result<String> {
+    if apply_live(paths) {
+        return Ok(APPLIED.into());
+    }
+    install(paths, s)
 }
 
 pub fn start() -> anyhow::Result<()> {
@@ -234,12 +283,22 @@ pub fn restart() -> anyhow::Result<()> {
     start()
 }
 
+fn sc_args(verb: &str, command: &str) -> String {
+    let bin_path = command.replace('"', "\\\"");
+    format!("{verb} {SERVICE} binPath= \"{bin_path}\" DisplayName= \"HolyZapret\" start= auto")
+}
+
+fn sc_raw(raw: &str) -> std::io::Result<std::process::Output> {
+    Command::new("sc").raw_arg(raw).creation_flags(CREATE_NO_WINDOW).output()
+}
+
 fn remove_quiet() {
     run_hidden("net", &["stop", SERVICE]);
     run_hidden("sc", &["delete", SERVICE]);
 }
 
 pub fn remove() -> Result<String, String> {
+    let _op = exclusive();
     let existed = query(SERVICE) != ServiceState::NotInstalled;
     remove_quiet();
     super::ray::remove();
@@ -249,6 +308,9 @@ pub fn remove() -> Result<String, String> {
     }
     kill_process("HolyZapret.exe");
     kill_process("winws.exe");
+    if super::settings::ray_gateway() {
+        let _ = super::gateway::apply(false);
+    }
     if query(SERVICE) != ServiceState::NotInstalled || super::ray::installed() {
         return Err("Не удалось удалить службу: нужны права администратора. Запустите лаунчер от имени администратора".into());
     }
@@ -265,5 +327,13 @@ mod tests {
         let b = r#""c:\hz\bin\HolyZapret.exe" --wf-tcp=80,443 --hostlist="C:\HZ\lists\a.txt" "#;
         assert!(same_command(a, b));
         assert!(!same_command(a, &a.replace("443", "443,2053")));
+    }
+
+    #[test]
+    fn service_command_is_quoted_the_same_for_create_and_config() {
+        let cmd = r#""C:\Hz\bin\RayOfLight.exe" --service --lists "C:\Hz\exp-list""#;
+        let c = sc_args("create", cmd);
+        assert_eq!(c, r#"create zapret binPath= "\"C:\Hz\bin\RayOfLight.exe\" --service --lists \"C:\Hz\exp-list\"" DisplayName= "HolyZapret" start= auto"#);
+        assert_eq!(sc_args("config", cmd).strip_prefix("config"), c.strip_prefix("create"));
     }
 }

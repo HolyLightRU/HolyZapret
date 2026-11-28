@@ -211,6 +211,39 @@ mod http {
         }
     }
 
+    pub fn download(host: &str, want: usize, timeout: Duration) -> (usize, bool) {
+        let Some(s) = session() else { return (0, false) };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        unsafe {
+            let conn = Closing(WinHttpConnect(s, wide(host).as_ptr(), 443, 0));
+            if conn.0.is_null() {
+                return (0, false);
+            }
+            let req = Closing(WinHttpOpenRequest(conn.0, wide("GET").as_ptr(), wide("/").as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(), WINHTTP_FLAG_SECURE));
+            if req.0.is_null() {
+                return (0, false);
+            }
+            WinHttpSetTimeouts(req.0, ms, ms, ms, ms);
+            let headers = wide("Accept: */*\r\nAccept-Encoding: identity\r\n");
+            if WinHttpSendRequest(req.0, headers.as_ptr(), u32::MAX, std::ptr::null(), 0, 0, 0) == 0 || WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
+                return (0, false);
+            }
+            let mut got = 0usize;
+            let mut buf = vec![0u8; 8192];
+            while got < want {
+                let mut read = 0u32;
+                if WinHttpReadData(req.0, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut read) == 0 {
+                    return (got, false);
+                }
+                if read == 0 {
+                    return (got, true);
+                }
+                got += read as usize;
+            }
+            (got, true)
+        }
+    }
+
     pub fn post(host: &str, body: &[u8], timeout: Duration) -> Option<Vec<u8>> {
         let s = session()?;
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
@@ -397,7 +430,6 @@ pub fn start(lib: Lib, priority: i16, wanted: Wanted, avoid: Avoid, ended: Arc<A
     let handle = Arc::new(lib.open(FILTER, windivert::LAYER_NETWORK, priority, 0).map_err(|e| format!("DNS: перехват не включился: {e}"))?);
     let resolver = Arc::new(Resolver::new());
     log.line(&format!("DNS: чиню ответы провайдера для сайтов из списков через {}", SERVERS.join(", ")));
-    flush_cache();
     {
         let h = handle.clone();
         let ended = ended.clone();
@@ -416,7 +448,12 @@ pub fn start(lib: Lib, priority: i16, wanted: Wanted, avoid: Avoid, ended: Arc<A
             handle_packet(&handle, &r, &wanted, &avoid, &log, pkt, addr);
         }
     });
+    std::thread::spawn(flush_cache);
     Ok(resolver)
+}
+
+pub fn download(host: &str, want: usize, timeout: Duration) -> (usize, bool) {
+    http::download(host, want, timeout)
 }
 
 pub fn flush_cache() {
@@ -646,6 +683,18 @@ mod tests {
         let o = packet::parse_udp(&out).unwrap();
         assert_eq!((o.sport, o.dport, o.payload()), (53, 50000, &good[..]));
         assert!(packet::checksums_ok(&out));
+    }
+
+    #[test]
+    #[ignore]
+    fn download_reads_big_and_small_pages_live() {
+        use crate::flows::{FETCH_WANT, Fetch, fetch_verdict};
+        let (big, ended) = download("www.wikipedia.org", FETCH_WANT, Duration::from_secs(10));
+        assert!(matches!(fetch_verdict(big, ended), Fetch::Passed(_)), "{big} {ended}");
+        let (small, ended) = download("example.com", FETCH_WANT, Duration::from_secs(10));
+        assert!(matches!(fetch_verdict(small, ended), Fetch::Short(_)), "{small} {ended}");
+        let (none, ended) = download("no-such-host.invalid", FETCH_WANT, Duration::from_secs(5));
+        assert_eq!(fetch_verdict(none, ended), Fetch::Failed);
     }
 
     #[test]

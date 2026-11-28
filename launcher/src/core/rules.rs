@@ -13,9 +13,10 @@ pub const BORROW: &str = "from:";
 const FILE: &str = "site-rules-user.txt";
 const MAX_DOMAINS: usize = 16;
 
-pub const TECHNIQUES: [&str; 10] = ["general", "sni-split", "sni-max", "ttl", "disorder", "md5sig", "badseq", "overlap-max", "random", "badsum"];
+pub const TECHNIQUES: [&str; 9] = ["general", "sni-split", "sni-pool", "ttl", "disorder", "md5sig", "badseq", "overlap-max", "random"];
 
-const LEGACY: [(&str, &str); 10] = [
+const LEGACY: [(&str, &str); 11] = [
+    ("badsum", "general"),
     ("alt3-ts", "general"),
     ("alt3-badseq", "badseq"),
     ("alt3-md5sig", "md5sig"),

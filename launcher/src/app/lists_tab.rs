@@ -110,11 +110,11 @@ impl App {
         self.lists_sync();
         theme::card(ui, |ui| {
             theme::row(ui, 36.0, |ui| {
-                ui.label(RichText::new("Списки").size(17.0).strong());
+                ui.label(RichText::new("Списки").font(crate::theme::semibold(17.0)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.lists.restart_hint {
                         let b = ui
-                            .add_enabled(!self.busy, egui::Button::new("Перезапустить службу"))
+                            .add_enabled(!self.busy, crate::theme::GlassButton::new("Перезапустить службу"))
                             .on_hover_text("Движок перечитает списки при запуске");
                         if b.clicked() {
                             self.lists.restart_hint = false;

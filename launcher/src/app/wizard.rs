@@ -1,4 +1,4 @@
-use super::home_ray::tile;
+use super::home_ray::tile_sized;
 use super::{App, Tab};
 use crate::core::diagnostics::Level;
 use crate::core::service::ServiceState;
@@ -29,7 +29,7 @@ fn emblem(ui: &mut egui::Ui, step: usize, busy: bool) {
     for (k, a) in [(12.0, 0.03), (8.0, 0.05), (4.0, 0.08)] {
         p.circle_filled(c, r + k, theme::grad(0.5).gamma_multiply(a));
     }
-    p.circle_filled(c, r, Color32::from_white_alpha(12));
+    theme::glass_disc(p, c, r, 1.0, 0.24, 12);
     let n = 72;
     let tau = std::f32::consts::TAU;
     let lit_until = (step + 1) as f32 / STEPS.len() as f32;
@@ -77,7 +77,7 @@ fn step_tile(ui: &mut egui::Ui, i: usize, current: usize) -> egui::Response {
                 });
             });
             let tc = if i > current { Color32::from_gray(170) } else { Color32::WHITE };
-            ui.label(RichText::new(name).size(18.0).strong().color(tc));
+            ui.label(RichText::new(name).font(crate::theme::semibold(18.0)).strong().color(tc));
             ui.add(egui::Label::new(muted(hint)).truncate());
         })
         .response;
@@ -97,7 +97,7 @@ fn banner(ui: &mut egui::Ui, color: Color32, glyph: &str, title: &str, text: &st
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(RichText::new(title).size(15.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(title).font(crate::theme::semibold(15.0)).strong().color(Color32::WHITE));
                     if !text.is_empty() {
                         ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(185))).wrap());
                     }
@@ -109,7 +109,7 @@ fn banner(ui: &mut egui::Ui, color: Color32, glyph: &str, title: &str, text: &st
 fn tiles(ui: &mut egui::Ui, items: &[(&str, String, &str, Color32)]) {
     ui.columns(items.len(), |cols| {
         for (col, (label, value, sub, color)) in cols.iter_mut().zip(items) {
-            tile(col, label, value, sub, *color);
+            tile_sized(col, label, value, sub, *color, 22.0);
         }
     });
 }
@@ -144,14 +144,14 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_max_width((ui.available_width() - 190.0).max(200.0));
                     ui.add_space(14.0);
-                    ui.label(RichText::new("Первая настройка").size(22.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("Первая настройка").font(crate::theme::semibold(22.0)).strong().color(Color32::WHITE));
                     ui.add(
                         egui::Label::new(RichText::new(format!("Три коротких шага, и защита включится. Шаг {} из 3: {}", step + 1, STEPS[step].0)).color(Color32::from_gray(160)))
                             .truncate(),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Пропустить мастер").on_hover_text("Можно вернуться к нему во вкладке «Инструменты»").clicked() {
+                    if crate::theme::button(ui, "Пропустить мастер").on_hover_text("Можно вернуться к нему в «Настройках → Обслуживание»").clicked() {
                         skip = true;
                     }
                 });
@@ -177,7 +177,7 @@ impl App {
             });
             ui.add_space(4.0);
             theme::row(ui, 44.0, |ui| {
-                if step > 0 && ui.add_enabled(!working, egui::Button::new("Назад")).clicked() {
+                if step > 0 && ui.add_enabled(!working, crate::theme::GlassButton::new("Назад")).clicked() {
                     back = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -207,7 +207,7 @@ impl App {
     }
 
     fn step_header(ui: &mut egui::Ui, title: &str, text: &str) {
-        ui.label(RichText::new(title).size(17.0).strong());
+        ui.label(RichText::new(title).font(crate::theme::semibold(17.0)).strong());
         ui.add_space(2.0);
         ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(185))).wrap());
         ui.add_space(10.0);
@@ -238,7 +238,7 @@ impl App {
         ui.add_space(10.0);
         let issues: Vec<_> = self.diag.findings.iter().filter(|f| f.level != Level::Ok).cloned().collect();
         if issues.is_empty() {
-            banner(ui, GREEN, theme::icon::CHECK, "Всё в порядке", "Ничего не мешает обходу. Нажмите «Далее».");
+            banner(ui, GREEN, theme::icon::CHECK, "Всё в порядке: ничего не мешает обходу", "");
             return;
         }
         let mut fix = None;
@@ -339,7 +339,7 @@ impl App {
                 } else {
                     ("Нажмите кнопку, чтобы включить защиту", Color32::WHITE)
                 };
-                ui.label(RichText::new(title).size(19.0).strong().color(color));
+                ui.label(RichText::new(title).font(crate::theme::semibold(19.0)).strong().color(color));
                 ui.add(egui::Label::new(RichText::new(crate::core::ray::install_label(&s)).color(Color32::from_gray(160))).truncate());
             });
         });
@@ -351,8 +351,8 @@ impl App {
             ui.add_space(10.0);
             ui.label(muted("Лаунчер тоже можно запускать с Windows, чтобы видеть статус в трее:"));
             ui.add_space(4.0);
-            self.autostart_row(ui, ctx);
-            self.auto_update_row(ui);
+            self.autostart_row(ui, ctx, true);
+            self.auto_update_row(ui, false);
         }
     }
 }
